@@ -17,9 +17,9 @@ fine with the default). Before this knob, all L2 tasks in one L3 launch shared
 the process-wide ``PTO2_RING_*`` env and could not be sized independently.
 
 The demo dispatches three L2 tasks: two use the scalar form (one ring value
-broadcast to every ring), and a third passes 4-entry lists for
-``ring_task_window`` / ``ring_heap`` / ``ring_dep_pool`` to size each of the four
-scope-depth rings independently.
+broadcast to every ring), and a third uses the per-ring arrays
+(``ring_task_windows`` / ``ring_heaps`` / ``ring_dep_pools``) to size each of
+the four scope-depth rings independently.
 
 The key line is inside ``orch_fn``: each ``submit_next_level`` gets its OWN
 ``CallConfig`` whose ``runtime_env`` is set per task. That per-task config
@@ -61,14 +61,21 @@ VECTOR_ADD_KERNELS = os.path.join(HERE, "..", "..", "l2", "vector_add", "kernels
 N_ROWS = 128
 N_COLS = 128
 
-# RuntimeEnv keys an L2 spec may carry. Each takes a scalar (broadcast to every
-# ring) or a 4-entry list (one value per scope-depth ring 0..3).
-RING_FIELDS = ("ring_task_window", "ring_heap", "ring_dep_pool")
+# RuntimeEnv keys an L2 spec may carry. Scalar keys broadcast one value to every
+# ring; the array keys size the four scope-depth rings (0..3) independently.
+RING_FIELDS = (
+    "ring_task_window",
+    "ring_heap",
+    "ring_dep_pool",
+    "ring_task_windows",
+    "ring_heaps",
+    "ring_dep_pools",
+)
 
 # One entry per L2 task dispatched by the orchestration. Each carries its own
 # ring sizing; the inputs differ so the golden checks are independent. The first
-# two tasks use the scalar form (one value broadcast to every ring); the third
-# passes 4-entry lists to size each scope-depth ring independently.
+# two tasks use the scalar form (one value per ring); the third uses the
+# per-ring arrays to size each scope-depth ring independently.
 L2_TASKS = [
     {
         "label": "l2_scalar_small",
@@ -90,9 +97,9 @@ L2_TASKS = [
         "label": "l2_per_ring",
         "a": 1.0,
         "b": 4.0,
-        "ring_task_window": [128, 64, 32, 16],
-        "ring_heap": [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1 * 1024 * 1024],
-        "ring_dep_pool": [256, 128, 64, 64],
+        "ring_task_windows": [128, 64, 32, 16],
+        "ring_heaps": [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1 * 1024 * 1024],
+        "ring_dep_pools": [256, 128, 64, 64],
     },
 ]
 
@@ -111,7 +118,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
     """
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root()
+    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
     include_dirs = kc.get_orchestration_include_dirs(runtime)
 
     kernel_bytes = kc.compile_incore(

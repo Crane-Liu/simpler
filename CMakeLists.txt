@@ -28,6 +28,22 @@ find_package(nanobind CONFIG REQUIRED)
 # Include Python bindings
 add_subdirectory(python/bindings)
 
+# Protocol used by `build_runtimes.py` when an onboard a2a3 build needs to
+# clone pto-isa and PTO_ISA_ROOT is not pre-set. Default `ssh` matches
+# conftest's default and self-hosted CI runners' deploy-key setup. Override
+# at `pip install` time via
+#   pip install --config-settings=cmake.define.SIMPLER_PTO_CLONE_PROTOCOL=https .
+set(SIMPLER_PTO_CLONE_PROTOCOL "ssh" CACHE STRING
+    "Protocol for cloning pto-isa during install (ssh or https)")
+
+# Override the pto-isa revision used when `build_runtimes.py` builds the
+# onboard a2a3 host runtime (which compiles the pto-isa SDMA headers into
+# host_runtime.so). Empty (default) preserves the original behavior and uses
+# the current checkout HEAD. Override at `pip install` time via
+#   pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT=<sha> .
+set(SIMPLER_PTO_ISA_COMMIT "" CACHE STRING
+    "Override pto-isa commit for onboard a2a3 host build (empty/latest = HEAD)")
+
 # Compiler sanitizer for host-compiled targets (sim runtime/kernels and the
 # onboard host runtime). Default `none`. Preset (asan/ubsan/tsan) or a raw
 # -fsanitize token list. Enable at `pip install` time via
@@ -35,13 +51,21 @@ add_subdirectory(python/bindings)
 set(SIMPLER_SANITIZER "none" CACHE STRING
     "Sanitizer for host targets during install (none/asan/ubsan/tsan)")
 
+# Pass --pto-isa-commit only when explicitly overridden; an empty cache var
+# leaves the flag off so build_runtimes uses the current checkout HEAD.
+if(NOT SIMPLER_PTO_ISA_COMMIT STREQUAL "")
+    set(_pto_isa_commit_arg --pto-isa-commit "${SIMPLER_PTO_ISA_COMMIT}")
+endif()
+
 # Pre-build runtime binaries (persistent build dirs for incremental compilation)
 add_custom_target(build_runtimes ALL
     COMMAND ${Python_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/simpler_setup/build_runtimes.py
         --lib-dir ${CMAKE_SOURCE_DIR}/build/lib
         --cache-dir ${CMAKE_SOURCE_DIR}/build/cache
+        --clone-protocol ${SIMPLER_PTO_CLONE_PROTOCOL}
         --sanitizer ${SIMPLER_SANITIZER}
+        ${_pto_isa_commit_arg}
     COMMENT "Building runtime binaries (incremental)..."
 )
 
@@ -51,8 +75,4 @@ if(SKBUILD_MODE)
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/build/lib/
             DESTINATION simpler_setup/_assets/build/lib
             OPTIONAL)
-    if(EXISTS "${CMAKE_SOURCE_DIR}/pto_isa.pin")
-        install(FILES ${CMAKE_SOURCE_DIR}/pto_isa.pin
-                DESTINATION simpler_setup/_assets)
-    endif()
 endif()

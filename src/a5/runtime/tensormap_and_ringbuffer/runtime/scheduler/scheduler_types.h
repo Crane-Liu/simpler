@@ -64,11 +64,13 @@ constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator erro
 // kills the slower-but-correct poller mid-poll — see the distributed
 // startup-skew scenario in issue #897.
 //
-// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in spin_hint.h).
-// Onboard keeps it below the STARS op-execute and host stream-sync budgets so
-// the AICPU can flush diagnostics before the host-visible timeout chain fires.
-// Sim has no STARS or ACL stream-sync timeout, but uses the same no-progress
-// watchdog shape. See spin_hint.h for the per-variant rationale.
+// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in spin_hint.h)
+// because the safe value differs per variant: onboard trims it to 2 s so the
+// AICPU detects a hang and flushes its diagnostics (tensor dump, in-flight
+// partial output) before STARS reaps the op and poisons the context (chain:
+// this < op-exec < host stream-sync, platform_config.h); sim has no STARS to
+// race and keeps the full 5 s #897 headroom. See spin_hint.h for the per-variant
+// rationale.
 constexpr int32_t SCHEDULER_TIMEOUT_MS = PLATFORM_SCHEDULER_TIMEOUT_MS;
 constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
     static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
@@ -114,7 +116,7 @@ struct alignas(64) CoreExecState {
     uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
 #else
     // --- Cold fields (init/diagnostics only, never in hot path) ---
-    int32_t worker_id;          // offset 48: index in runtime.dev.workers[]
+    int32_t worker_id;          // offset 48: index in runtime.workers[]
     uint32_t physical_core_id;  // offset 52: hardware physical core ID
     CoreType core_type;         // offset 56: AIC or AIV (enum class : int32_t)
     uint8_t pad2_[4];           // offset 60: pad to 64 bytes

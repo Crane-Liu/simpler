@@ -100,15 +100,9 @@
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 #define PTO2_DEP_POOL_CLEANUP_INTERVAL 64   // Cleanup every N retired tasks
 
-// get_tensor_data/set_tensor_data spin-wait timeout, expressed in time. The cycle
-// count (PTO2_TENSOR_DATA_TIMEOUT_CYCLES) is derived from this in pto_runtime2.cpp
-// — its only user — by scaling with the platform counter frequency, like
-// SCHEDULER_TIMEOUT_CYCLES, so it reaps at the same wall-clock on every arch (a
-// fixed raw cycle count would be 15 s on a5 at 1 GHz but 300 s on a2a3 at 50 MHz).
-// PLATFORM_PROF_SYS_CNT_FREQ is deliberately NOT pulled into this header: it is
-// included by orchestrations that define that constant locally, so doing so caused
-// a redefinition conflict. See issue #1189.
-constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_MS = 15000;  // 15 s
+// get_tensor_data/set_tensor_data spin wait timeout in cycles.
+// ~10s on hardware (1.5 GHz counter), ~10s on simulation (chrono-based).
+constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
 
 // =============================================================================
 // Task States
@@ -384,27 +378,10 @@ static_assert(
  * - fanin_count set once at submission, read-only after (hot path for ready check)
  * - task_state, fanin_refcount, fanout_refcount updated atomically
  */
-
-// fanout_count / fanout_refcount bit encoding (both uint32):
-//   bits [30:0] = consumer references (count: # consumers; refcount: # released)
-//   bit  [31]   = the owning scope's reference (PTO2_FANOUT_SCOPE_BIT)
-// fanout_count is seeded to PTO2_FANOUT_SCOPE_BIT and ++'d per consumer, so it
-// ends as (SCOPE_BIT | num_consumers). release adds 1 (consumer completion) or
-// SCOPE_BIT (scope_end). CONSUMED iff fanout_refcount == fanout_count (every
-// consumer released AND scope bit set). Keeping the scope ref in a distinct bit
-// (rather than folding scope + consumers into one count) lets a consumer reach
-// fanout_refcount == (fanout_count & ~PTO2_FANOUT_SCOPE_BIT) while the scope bit
-// is still unset -- i.e. "all consumers done but scope still open" stays
-// distinguishable from "fully consumed". The heap/task deadlock detector keys
-// off exactly that complement: that condition with state==COMPLETED means the
-// head can only be released by scope_end, which a blocked orchestrator can
-// never reach -> provable deadlock.
-static constexpr uint32_t PTO2_FANOUT_SCOPE_BIT = 0x80000000u;
-
 struct alignas(64) PTO2TaskSlotState {
     // Fanout lock + list (accessed together under lock in on_task_complete)
     std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
-    uint32_t fanout_count;             // SCOPE_BIT (owning scope) | number of consumers
+    int32_t fanout_count;              // 1 (owning scope) + number of consumers
 
     PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
 
@@ -416,7 +393,7 @@ struct alignas(64) PTO2TaskSlotState {
     int32_t fanin_count;                  // Number of producer dependencies (set once by wiring)
 
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
-    std::atomic<uint32_t> fanout_refcount;  // Dynamic: low bits = released consumers, bit31 = scope released
+    std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
     // Value is the same on every reuse (&task_payloads[slot] / &task_descriptors[slot]),
@@ -480,7 +457,7 @@ struct alignas(64) PTO2TaskSlotState {
      */
     void reset_for_reuse() {
         fanout_lock.store(0, std::memory_order_relaxed);
-        fanout_count = PTO2_FANOUT_SCOPE_BIT;  // bit31 = owning-scope ref; consumers ++ into low bits
+        fanout_count = 1;
         fanout_head = nullptr;
         fanin_refcount.store(0, std::memory_order_relaxed);
         fanout_refcount.store(0, std::memory_order_relaxed);

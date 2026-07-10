@@ -152,11 +152,6 @@ void Scheduler::worker_done(WorkerCompletion completion) {
     completion_cv_.notify_one();
 }
 
-void Scheduler::notify_ready() {
-    std::lock_guard<std::mutex> lk(completion_mu_);
-    completion_cv_.notify_one();
-}
-
 // =============================================================================
 // Scheduler loop
 // =============================================================================
@@ -166,9 +161,8 @@ void Scheduler::run() {
         // Wait until there's something to process
         {
             std::unique_lock<std::mutex> lk(completion_mu_);
-            completion_cv_.wait(lk, [this] {
-                return !completion_queue_.empty() || !cfg_.ready_next_level_queue->empty() ||
-                       !cfg_.ready_sub_queue->empty() || stop_requested_.load(std::memory_order_acquire);
+            completion_cv_.wait_for(lk, std::chrono::milliseconds(1), [this] {
+                return !completion_queue_.empty() || stop_requested_.load(std::memory_order_acquire);
             });
         }
 
@@ -351,21 +345,17 @@ void Scheduler::dispatch_ready() {
             }
             int N = s.group_size();  // 1 for normal tasks
 
-            // Affinity-aware dispatch: pin args[i] to affinities[i] when set,
-            // fill remaining slots from the idle pool. NEXT_LEVEL affinity
-            // values are stable worker ids; SUB keeps index semantics for
-            // internal callers.
+            // Affinity-aware dispatch: pin args[i] to worker affinities[i]
+            // when set, fill remaining slots from the idle pool.
             std::vector<WorkerThread *> workers(static_cast<size_t>(N), nullptr);
             bool ok = true;
 
             // Pass 1: satisfy affinity constraints
             for (int i = 0; i < N; i++) {
-                int32_t aff = s.get_affinity(i);
+                int8_t aff = s.get_affinity(i);
                 if (aff >= 0) {
-                    auto *wt = s.worker_type == WorkerType::NEXT_LEVEL ?
-                                   cfg_.manager->get_worker_by_id(s.worker_type, aff) :
-                                   cfg_.manager->get_worker_by_index(s.worker_type, aff);
-                    if (!wt || !wt->idle() || !s.worker_allowed(i, wt->worker_id())) {
+                    auto *wt = cfg_.manager->get_worker(s.worker_type, aff);
+                    if (!wt || !wt->idle() || !s.endpoint_allowed(i, wt->endpoint_id())) {
                         ok = false;
                         break;
                     }
@@ -377,7 +367,8 @@ void Scheduler::dispatch_ready() {
             if (ok) {
                 for (int i = 0; i < N; i++) {
                     if (workers[static_cast<size_t>(i)] != nullptr) continue;
-                    auto *wt = cfg_.manager->pick_idle(s.worker_type, workers, s.eligible_workers_for(i));
+                    auto *wt =
+                        cfg_.manager->pick_idle_excluding_eligible(s.worker_type, workers, s.eligible_endpoints_for(i));
                     if (!wt) {
                         ok = false;
                         break;

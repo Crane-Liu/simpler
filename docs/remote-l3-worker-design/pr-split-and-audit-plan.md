@@ -238,9 +238,8 @@ PR 2: callable identity and run contract.
 Scope:
 
 - Callable descriptors, digest/hashid identity, and target namespaces.
-- `ChipWorker.register_callable()` handle semantics.
-- `ChipWorker.run()` and `Worker.run()` run contract (return `None`; timing is
-  observed out-of-band via `[STRACE]` markers, not a return value).
+- `ChipWorker.prepare_callable()` handle semantics.
+- `ChipWorker.run()` and `Worker.run()` timing return contract.
 - Python import callable descriptors needed by remote registration.
 - Focused Python unit tests.
 
@@ -249,8 +248,7 @@ Acceptance criteria:
 - Target-private slots are not public routing IDs.
 - Prepare rollback and unregister refcount behavior are tested.
 - Descriptor hashing is stable.
-- `run()` returns `None`; timing is observed via `[STRACE]` markers (no
-  `RunTiming` return value).
+- `RunTiming` introspection contract is preserved.
 
 PR 3: remote wire codec.
 
@@ -275,7 +273,7 @@ Scope:
 
 - `WorkerEndpoint` interface.
 - `LocalMailboxEndpoint` adapter.
-- Endpoint capability metadata and eligible worker-id sets.
+- Endpoint capability metadata and eligible endpoint sets.
 - `WorkerCompletion` outcome propagation.
 - Failed task poisoning.
 - Remote tensor sidecars and dependency keys, without a live remote session.
@@ -283,7 +281,7 @@ Scope:
 
 Acceptance criteria:
 
-- Scheduler chooses only eligible idle workers.
+- Scheduler chooses only eligible idle endpoints.
 - Worker affinity is validated against eligibility.
 - Group partial failure and downstream poison are tested.
 - Slot release and `drain()` behavior are correct after success and failure.
@@ -312,8 +310,8 @@ Scope:
 
 - `simpler-remote-worker`.
 - `simpler-remote-l3-session`.
-- Python `RemoteCallable`, `RemoteBufferHandle`, `RemoteBufferExport`,
-  `RemoteTensorRef`, and hidden remote tensor sidecar integration.
+- Python `RemoteCallable`, `RemoteBufferHandle`, `RemoteTensorRef`, and
+  `RemoteTaskArgs` integration.
 - Simulation remote buffer allocation, copy, export, import, and release.
 - Remote dispatcher and inner worker registry controls.
 - Simulation integration tests.

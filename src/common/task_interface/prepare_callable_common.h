@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Runtime-agnostic helper for the kernel-upload half of register_callable_impl.
+ * Runtime-agnostic helper for the kernel-upload half of prepare_callable_impl.
  *
  * Each runtime variant (host_build_graph, tensormap_and_ringbuffer, ...) needs
  * to: upload the ChipCallable buffer to device once, then translate each child
@@ -36,7 +36,7 @@ struct ChildKernelAddr {
 };
 
 /**
- * Output bundle from a runtime's register_callable_impl() — everything the
+ * Output bundle from a runtime's prepare_callable_impl() — everything the
  * platform layer needs to register a callable_id with its DeviceRunner.
  *
  * Replaces the per-field Runtime::pending_* sidecar that earlier callsites
@@ -51,7 +51,7 @@ struct ChildKernelAddr {
  *                       device by DeviceRunner; host does no dlopen)
  *
  * func_name / config_name are non-empty only for the trb path; the hbg path
- * resolves its entry symbol during register_callable_impl and stores the
+ * resolves its entry symbol during prepare_callable_impl and stores the
  * resulting function pointer in host_orch_func_ptr directly.
  */
 struct CallableArtifacts {
@@ -67,6 +67,30 @@ struct CallableArtifacts {
     size_t orch_so_size{0};             // trb only
     std::string func_name;              // trb only (orch entry symbol)
     std::string config_name;            // trb only (orch config symbol)
+};
+
+/**
+ * Result of DeviceRunner::bind_callable_to_runtime — what the c_api
+ * needs to pass on to bind_callable_to_runtime_impl for a per-run binding.
+ *
+ * Returning a struct (rather than a `void**` out-parameter) keeps the caller
+ * site idiomatic — destructure with C++17 structured bindings:
+ *
+ *     auto [rc, host_orch_func_ptr] =
+ *         runner->bind_callable_to_runtime(*r, callable_id);
+ *
+ * `host_orch_func_ptr` is type-erased as `void *` (rather than the concrete
+ * OrchestrationFunc) so this header stays runtime-agnostic; only the hbg path
+ * sets it. trb leaves it null and bind_callable_to_runtime_impl asserts so.
+ */
+struct BindCallableResult {
+    int rc{0};
+    void *host_orch_func_ptr{nullptr};
+    // Pointer into CallableState's cached signature vector — valid
+    // until the callable_id is unregistered. Nullptr + 0 when the callable
+    // had no recorded signature (legacy path).
+    const ArgDirection *signature{nullptr};
+    int sig_count{0};
 };
 
 /**

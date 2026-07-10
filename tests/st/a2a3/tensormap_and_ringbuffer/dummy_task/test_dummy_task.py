@@ -57,7 +57,8 @@ class TestDummyTask(SceneTestCase):
                 "name": "WRITE_CONST",
                 "source": "kernels/aic/kernel_write_const.cpp",
                 "core_type": "aic",
-                # Single-AIC task with one INOUT tensor at payload slot 0.
+                # Single-AIC task with one INOUT tensor (args[0]). Declared so
+                # the tensor dump's per-subtask sum matches the payload.
                 "signature": [D.INOUT],
             },
             {

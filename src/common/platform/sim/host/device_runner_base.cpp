@@ -14,20 +14,14 @@
 #include <stdlib.h>
 
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <limits>
 #include <string>
 #include <utility>
 
 #include "callable.h"
 #include "callable_protocol.h"
-#include "call_config.h"
 #include "chip_callable_layout.h"
-#include "common/host_api.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
-#include "task_args.h"
 #include "utils/elf_build_id.h"
 
 namespace simpler::common::sim_host {
@@ -91,13 +85,11 @@ int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_si
     // Idempotent for the production case (sizes do not change across a
     // worker's lifetime). If a caller asks for a larger layout on any
     // region, redo just that region.
-    bool arena_changed = false;
-    auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+    auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
             if (arena.is_committed() && cached_size != 0) {
                 arena.release();
                 cached_size = 0;
-                arena_changed = true;
             }
             return 0;
         }
@@ -106,7 +98,6 @@ int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_si
         }
         arena.release();
         cached_size = 0;
-        arena_changed = true;
         arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
         if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
             arena.release();
@@ -129,64 +120,9 @@ int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_si
         cached_gm_heap_size_ = 0;
         cached_gm_sm_size_ = 0;
         cached_runtime_arena_size_ = 0;
-        prebuilt_runtime_arena_cache_valid_ = false;
-        prebuilt_runtime_arena_cache_key_.clear();
-        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-        prebuilt_runtime_arena_cache_image_.clear();
         return -1;
     }
-    if (arena_changed) {
-        prebuilt_runtime_arena_cache_valid_ = false;
-        prebuilt_runtime_arena_cache_key_.clear();
-        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-        prebuilt_runtime_arena_cache_image_.clear();
-    }
     return 0;
-}
-
-bool SimDeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
-    uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
-    void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
-) const {
-    if (!prebuilt_runtime_arena_cache_valid_ || prebuilt_runtime_arena_cache_hash_ != hash ||
-        prebuilt_runtime_arena_cache_key_.size() != key_size || key_data == nullptr || gm_heap_base == nullptr ||
-        sm_base == nullptr || runtime_arena_base == nullptr || runtime_off == nullptr || image_data == nullptr ||
-        image_size == nullptr) {
-        return false;
-    }
-    if (std::memcmp(prebuilt_runtime_arena_cache_key_.data(), key_data, key_size) != 0) {
-        return false;
-    }
-    *gm_heap_base = prebuilt_runtime_arena_cache_gm_heap_base_;
-    *sm_base = prebuilt_runtime_arena_cache_sm_base_;
-    *runtime_arena_base = prebuilt_runtime_arena_cache_runtime_arena_base_;
-    *runtime_off = prebuilt_runtime_arena_cache_runtime_off_;
-    *image_data = prebuilt_runtime_arena_cache_image_.data();
-    *image_size = prebuilt_runtime_arena_cache_image_.size();
-    return true;
-}
-
-void SimDeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
-    uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base, void *runtime_arena_base,
-    size_t runtime_off, const void *image_data, size_t image_size
-) {
-    prebuilt_runtime_arena_cache_valid_ = false;
-    prebuilt_runtime_arena_cache_hash_ = hash;
-    prebuilt_runtime_arena_cache_key_.assign(
-        static_cast<const uint8_t *>(key_data), static_cast<const uint8_t *>(key_data) + key_size
-    );
-    prebuilt_runtime_arena_cache_gm_heap_base_ = gm_heap_base;
-    prebuilt_runtime_arena_cache_sm_base_ = sm_base;
-    prebuilt_runtime_arena_cache_runtime_arena_base_ = runtime_arena_base;
-    prebuilt_runtime_arena_cache_runtime_off_ = runtime_off;
-    prebuilt_runtime_arena_cache_image_.assign(
-        static_cast<const uint8_t *>(image_data), static_cast<const uint8_t *>(image_data) + image_size
-    );
-    prebuilt_runtime_arena_cache_valid_ = true;
 }
 
 void *SimDeviceRunnerBase::acquire_pooled_gm_heap() {
@@ -265,155 +201,39 @@ int SimDeviceRunnerBase::device_memset(void *dev_ptr, int value, size_t bytes) {
     return 0;
 }
 
-void SimDeviceRunnerBase::get_retained_temp_buffer(void **addr, size_t *size) {
-    if (addr != nullptr) *addr = retained_temp_addr_;
-    if (size != nullptr) *size = retained_temp_size_;
-}
-
-void SimDeviceRunnerBase::set_retained_temp_buffer(void *addr, size_t size) {
-    retained_temp_addr_ = addr;
-    retained_temp_size_ = size;
-}
-
-void SimDeviceRunnerBase::clear_temporary_buffer() {
-    if (retained_temp_addr_ != nullptr) {
-        mem_alloc_.free(retained_temp_addr_);
-        retained_temp_addr_ = nullptr;
-        retained_temp_size_ = 0;
-    }
-}
-
-int SimDeviceRunnerBase::l3_l2_orch_comm_init(void *control_block, size_t control_block_size) {
-    return l3_l2_orch_comm_service_.start(this, control_block, control_block_size);
-}
-
-int SimDeviceRunnerBase::l3_l2_orch_comm_shutdown() { return l3_l2_orch_comm_service_.stop(); }
-
-void *SimDeviceRunnerBase::l3_l2_allocate_region_bytes(uint64_t bytes) {
-    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max()) {
-        return nullptr;
-    }
-    void *ptr = nullptr;
-    if (posix_memalign(&ptr, L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT, static_cast<size_t>(bytes)) != 0) {
-        return nullptr;
-    }
-    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
-    l3_l2_allocations_.insert(ptr);
-    return ptr;
-}
-
-void SimDeviceRunnerBase::l3_l2_free_region_bytes(void *ptr) {
-    if (ptr == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
-    auto it = l3_l2_allocations_.find(ptr);
-    if (it == l3_l2_allocations_.end()) {
-        return;
-    }
-    std::free(ptr);
-    l3_l2_allocations_.erase(it);
-}
-
-int SimDeviceRunnerBase::l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) {
-    if (bytes > std::numeric_limits<size_t>::max()) {
-        return -1;
-    }
-    return copy_to_device(dev_ptr, host_ptr, static_cast<size_t>(bytes));
-}
-
-int SimDeviceRunnerBase::l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) {
-    if (bytes > std::numeric_limits<size_t>::max()) {
-        return -1;
-    }
-    return copy_from_device(host_ptr, dev_ptr, static_cast<size_t>(bytes));
-}
-
-std::thread SimDeviceRunnerBase::l3_l2_create_service_thread(std::function<void()> fn) {
-    return create_thread(std::move(fn));
-}
-
-int SimDeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
-    // Registered-callable flow only: the orch SO was already delivered to the
-    // sim AICPU at launch_device_register time. A run just needs the active
-    // callable_id so the AICPU dispatches the right orch_so_table_ slot.
-    if (cid < 0) {
-        LOG_ERROR("stamp_orch_so: invalid callable_id=%d", cid);
-        return -1;
-    }
-    auto it = callables_.find(cid);
-    if (it == callables_.end()) {
-        LOG_ERROR("stamp_orch_so: callable_id=%d not registered", cid);
-        return -1;
-    }
-    runtime.set_active_callable_id(cid);
-    return 0;
-}
-
 int SimDeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
     const int32_t cid = runtime.get_active_callable_id();
     if (cid < 0) {
         LOG_ERROR("prepare_orch_so: no active callable_id; prepared-callable flow required");
         return -1;
     }
-    return stamp_orch_so(runtime, cid);
-}
-
-int SimDeviceRunnerBase::commit_device_register(int32_t cid) {
     auto it = callables_.find(cid);
     if (it == callables_.end()) {
-        LOG_ERROR("commit_device_register: callable_id=%d not registered", cid);
+        LOG_ERROR("prepare_orch_so: callable_id=%d not registered", cid);
         return -1;
     }
-    if (it->second.host_dlopen_handle != nullptr) {
+    const auto &state = it->second;
+    // hbg: orch SO never crosses host/device — clear device-orch metadata
+    // and skip AICPU bookkeeping.
+    if (state.host_dlopen_handle != nullptr) {
+        runtime.set_dev_orch_so(0, 0);
+        runtime.set_active_callable_id(cid, /*is_new=*/false);
         return 0;
     }
-    const bool inserted = aicpu_seen_callable_ids_.insert(cid).second;
-    if (inserted) {
+    const bool first_sighting = aicpu_seen_callable_ids_.insert(cid).second;
+    if (first_sighting) {
         ++aicpu_dlopen_total_;
-        LOG_INFO_V0("AICPU callable load committed cid=%d (count=%zu)", cid, aicpu_dlopen_total_);
     }
+    runtime.set_dev_orch_so(state.dev_orch_so_addr, state.dev_orch_so_size);
+    runtime.set_active_callable_id(cid, first_sighting);
+    LOG_INFO_V0(
+        "Orch SO prepared cid=%d hash=0x%lx %zu bytes (is_new=%d)", cid, state.hash, state.dev_orch_so_size,
+        first_sighting ? 1 : 0
+    );
     return 0;
 }
 
-int SimDeviceRunnerBase::launch_device_register(int32_t callable_id) {
-    auto it = callables_.find(callable_id);
-    if (it == callables_.end()) {
-        LOG_ERROR("launch_device_register: callable_id=%d not registered", callable_id);
-        return -1;
-    }
-    if (it->second.host_dlopen_handle != nullptr) {
-        return 0;
-    }
-
-    int rc = ensure_device_initialized();
-    if (rc != 0) {
-        LOG_ERROR("launch_device_register: ensure_device_initialized failed: %d", rc);
-        return rc;
-    }
-
-    // Build the orch-SO descriptor straight from CallableState — no throwaway
-    // Runtime + stamp round-trip. Mirrors the onboard launch_device_register.
-    const CallableState &state = it->second;
-    RegisterCallableArgs reg_args{};
-    reg_args.active_callable_id = callable_id;
-    reg_args.dev_orch_so_addr = state.dev_orch_so_addr;
-    reg_args.dev_orch_so_size = state.dev_orch_so_size;
-    snprintf(reg_args.device_orch_func_name, sizeof(reg_args.device_orch_func_name), "%s", state.func_name.c_str());
-    snprintf(
-        reg_args.device_orch_config_name, sizeof(reg_args.device_orch_config_name), "%s", state.config_name.c_str()
-    );
-
-    rc = invoke_device_register(reg_args);
-    if (rc != 0) {
-        LOG_ERROR("launch_device_register: invoke_device_register failed: %d", rc);
-        return rc;
-    }
-
-    return commit_device_register(callable_id);
-}
-
-int SimDeviceRunnerBase::record_device_orch_callable(
+int SimDeviceRunnerBase::register_callable(
     int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
@@ -422,17 +242,15 @@ int SimDeviceRunnerBase::record_device_orch_callable(
     // it by callable_id; rejecting an out-of-range id here keeps the host and
     // AICPU sides in sync and avoids an OOB access at run time.
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
-        LOG_ERROR(
-            "record_device_orch_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
-        );
+        LOG_ERROR("register_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS);
         return -1;
     }
     if (orch_so_data == nullptr || orch_so_size == 0) {
-        LOG_ERROR("record_device_orch_callable: empty orch SO for callable_id=%d", callable_id);
+        LOG_ERROR("register_callable: empty orch SO for callable_id=%d", callable_id);
         return -1;
     }
     if (callables_.count(callable_id) != 0) {
-        LOG_ERROR("record_device_orch_callable: callable_id=%d already registered", callable_id);
+        LOG_ERROR("register_callable: callable_id=%d already registered", callable_id);
         return -1;
     }
 
@@ -443,7 +261,7 @@ int SimDeviceRunnerBase::record_device_orch_callable(
     if (buf_it == orch_so_dedup_.end()) {
         void *buf = mem_alloc_.alloc(orch_so_size);
         if (buf == nullptr) {
-            LOG_ERROR("record_device_orch_callable: alloc %zu bytes failed", orch_so_size);
+            LOG_ERROR("register_callable: alloc %zu bytes failed", orch_so_size);
             return -1;
         }
         // Sim shares an address space with the simulated AICPU thread, so a
@@ -455,13 +273,11 @@ int SimDeviceRunnerBase::record_device_orch_callable(
         entry.refcount = 1;
         orch_so_dedup_.emplace(hash, entry);
         dev_addr = reinterpret_cast<uint64_t>(buf);
-        LOG_INFO_V0("record_device_orch_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
+        LOG_INFO_V0("register_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
     } else {
         buf_it->second.refcount++;
         dev_addr = reinterpret_cast<uint64_t>(buf_it->second.dev_addr);
-        LOG_INFO_V0(
-            "record_device_orch_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount
-        );
+        LOG_INFO_V0("register_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount);
     }
 
     CallableState state;
@@ -476,22 +292,22 @@ int SimDeviceRunnerBase::record_device_orch_callable(
     return 0;
 }
 
-int SimDeviceRunnerBase::record_host_orch_callable(
+int SimDeviceRunnerBase::register_callable_host_orch(
     int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
         LOG_ERROR(
-            "record_host_orch_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
+            "register_callable_host_orch: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
         );
         return -1;
     }
     if (host_dlopen_handle == nullptr || host_orch_func_ptr == nullptr) {
-        LOG_ERROR("record_host_orch_callable: null handle/fn for callable_id=%d", callable_id);
+        LOG_ERROR("register_callable_host_orch: null handle/fn for callable_id=%d", callable_id);
         return -1;
     }
     if (callables_.count(callable_id) != 0) {
-        LOG_ERROR("record_host_orch_callable: callable_id=%d already registered", callable_id);
+        LOG_ERROR("register_callable_host_orch: callable_id=%d already registered", callable_id);
         return -1;
     }
 
@@ -502,7 +318,7 @@ int SimDeviceRunnerBase::record_host_orch_callable(
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     ++host_dlopen_total_;
-    LOG_INFO_V0("record_host_orch_callable: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
+    LOG_INFO_V0("register_callable_host_orch: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
     return 0;
 }
 
@@ -533,55 +349,27 @@ int SimDeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool SimDeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
-// Per-run binding half, defined in each runtime's runtime_maker.cpp and linked
-// into this same sim runtime .so. Declared here (rather than only in
-// c_api_shared.cpp) so bind_callable_to_runtime can call it directly, keeping
-// the CallableState-derived host_orch_func_ptr / signature internal to the
-// runner instead of returning them across the c_api boundary.
-extern "C" int bind_callable_to_runtime_impl(
-    Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
-    const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
-    const uint64_t *ring_dep_pool
-);
-
-int SimDeviceRunnerBase::bind_callable_to_runtime(
-    Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
-    const uint64_t *ring_heap, const uint64_t *ring_dep_pool
-) {
+BindCallableResult SimDeviceRunnerBase::bind_callable_to_runtime(Runtime &runtime, int32_t callable_id) {
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
         LOG_ERROR("bind_callable_to_runtime: callable_id=%d not registered", callable_id);
-        return -1;
+        return {-1, nullptr, nullptr, 0};
     }
     const auto &state = it->second;
     for (const auto &kv : state.kernel_addrs) {
         if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
-            return -1;
+            return {-1, nullptr, nullptr, 0};
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
     }
-    // The AICPU dispatches the orch SO via this callable_id; the SO descriptor
-    // was already delivered at launch_device_register time.
-    runtime.set_active_callable_id(callable_id);
-
-    // Per-run binding. host_orch_func_ptr + signature come from CallableState and
-    // stay inside the runner — no longer returned to the c_api.
-    return bind_callable_to_runtime_impl(
-        &runtime, api, reinterpret_cast<const ChipStorageTaskArgs *>(orch_args), state.host_orch_func_ptr,
-        state.signature.empty() ? nullptr : state.signature.data(), static_cast<int>(state.signature.size()),
-        ring_task_window, ring_heap, ring_dep_pool
-    );
-}
-
-void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
-    set_l2_swimlane_enabled(config.enable_l2_swimlane);
-    set_dump_tensor_enabled(config.enable_dump_tensor);
-    set_pmu_enabled(config.enable_pmu);
-    // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.
-    set_dep_gen_enabled(config.enable_dep_gen != 0);
-    set_scope_stats_enabled(config.enable_scope_stats != 0);
-    set_output_prefix(config.output_prefix);
+    runtime.set_device_orch_func_name(state.func_name.c_str());
+    runtime.set_device_orch_config_name(state.config_name.c_str());
+    runtime.set_active_callable_id(callable_id, /*is_new=*/false);
+    return {
+        0, state.host_orch_func_ptr, state.signature.empty() ? nullptr : state.signature.data(),
+        static_cast<int>(state.signature.size())
+    };
 }
 
 uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *callable) {
@@ -675,11 +463,10 @@ void SimDeviceRunnerBase::print_handshake_results() {
     }
 
     LOG_DEBUG("Handshake results for %d cores:", worker_count_);
-    Handshake *workers = last_runtime_->get_workers();
     for (int i = 0; i < worker_count_; i++) {
         LOG_DEBUG(
-            "  Core %d: aicore_done=%d aicpu_ready=%d task=%d", i, workers[i].aicore_done, workers[i].aicpu_ready,
-            workers[i].task
+            "  Core %d: aicore_done=%d aicpu_ready=%d task=%d", i, last_runtime_->workers[i].aicore_done,
+            last_runtime_->workers[i].aicpu_ready, last_runtime_->workers[i].task
         );
     }
 }

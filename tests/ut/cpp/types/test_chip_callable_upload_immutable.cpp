@@ -50,7 +50,6 @@ std::vector<uint8_t> build_test_chip_callable() {
     const uint8_t kernel0[] = {0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04};
     const uint8_t kernel1[] = {0xca, 0xfe, 0xba, 0xbe, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a};
 
-    // This test exercises chip-callable upload/dedup, not the dump.
     auto core0 = make_callable<CORE_MAX_TENSOR_ARGS>(core_sig, kCoreSig, kernel0, sizeof(kernel0));
     auto core1 = make_callable<CORE_MAX_TENSOR_ARGS>(core_sig, kCoreSig, kernel1, sizeof(kernel1));
 

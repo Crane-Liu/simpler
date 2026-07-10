@@ -7,7 +7,7 @@ runtime threads are runnable than there are CPUs — high `--max-parallel` on a
 few-vCPU box, or several scene-test cases sharing one runner — the
 busy-spin/handshake/timeout logic that is correct on hardware can **livelock or
 false-timeout**. Symptoms: a stuck test that eventually hits the pytest session
-timeout (`rc=124`), or a `simpler_run failed with code -1` cascade. The work is
+timeout (`rc=124`), or a `run_prepared failed with code -1` cascade. The work is
 not wrong; the threads it depends on just never got a CPU slice in time.
 
 Mitigation: lower `--max-parallel` (e.g. `--max-parallel 2`) on CPU-constrained
@@ -32,7 +32,7 @@ Two distinct signatures, both only on sim and only under load:
    ```text
    Core X deinit timed out
    aicpu_execute: Thread execution failed with rc=-1
-   RuntimeError: chip_process dev=N: simpler_run failed with code -1
+   RuntimeError: chip_process dev=N: run_prepared failed with code -1
    ```
 
 Both appear intermittently in `st-sim-*` on `ubuntu-latest` (≈4 vCPU) and are
@@ -102,7 +102,7 @@ reliably, far below CI's ~4 vCPU):
 
 ```bash
 # N concurrent instances of one case, on 2 CPUs
-docker run --cpus=2 <image> bash -c '
+docker run --cpus=2 -e PTO_ISA_ROOT=/pto-isa <image> bash -c '
   source .venv/bin/activate
   for c in $(seq 1 8); do
     python -c "from examples.workers.l3.domain_rank_map.main import run; run(\"a5sim\",[0,1,2])" &

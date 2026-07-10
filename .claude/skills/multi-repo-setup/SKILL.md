@@ -1,24 +1,17 @@
 ---
 name: multi-repo-setup
-description: Set up a cross-repo investigation when a workload from another repo (pypto, pypto-lib, pypto-serving, etc.) needs to be run, especially when you want to swap in simpler-main HEAD or the current worktree's simpler instead of the version that repo pins. Documents the repo graph (who imports who), clones-or-updates each external repo every invocation so stale local clones don't lie about CI parity, and points at each repo's own skills/docs for workload-specific steps. MUST invoke before chasing "X doesn't work on simpler" reports where X lives outside this repo.
+description: Set up a cross-repo investigation when a workload from another repo (pypto, pypto-lib, etc.) needs to be run, especially when you want to swap in simpler-main HEAD or the current worktree's simpler instead of the version that repo pins. Clones-or-updates each external repo every invocation so stale local clones don't lie about CI parity. MUST invoke before chasing "X doesn't work on simpler" reports where X lives outside this repo.
 ---
 
 # Multi-Repo Investigation Setup
 
-This skill answers one question: **given a workload that lives in another
-repo, how do the repos relate, and how do I clone + set up each one so the
-workload runs against the simpler I want?** It stops at "the repos are
-installed and the workload's own entry point is reachable" — for what to
-*run* and how to read its output, defer to that repo's own skills/docs
-(see [Step 5](#step-5-hand-off-to-each-repos-own-skillsdocs)) or, for the
-qwen3 workload specifically, to
-[`multi-repo-qwen-setup`](../multi-repo-qwen-setup/SKILL.md).
-
 The skill lives in the simpler repo, so `$PWD` when you invoke it is
-already a simpler worktree — nothing to clone for simpler itself. Every
-other repo gets cloned-or-updated to a canonical local path each time. The
-default is to follow each repo's own pinning. Simpler dev often diverges
-from that to swap in either simpler-main HEAD or the current worktree.
+already a simpler worktree — nothing to clone for simpler itself.
+
+Every other repo gets cloned-or-updated to a canonical local path each
+time. The default is to follow each repo's own pinning. Simpler dev
+often diverges from that to swap in either simpler-main HEAD or the
+current worktree.
 
 ## When to invoke
 
@@ -31,7 +24,7 @@ Invoke before:
 Skip for work that stays inside `simpler/` (its own pytest, examples,
 unit tests).
 
-## Step 1: The repo graph (who imports who)
+## Step 1: The repo graph (URLs)
 
 For an Ascend workload investigation, the cast is usually some subset
 of these. `simpler` is `$PWD` — the other repos are cloned under the
@@ -39,22 +32,13 @@ worktree's **`build/`** (gitignored, so they never get committed and stay
 co-located with the simpler you're testing). `$BUILD` =
 `$(git rev-parse --show-toplevel)/build` (Step 2 defines it).
 
-| repo | role | imports | GitHub URL | local clone |
-| ---- | ---- | ------- | ---------- | ----------- |
-| simpler | host runtime + DFX (this repo) | — | <https://github.com/hw-native-sys/simpler> | `$PWD` (the current worktree) |
-| pto-isa | ISA spec | — | [pto-isa][pto-isa] | `$BUILD/pto-isa` |
-| pypto | compiler + Python frontend; vendors a simpler submodule at `runtime/` | simpler | <https://github.com/hw-native-sys/pypto> | `$BUILD/pypto` |
-| pypto-lib | model kernels (qwen3, deepseek, etc.) | pypto + simpler | <https://github.com/hw-native-sys/pypto-lib> | `$BUILD/pypto-lib` |
-| pypto-serving | serving stack + standalone model runners (qwen3 `npu_generate.py`) | pypto-lib + pypto + simpler | <https://github.com/hw-native-sys/pypto-serving> | `$BUILD/pypto-serving` |
-
-[pto-isa]: https://github.com/hw-native-sys/pto-isa
-| PTOAS | `ptoas` assembler — **provided globally**, no clone | — | (on dev box / CI) | `/usr/local/bin/ptoas-bin` via `pypto-setup` |
-
-The import chain is a stack: **pto-isa** (build-time spec) → **simpler**
-(runtime) → **pypto** (compiler, vendors simpler) → **pypto-lib** (kernels)
-→ **pypto-serving** (serving + runners). A change low in the stack
-(simpler) can break anything above it; that's why Step 3 lets you pin which
-simpler the whole stack sees.
+| repo | role | GitHub URL | local clone |
+| ---- | ---- | ---------- | ----------- |
+| simpler | host runtime + DFX (this repo) | <https://github.com/hw-native-sys/simpler> | `$PWD` (the current worktree) |
+| pypto | compiler + Python frontend; vendors a simpler submodule at `runtime/` | <https://github.com/hw-native-sys/pypto> | `$BUILD/pypto` |
+| pypto-lib | model workloads (qwen3, deepseek, etc.) — imports pypto + simpler | <https://github.com/hw-native-sys/pypto-lib> | `$BUILD/pypto-lib` |
+| pto-isa | ISA spec; sets `PTO_ISA_ROOT` (required to BUILD the simpler runtime) | <https://github.com/hw-native-sys/pto-isa> | `$BUILD/pto-isa` |
+| PTOAS | `ptoas` assembler — **provided globally**, no clone | (on dev box / CI) | `/usr/local/bin/ptoas-bin` via `pypto-setup` |
 
 Drop rows your investigation doesn't need. Add rows for ad-hoc repos in
 the same format.
@@ -81,11 +65,10 @@ ensure_repo() {
   git -C "$dir" submodule update --init --recursive --depth 1
 }
 
-ensure_repo https://github.com/hw-native-sys/pto-isa        "$BUILD/pto-isa"
-ensure_repo https://github.com/hw-native-sys/pypto          "$BUILD/pypto"
-ensure_repo https://github.com/hw-native-sys/pypto-lib      "$BUILD/pypto-lib"
-ensure_repo https://github.com/hw-native-sys/pypto-serving  "$BUILD/pypto-serving"
-# add more as needed; drop rows your investigation doesn't touch
+ensure_repo https://github.com/hw-native-sys/pypto      "$BUILD/pypto"
+ensure_repo https://github.com/hw-native-sys/pypto-lib  "$BUILD/pypto-lib"
+ensure_repo https://github.com/hw-native-sys/pto-isa    "$BUILD/pto-isa"
+# add more as needed
 ```
 
 Notes:
@@ -97,13 +80,15 @@ Notes:
 - PTOAS / CANN / gcc-15 are **provided globally** — no download. Step 2.5's
   `pypto-setup --export` points `PTOAS_ROOT` at them.
 
-## Step 2.5: Toolchain env — `pypto-setup`
+## Step 2.5: Toolchain env — `pypto-setup` + `PTO_ISA_ROOT`
 
 The dev box and CI runners ship ptoas, CANN, and gcc-15 globally; the
-`pypto-setup` helper hands you the env in one line:
+`pypto-setup` helper hands you the env in one line. `PTO_ISA_ROOT` is the
+one piece it does NOT set (it's per-user) — point it at the `build/` clone:
 
 ```bash
 eval "$(pypto-setup --export)"          # exports PTOAS_ROOT, ASCEND_HOME_PATH, GCC15_ROOT, PATH
+export PTO_ISA_ROOT="$BUILD/pto-isa"    # required to BUILD the simpler runtime
 ```
 
 Run `pypto-setup` (no args) to see every global component, its path, and
@@ -111,8 +96,8 @@ whether it's present. Why each matters:
 
 - **`PTOAS_ROOT`** unset → the JIT compile silently sets `skip_ptoas=True` →
   no `kernel_config.py` emitted → the runtime can't assemble kernels onboard.
-- **PTO-ISA checkout unavailable** → the simpler runtime build fails with
-  `PTO-ISA not available`; manually clone pto-isa into `build/pto-isa`.
+- **`PTO_ISA_ROOT`** unset → the simpler runtime build fails with
+  `PTO-ISA not available`.
 
 ## Step 3: Override — pick which simpler the workload sees
 
@@ -133,36 +118,14 @@ pip install --no-build-isolation "$BUILD/simpler-main"
 ### Override B: this worktree's simpler (your PR branch)
 
 You want to test in-flight changes (current PR / dev branch) against the
-external workload. The install builds the onboard runtime against the
-`pto_isa.pin` managed checkout. A stale simpler whose ABI
+external workload. `PTO_ISA_ROOT` (Step 2.5) must be exported first — the
+install builds the onboard runtime against it. A stale simpler whose ABI
 doesn't match the pypto compiler surfaces as **507018** on the first run.
 
 ```bash
 source .venv/bin/activate
-pip install --no-build-isolation .
+pip install --no-build-isolation .   # needs PTO_ISA_ROOT set (Step 2.5)
 ```
-
-**Re-editing simpler later → the runtime `.so` may NOT recompile.** Non-editable
-`pip install .` (and `--force-reinstall`) rebuilds the *Python wheel* but can
-**silently skip the runtime build** (the runtime builder skips when outputs
-already exist), so a fresh C++ edit to `src/{arch}/runtime|platform/*` does not
-take effect — you keep running the old binary (real footgun: a runtime fix or
-diagnostic you added appears to do nothing). After editing simpler's C++, either
-verify the installed `.so` actually changed, or rebuild it via the cmake cache
-and sync to **both** load locations (`build/lib` AND the installed
-`.venv/.../simpler_setup/_assets/build/lib`):
-
-```bash
-BD=build/cache/{arch}/onboard/tensormap_and_ringbuffer/{aicpu|host|aicore}
-cmake --build "$BD" -j                       # incremental; recompiles changed .cpp
-SO="$BD/libaicpu_kernel.so"                   # or libhost_runtime.so / aicore_kernel.o
-for d in $(find .venv build/lib -path "*onboard*tensormap_and_ringbuffer*$(basename "$SO")"); do cp "$SO" "$d"; done
-strings "$SO" | grep '<your-marker>'          # confirm your change is in the binary
-```
-
-(CI/dev normally "use `-e .`" — editable rebuilds incrementally on reinstall; but
-multi-repo prefers non-editable to avoid the `_simpler_editable.pth` leak, so you
-must take the verify-or-cmake-build step above instead.)
 
 ### Either way: verify which simpler actually loaded
 
@@ -193,13 +156,10 @@ without reinstall. Editable installs leak the `_simpler_editable.pth`
 hook into user-site, which survives sessions and shadows the next
 venv install. Non-editable installs don't.
 
-## Step 4: Install the compiler / kernel / serving layers
+## Step 4: Install pypto / pypto-lib
 
-Install only the layers your workload imports (the Step 1 chain). For each,
-prefer plain `--no-build-isolation` install and let the vendored simpler
-stay unbuilt — you've already provided simpler via Step 3.
-
-### pypto (compiler)
+For pypto, plain install too — let pypto's vendored `runtime/` stay
+unbuilt because you've already provided simpler via Step 3:
 
 ```bash
 pip install --no-build-isolation "$BUILD/pypto"
@@ -207,57 +167,58 @@ pip install --no-build-isolation "$BUILD/pypto"
 # overwrite the simpler you installed in Step 3 with pypto's older pin.
 ```
 
-### pypto-lib (kernels) — import-only
+pypto-lib is import-only (no install). Set `PYTHONPATH` and run
+scripts out of its tree directly:
 
 ```bash
-export PYTHONPATH="$BUILD/pypto-lib"   # no install; run scripts out of its tree
+export PYTHONPATH="$BUILD/pypto-lib"
 ```
 
-### pypto-serving (serving + runners)
-
-Install or `PYTHONPATH`-import per that repo's README (see Step 5). Its
-qwen3 runner is the entry point the
-[`multi-repo-qwen-setup`](../multi-repo-qwen-setup/SKILL.md)
-skill drives.
-
-Re-verify the loaded simpler after every install — an install can
+Re-verify the loaded simpler after every install — pypto's install can
 re-resolve dependencies in ways that change what wins.
 
-## Step 5: Hand off to each repo's own skills/docs
+## Worked example: qwen3 decode_layer onboard (a2a3) + DFX
 
-This skill gets the repos cloned, the toolchain env exported, and the
-simpler-of-your-choice installed. **What to run inside each repo — its
-test entry points, flags, golden-data setup, DFX knobs — is documented in
-that repo, not here.** After Step 4, for each external repo you're using,
-consult, in this order:
-
-1. **That repo's `.claude/skills/`** (if it has one) — task-specific
-   workflows maintained by that repo's owners.
-2. **That repo's top-level `README.md`** and any `docs/` — setup and
-   run recipes.
-3. **The workload script's own docstring / `--help`** — often the most
-   precise statement of intent and flags.
+End-to-end, assuming Steps 1–4 done (repos in `$BUILD`, env from Step 2.5,
+worktree simpler installed). The case is
+`$BUILD/pypto-lib/models/qwen3/14b/decode_layer.py`. Onboard runs MUST hold a
+per-die lock (see `.claude/rules/running-onboard.md`) and pass the
+`onboard-arch-precheck` gate.
 
 ```bash
-ls "$BUILD/<repo>/.claude/skills" 2>/dev/null   # repo-owned skills, if any
-sed -n '1,40p' "$BUILD/<repo>/README.md"        # repo setup/run recipe
-python "$BUILD/<repo>/<workload>.py" --help      # the script's own contract
+.claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1   # refuse wrong-arch BEFORE locking
+cd "$BUILD/pypto-lib/models/qwen3/14b"
+# Round 1 — dep_gen (topology) ; Round 2 — swimlane (clean timing). NEVER co-run:
+# dep_gen perturbs the timing the overhead analysis reads.
+task-submit --device auto --device-num 1 --run "python decode_layer.py -p a2a3 -d \$TASK_DEVICE"
+task-submit --device auto --device-num 1 --run "python decode_layer.py -p a2a3 -d \$TASK_DEVICE --no-dep-gen --enable-l2-swimlane"
 ```
 
-Do not duplicate those instructions into simpler's skills — link to them.
-The one exception maintained here is the qwen3 workload, whose cross-repo
-timing/ring/timeout gotchas are simpler-specific enough to warrant the
-dedicated [`multi-repo-qwen-setup`](../multi-repo-qwen-setup/SKILL.md)
-skill.
+Both write to `build_output/_jit_*/dfx_outputs/` (`deps.json` from round 1,
+`l2_swimlane_records.json` from round 2). Then analyze from the simpler worktree
+(its `simpler_setup/tools` wins by cwd precedence):
 
-## Step 6: If the workload fails — start with "is it CI-gated?"
+```bash
+# ROUND1_DIR / ROUND2_DIR are the two build_output/_jit_*/dfx_outputs/ dirs above.
+python -m simpler_setup.tools.sched_overhead_analysis \
+    --l2-swimlane-records-json "ROUND2_DIR/l2_swimlane_records.json" \
+    --deps-json "ROUND1_DIR/deps.json"
+# Visual: add the Overhead Analysis track to the Perfetto trace
+python -m simpler_setup.tools.swimlane_converter "ROUND2_DIR/l2_swimlane_records.json" \
+    --deps-json "ROUND1_DIR/deps.json" --overhead -o swimlane.json
+```
+
+See [docs/dfx/sched-overhead-model.md](../../../docs/dfx/sched-overhead-model.md)
+for what the report and the 8 overhead tracks mean.
+
+## Step 5: If the workload fails — start with "is it CI-gated?"
 
 The most informative first check is whether the workload is gated by
 that repo's CI workflow.
 
 | case | meaning | how to triage |
 | ---- | ------- | ------------- |
-| **CI-gated** | the repo's CI runs this exact script today; it was passing as of the last green CI run | A failure now usually points at a **recent code change** — your in-flight simpler changes, or a commit landed in pypto / pypto-lib / pypto-serving since the last CI run. Bisect against `origin/main` of each repo. |
+| **CI-gated** | the repo's CI runs this exact script today; it was passing as of the last green CI run | A failure now usually points at a **recent code change** — your in-flight simpler changes, or a commit landed in pypto / pypto-lib since the last CI run. Bisect against `origin/main` of each repo. |
 | **not CI-gated** | the script is in the repo but no workflow invokes it | Read the docstring first. Files like this are often "intent" / "EXPECTED / INTENT program" / experimental drafts — they may be documented as expected-to-fail. Treat as workload bug, not simpler bug, unless proven otherwise. |
 
 Quick check:
@@ -279,7 +240,7 @@ pypto-lib ... example"). That subset is the actual cross-repo gate.
 | `ModuleNotFoundError: No module named 'pypto'` | pypto not installed in this venv | reinstall pypto from your local clone |
 | `import simpler` resolves to wrong path | user-site `.pth` hook shadowing venv | remove `_simpler_editable.{pth,py}` from user-site |
 | `FileNotFoundError: kernel_config.py not found in ...` | `PTOAS_ROOT` unset → pypto auto-skips ptoas → no `kernel_config.py` emitted | `eval "$(pypto-setup --export)"` (Step 2.5) |
-| PTO-ISA unavailable | no checkout | clone into `build/pto-isa` |
+| `OSError: PTO-ISA not available` (during simpler build) | `PTO_ISA_ROOT` unset | `export PTO_ISA_ROOT="$BUILD/pto-isa"` (Step 2.5) |
 | script exits 0 but no device run | compile-only smoke fallback (golden data dir missing) | pass `--data-dir <golden>` or `--smoke` explicitly |
 | `aclrtSynchronizeStreamWithTimeout (AICPU) failed: 507018` | binary skew (simpler runtime vs pypto compiler ABI), OR device log is the only ground truth | rebuild simpler against the matching pypto (Step 3/4); then read `~/ascend/log/debug/device-N/device-<pid>_*.log` |
 | `BFloat16 did not match Float` at validate | golden data shape mismatch (data older than code) | regenerate golden via the workload's `gen_*_golden.py` |
@@ -296,18 +257,13 @@ grep "completed=" "$LOG" | head -1
 ```
 
 If the same task hangs across every retry on every chip, it's the
-workload (or your code change), not chip contention. For the full
-`507018` mechanism-classification table (deadlock vs op-timeout vs
-stall), see [`.claude/rules/running-onboard.md`](../../rules/running-onboard.md).
+workload (or your code change), not chip contention.
 
 ## Anti-patterns
 
 - ❌ **Trusting an existing local clone without `git fetch`**. Your
   clone is whatever you last fetched, possibly weeks behind. Step 2
   exists precisely to make this not a thing.
-- ❌ **Re-documenting another repo's run steps here**. Link to that
-  repo's own `.claude/skills/` / README (Step 5) — duplicated steps go
-  stale the moment that repo moves.
 - ❌ **Using `-e` "just to be safe"**. Editable installs leak a
   user-site finder hook that survives sessions and shadows the next
   venv install. Plain install is the default; reach for `-e` only
@@ -315,7 +271,7 @@ stall), see [`.claude/rules/running-onboard.md`](../../rules/running-onboard.md)
 - ❌ **Blaming chip contention before reading the device log**. The
   device log either shows the contention signature (sibling-die cores
   with `cond_reg_state=ack` from another owner) or it doesn't.
-- ❌ **Treating any failing workload as "simpler broke it"**. Step 6's
+- ❌ **Treating any failing workload as "simpler broke it"**. Step 5's
   CI-gate check separates "your simpler change broke a CI case" (real)
   from "this file was always expected to fail" (not your problem).
 - ❌ **Skipping `.claude/rules/running-onboard.md`** on onboard

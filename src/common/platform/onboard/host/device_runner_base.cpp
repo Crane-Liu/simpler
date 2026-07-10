@@ -32,90 +32,19 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 
 #include "callable.h"
 #include "callable_protocol.h"
-#include "call_config.h"
 #include "chip_callable_layout.h"
 #include "common/core_type.h"
-#include "common/host_api.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
-#include "host/raii_scope_guard.h"
 #include "host_log.h"
-#include "pto_runtime_c_api.h"
-#include "task_args.h"
 #include "utils/elf_build_id.h"
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
 // `print_handshake_results` / `bind_callable_to_runtime` /
 // `prepare_orch_so`.
-
-// Implemented by each runtime's host part (runtime_maker.cpp). Reports the
-// AICPU entry symbols this runtime exports beyond the base {exec, init} set, so
-// the common AICPU loader carries no runtime-specific symbol knowledge. TMARB
-// returns simpler_aicpu_register_callable; host_build_graph returns none.
-extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
-
-namespace {
-
-HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
-    RuntimeTimeoutConfig order_defaults{
-        PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
-    };
-    RuntimeTimeoutParseStatus parse_status;
-    RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(order_defaults, &parse_status);
-
-    if (parse_status.op_execute_env_set && !parse_status.op_execute_valid) {
-        const char *op_env = std::getenv(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
-        LOG_WARN(
-            "%s=%s invalid, using default %llu", PTO2_OP_EXECUTE_TIMEOUT_US_ENV, op_env,
-            (unsigned long long)order_defaults.op_execute_timeout_us
-        );
-    }
-
-    if (parse_status.stream_sync_env_set && !parse_status.stream_sync_valid) {
-        const char *sync_env = std::getenv(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV);
-        LOG_WARN(
-            "%s=%s invalid, using default %d", PTO2_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env,
-            order_defaults.stream_sync_timeout_ms
-        );
-    }
-
-    if (parse_status.scheduler_env_set && !parse_status.scheduler_valid) {
-        const char *sched_env = std::getenv(PTO2_SCHEDULER_TIMEOUT_MS_ENV);
-        LOG_WARN(
-            "%s=%s invalid, using default %d", PTO2_SCHEDULER_TIMEOUT_MS_ENV, sched_env,
-            order_defaults.scheduler_timeout_ms
-        );
-    }
-
-    bool host_timeout_env_set =
-        parse_status.op_execute_env_set || parse_status.stream_sync_env_set || parse_status.scheduler_env_set;
-    RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(cfg);
-    // The scheduler override is forwarded to the device (via InitArgs at init)
-    // only when explicitly set, valid, and consistent with the op/stream
-    // ordering. 0 means "no override" — the AICPU scheduler then keeps its
-    // compile-time default. op/stream remain host-side acl knobs.
-    int32_t scheduler_override = (parse_status.scheduler_env_set && parse_status.scheduler_valid &&
-                                  order_status == RuntimeTimeoutOrderStatus::OK) ?
-                                     cfg.scheduler_timeout_ms :
-                                     0;
-    if (host_timeout_env_set && order_status != RuntimeTimeoutOrderStatus::OK) {
-        LOG_WARN(
-            "Ignoring PTO2 timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, stream_sync=%d ms)",
-            runtime_timeout_order_status_name(order_status), cfg.scheduler_timeout_ms,
-            (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
-        );
-        return HostRuntimeTimeoutConfig{
-            order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms, scheduler_override
-        };
-    }
-    return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override};
-}
-
-}  // namespace
 
 DeviceRunnerBase::DeviceRunnerBase() :
     gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
@@ -142,82 +71,6 @@ int DeviceRunnerBase::device_memset(void *dev_ptr, int value, std::size_t bytes)
     return aclrtMemset(dev_ptr, bytes, value, bytes);
 }
 
-void DeviceRunnerBase::get_retained_temp_buffer(void **addr, size_t *size) {
-    if (addr != nullptr) *addr = retained_temp_addr_;
-    if (size != nullptr) *size = retained_temp_size_;
-}
-
-void DeviceRunnerBase::set_retained_temp_buffer(void *addr, size_t size) {
-    retained_temp_addr_ = addr;
-    retained_temp_size_ = size;
-}
-
-void DeviceRunnerBase::clear_temporary_buffer() {
-    if (retained_temp_addr_ != nullptr) {
-        mem_alloc_.free(retained_temp_addr_);
-        retained_temp_addr_ = nullptr;
-        retained_temp_size_ = 0;
-    }
-}
-
-int DeviceRunnerBase::l3_l2_orch_comm_init(void *control_block, size_t control_block_size) {
-    if (!l3_l2_orch_comm_supported()) {
-        return PTO_RUNTIME_ERR_UNSUPPORTED;
-    }
-    return l3_l2_orch_comm_service_.start(this, control_block, control_block_size);
-}
-
-int DeviceRunnerBase::l3_l2_orch_comm_shutdown() {
-    if (!l3_l2_orch_comm_supported()) {
-        return 0;
-    }
-    return l3_l2_orch_comm_service_.stop();
-}
-
-void *DeviceRunnerBase::l3_l2_allocate_region_bytes(uint64_t bytes) {
-    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max()) {
-        return nullptr;
-    }
-    void *ptr = allocate_tensor(static_cast<size_t>(bytes));
-    if (ptr == nullptr) {
-        return nullptr;
-    }
-    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
-    l3_l2_allocations_.insert(ptr);
-    return ptr;
-}
-
-void DeviceRunnerBase::l3_l2_free_region_bytes(void *ptr) {
-    if (ptr == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
-    auto it = l3_l2_allocations_.find(ptr);
-    if (it == l3_l2_allocations_.end()) {
-        return;
-    }
-    free_tensor(ptr);
-    l3_l2_allocations_.erase(it);
-}
-
-int DeviceRunnerBase::l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) {
-    if (bytes > std::numeric_limits<size_t>::max()) {
-        return -1;
-    }
-    return copy_to_device(dev_ptr, host_ptr, static_cast<size_t>(bytes));
-}
-
-int DeviceRunnerBase::l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) {
-    if (bytes > std::numeric_limits<size_t>::max()) {
-        return -1;
-    }
-    return copy_from_device(host_ptr, dev_ptr, static_cast<size_t>(bytes));
-}
-
-std::thread DeviceRunnerBase::l3_l2_create_service_thread(std::function<void()> fn) {
-    return create_thread(std::move(fn));
-}
-
 void *DeviceRunnerBase::acquire_pooled_gm_heap() {
     if (!gm_heap_arena_.is_committed()) return nullptr;
     return gm_heap_arena_.base();
@@ -235,47 +88,6 @@ void *DeviceRunnerBase::acquire_pooled_runtime_arena() {
     return runtime_arena_pool_.base();
 }
 
-bool DeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
-    uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
-    void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
-) const {
-    if (!prebuilt_runtime_arena_cache_valid_ || prebuilt_runtime_arena_cache_hash_ != hash ||
-        prebuilt_runtime_arena_cache_key_.size() != key_size || key_data == nullptr || gm_heap_base == nullptr ||
-        sm_base == nullptr || runtime_arena_base == nullptr || runtime_off == nullptr || image_data == nullptr ||
-        image_size == nullptr) {
-        return false;
-    }
-    if (std::memcmp(prebuilt_runtime_arena_cache_key_.data(), key_data, key_size) != 0) {
-        return false;
-    }
-    *gm_heap_base = prebuilt_runtime_arena_cache_gm_heap_base_;
-    *sm_base = prebuilt_runtime_arena_cache_sm_base_;
-    *runtime_arena_base = prebuilt_runtime_arena_cache_runtime_arena_base_;
-    *runtime_off = prebuilt_runtime_arena_cache_runtime_off_;
-    *image_data = prebuilt_runtime_arena_cache_image_.data();
-    *image_size = prebuilt_runtime_arena_cache_image_.size();
-    return true;
-}
-
-void DeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
-    uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base, void *runtime_arena_base,
-    size_t runtime_off, const void *image_data, size_t image_size
-) {
-    prebuilt_runtime_arena_cache_valid_ = false;
-    prebuilt_runtime_arena_cache_hash_ = hash;
-    prebuilt_runtime_arena_cache_key_.assign(
-        static_cast<const uint8_t *>(key_data), static_cast<const uint8_t *>(key_data) + key_size
-    );
-    prebuilt_runtime_arena_cache_gm_heap_base_ = gm_heap_base;
-    prebuilt_runtime_arena_cache_sm_base_ = sm_base;
-    prebuilt_runtime_arena_cache_runtime_arena_base_ = runtime_arena_base;
-    prebuilt_runtime_arena_cache_runtime_off_ = runtime_off;
-    prebuilt_runtime_arena_cache_image_.assign(
-        static_cast<const uint8_t *>(image_data), static_cast<const uint8_t *>(image_data) + image_size
-    );
-    prebuilt_runtime_arena_cache_valid_ = true;
-}
-
 int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
     // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
     // runtime arena. Split out from a single large allocation because the
@@ -287,8 +99,7 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
     // worker's lifetime). If a caller asks for a larger layout on any
     // region, redo just that region — already-committed peers stay alive
     // so their callers don't have to re-acquire.
-    bool arena_changed = false;
-    auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+    auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
             // hbg's runtime_arena path: caller passed 0 and never reserved
             // a region. Leave the arena uncommitted; acquire_pooled_* will
@@ -296,7 +107,6 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
             if (arena.is_committed() && cached_size != 0) {
                 arena.release();
                 cached_size = 0;
-                arena_changed = true;
             }
             return 0;
         }
@@ -305,7 +115,6 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
         }
         arena.release();
         cached_size = 0;
-        arena_changed = true;
         arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
         if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
             // commit() failure leaves committed_=false, so the next entry's
@@ -334,21 +143,7 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
         cached_gm_heap_size_ = 0;
         cached_gm_sm_size_ = 0;
         cached_runtime_arena_size_ = 0;
-        prebuilt_runtime_arena_cache_valid_ = false;
-        prebuilt_runtime_arena_cache_key_.clear();
-        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-        prebuilt_runtime_arena_cache_image_.clear();
         return -1;
-    }
-    if (arena_changed) {
-        prebuilt_runtime_arena_cache_valid_ = false;
-        prebuilt_runtime_arena_cache_key_.clear();
-        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-        prebuilt_runtime_arena_cache_image_.clear();
     }
     return 0;
 }
@@ -382,7 +177,6 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
     }
 
     if (device_id_ == -1) {
-        timeout_config_ = resolve_onboard_timeout_config();
         configure_aicore_op_timeout();
     }
 
@@ -392,16 +186,15 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
 
 void DeviceRunnerBase::configure_aicore_op_timeout() {
     uint64_t actual_timeout = 0;
-    int rc = aclrtSetOpExecuteTimeOutV2(timeout_config_.op_execute_timeout_us, &actual_timeout);
+    int rc = aclrtSetOpExecuteTimeOutV2(PLATFORM_OP_EXECUTE_TIMEOUT_US, &actual_timeout);
     if (rc != 0) {
         LOG_ERROR(
-            "aclrtSetOpExecuteTimeOutV2(%llu us) failed: %d", (unsigned long long)timeout_config_.op_execute_timeout_us,
-            rc
+            "aclrtSetOpExecuteTimeOutV2(%llu us) failed: %d", (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, rc
         );
     } else {
         LOG_INFO_V0(
             "aclrtSetOpExecuteTimeOutV2: requested=%llu us, actual=%llu us",
-            (unsigned long long)timeout_config_.op_execute_timeout_us, (unsigned long long)actual_timeout
+            (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, (unsigned long long)actual_timeout
         );
     }
 }
@@ -444,46 +237,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
         LOG_INFO_V0("DeviceRunner: device=%d set, streams created", device_id_);
     }
 
-    rc = ensure_binaries_loaded();
-    if (rc != 0) return rc;
-
-    return ensure_aicpu_init_launched();
-}
-
-int DeviceRunnerBase::ensure_aicpu_init_launched() {
-    // Per-device one-shot: latch the invariants (orch device id, log config)
-    // into the resident AICPU SO globals via simpler_aicpu_init, so exec /
-    // record_device_orch_callable launches no longer carry them. The inner SO stays
-    // dlopen'd across launches, so a single init holds for the runner's life.
-    if (aicpu_init_launched_) {
-        return 0;
-    }
-
-    InitArgs init_args{};
-    init_args.device_id = static_cast<uint32_t>(device_id_);
-    init_args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
-    init_args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
-    // Per-device scheduler watchdog override, resolved once at attach into
-    // timeout_config_. 0 -> the AICPU scheduler keeps its compile-time default.
-    init_args.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
-
-    LOG_INFO_V0("=== launch_aicpu_payload %s ===", host::KernelNames::InitName);
-    int rc = launch_aicpu_payload(
-        stream_aicpu_, &init_args, sizeof(init_args), host::KernelNames::InitName, /*aicpu_num=*/1
-    );
-    if (rc != 0) {
-        LOG_ERROR("ensure_aicpu_init_launched: launch_aicpu_payload failed: %d", rc);
-        return rc;
-    }
-
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
-    if (rc != 0) {
-        LOG_ERROR("ensure_aicpu_init_launched: stream sync failed: %d (device_id=%d)", rc, device_id_);
-        return rc;
-    }
-
-    aicpu_init_launched_ = true;
-    return 0;
+    return ensure_binaries_loaded();
 }
 
 int DeviceRunnerBase::ensure_binaries_loaded() {
@@ -524,21 +278,27 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
     }
     LOG_INFO_V2("DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap");
 
-    // JSON-register the inner SO and resolve its runtime entry handles. The
-    // runtime reports any AICPU entries it exports beyond the base set so the
-    // loader stays runtime-agnostic.
-    std::vector<std::string> extra_symbols;
-    size_t extra_count = 0;
-    const char *const *extra = runtime_extra_aicpu_symbols(&extra_count);
-    for (size_t i = 0; i < extra_count && extra != nullptr; ++i) {
-        if (extra[i] != nullptr) extra_symbols.emplace_back(extra[i]);
-    }
-    rc = load_aicpu_op_.Init(extra_symbols);
+    // JSON-register the inner SO and resolve the simpler_aicpu_exec handle.
+    rc = load_aicpu_op_.Init();
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::Init failed: %d", rc);
         return rc;
     }
-    LOG_INFO_V2("DeviceRunner: inner SO registered (runtime entry handles ready)");
+    LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_exec handle ready)");
+
+    // H2D the per-task DeviceArgs struct itself. device_args_.aicpu_so_bin/len
+    // stay zero — our own per-task AICPU code (launched via rtsLaunchCpuKernel
+    // against the cached rtFuncHandle on LoadAicpuOp) never reads them, and
+    // the dispatcher-bootstrap KernelArgs (KERNEL_TYPE_AICPU_KFC) builds its
+    // own DeviceArgs view inside BootstrapDispatcher rather than reading
+    // ours. The "load-bearing on a5" finding documented prior to #864/#870
+    // no longer reproduces against current HEAD — see PR removing
+    // AicpuSoInfo (CI on both archs green).
+    rc = kernel_args_.init_device_args(device_args_, mem_alloc_);
+    if (rc != 0) {
+        LOG_ERROR("init_device_args failed: %d", rc);
+        return rc;
+    }
 
     // Release host bytes — bootstrap is done. Per-task launches go through
     // the cached rtFuncHandle owned by LoadAicpuOp; dispatcher SO bytes are
@@ -607,9 +367,7 @@ void DeviceRunnerBase::print_handshake_results() {
     // Allocate temporary buffer to read handshake data from device
     std::vector<Handshake> workers(worker_count_);
     size_t total_size = sizeof(Handshake) * worker_count_;
-    rtMemcpy(
-        workers.data(), total_size, kernel_args_.args.runtime_args->get_workers(), total_size, RT_MEMCPY_DEVICE_TO_HOST
-    );
+    rtMemcpy(workers.data(), total_size, kernel_args_.args.runtime_args->workers, total_size, RT_MEMCPY_DEVICE_TO_HOST);
 
     LOG_DEBUG("Handshake results for %d cores:", worker_count_);
     for (int i = 0; i < worker_count_; i++) {
@@ -676,106 +434,46 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     return chip_dev;
 }
 
-int DeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
-    // Registered-callable flow only: the orch SO was already H2D'd and
-    // dlopen'd device-side at record_device_orch_callable / launch_device_register
-    // time. All that remains for a run is to tell the AICPU which orch_so_table_
-    // slot to dispatch — the active callable_id.
-    if (cid < 0) {
-        LOG_ERROR("stamp_orch_so: invalid callable_id=%d", cid);
-        return -1;
-    }
-    auto it = callables_.find(cid);
-    if (it == callables_.end()) {
-        LOG_ERROR("stamp_orch_so: callable_id=%d not registered", cid);
-        return -1;
-    }
-    runtime.set_active_callable_id(cid);
-    return 0;
-}
-
 int DeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
+    // Registered-callable flow only: the SO bytes were already H2D'd at
+    // register_callable time. Stamp dev_orch_so on the runtime and mark
+    // `is_new` based on whether the AICPU has seen this cid since
+    // registration.
     const int32_t cid = runtime.get_active_callable_id();
     if (cid < 0) {
         LOG_ERROR("prepare_orch_so: no active callable_id; registered-callable flow required");
         return -1;
     }
-    return stamp_orch_so(runtime, cid);
-}
-
-int DeviceRunnerBase::commit_device_register(int32_t cid) {
     auto it = callables_.find(cid);
     if (it == callables_.end()) {
-        LOG_ERROR("commit_device_register: callable_id=%d not registered", cid);
+        LOG_ERROR("prepare_orch_so: callable_id=%d not registered", cid);
         return -1;
     }
     const auto &state = it->second;
+    // hbg variant: orch SO never crosses the host/device boundary, so the
+    // AICPU does no per-cid dlopen. Skip the orch_so_table_ bookkeeping
+    // (and the AICPU dlopen counter) and clear the device-orch metadata.
     if (state.host_dlopen_handle != nullptr) {
+        runtime.set_dev_orch_so(0, 0);
+        runtime.set_active_callable_id(cid, /*is_new=*/false);
         return 0;
     }
-    const bool inserted = aicpu_seen_callable_ids_.insert(cid).second;
-    if (inserted) {
+    const bool first_sighting = aicpu_seen_callable_ids_.insert(cid).second;
+    if (first_sighting) {
         ++aicpu_dlopen_total_;
-        LOG_INFO_V0("AICPU callable load committed cid=%d (count=%zu)", cid, aicpu_dlopen_total_);
     }
+    runtime.set_dev_orch_so(state.dev_orch_so_addr, state.dev_orch_so_size);
+    // The c_api caller passed is_new=false; refresh with the authoritative
+    // first_sighting flag before AICPU consumes register_new_callable_id_.
+    runtime.set_active_callable_id(cid, first_sighting);
+    LOG_INFO_V0(
+        "Orch SO prepared cid=%d hash=0x%lx %zu bytes (is_new=%d)", cid, state.hash, state.dev_orch_so_size,
+        first_sighting ? 1 : 0
+    );
     return 0;
 }
 
-int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
-    auto it = callables_.find(callable_id);
-    if (it == callables_.end()) {
-        LOG_ERROR("launch_device_register: callable_id=%d not registered", callable_id);
-        return -1;
-    }
-    if (it->second.host_dlopen_handle != nullptr) {
-        return 0;
-    }
-
-    int rc = ensure_device_initialized();
-    if (rc != 0) {
-        LOG_ERROR("launch_device_register: ensure_device_initialized failed: %d", rc);
-        return rc;
-    }
-
-    // Build the orch-SO descriptor straight from CallableState — no full
-    // Runtime H2D as the old prewarm path did. Registration always (re)dlopens
-    // the SO device-side, so there is no per-callable "new?" bit to carry.
-    const CallableState &state = it->second;
-    RegisterCallableArgs reg_args{};
-    reg_args.active_callable_id = callable_id;
-    reg_args.dev_orch_so_addr = state.dev_orch_so_addr;
-    reg_args.dev_orch_so_size = state.dev_orch_so_size;
-    snprintf(reg_args.device_orch_func_name, sizeof(reg_args.device_orch_func_name), "%s", state.func_name.c_str());
-    snprintf(
-        reg_args.device_orch_config_name, sizeof(reg_args.device_orch_config_name), "%s", state.config_name.c_str()
-    );
-
-    LOG_INFO_V0("=== launch_aicpu_payload %s ===", host::KernelNames::RegisterCallableName);
-    rc = launch_aicpu_payload(
-        stream_aicpu_, &reg_args, sizeof(reg_args), host::KernelNames::RegisterCallableName, /*aicpu_num=*/1
-    );
-    if (rc != 0) {
-        LOG_ERROR("launch_device_register: launch_aicpu_payload failed: %d", rc);
-        return rc;
-    }
-
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
-    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
-        LOG_ERROR(
-            "launch_device_register: stream sync timeout timeout_ms=%d device_id=%d", PLATFORM_STREAM_SYNC_TIMEOUT_MS,
-            device_id_
-        );
-        return rc;
-    }
-    if (rc != 0) {
-        LOG_ERROR("launch_device_register: aclrtSynchronizeStreamWithTimeout failed: %d", rc);
-        return rc;
-    }
-
-    return commit_device_register(callable_id);
-}
-
-int DeviceRunnerBase::record_device_orch_callable(
+int DeviceRunnerBase::register_callable(
     int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
@@ -784,17 +482,15 @@ int DeviceRunnerBase::record_device_orch_callable(
     // it by callable_id; rejecting an out-of-range id here keeps the host and
     // AICPU sides in sync and avoids an OOB access at run time.
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
-        LOG_ERROR(
-            "record_device_orch_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
-        );
+        LOG_ERROR("register_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS);
         return -1;
     }
     if (orch_so_data == nullptr || orch_so_size == 0) {
-        LOG_ERROR("record_device_orch_callable: empty orch SO for callable_id=%d", callable_id);
+        LOG_ERROR("register_callable: empty orch SO for callable_id=%d", callable_id);
         return -1;
     }
     if (callables_.count(callable_id) != 0) {
-        LOG_ERROR("record_device_orch_callable: callable_id=%d already registered", callable_id);
+        LOG_ERROR("register_callable: callable_id=%d already registered", callable_id);
         return -1;
     }
 
@@ -808,12 +504,12 @@ int DeviceRunnerBase::record_device_orch_callable(
     if (buf_it == orch_so_dedup_.end()) {
         void *buf = mem_alloc_.alloc(orch_so_size);
         if (buf == nullptr) {
-            LOG_ERROR("record_device_orch_callable: alloc %zu bytes failed", orch_so_size);
+            LOG_ERROR("register_callable: alloc %zu bytes failed", orch_so_size);
             return -1;
         }
         int rc = rtMemcpy(buf, orch_so_size, orch_so_data, orch_so_size, RT_MEMCPY_HOST_TO_DEVICE);
         if (rc != 0) {
-            LOG_ERROR("record_device_orch_callable: rtMemcpy failed: %d", rc);
+            LOG_ERROR("register_callable: rtMemcpy failed: %d", rc);
             mem_alloc_.free(buf);
             return rc;
         }
@@ -823,13 +519,11 @@ int DeviceRunnerBase::record_device_orch_callable(
         entry.refcount = 1;
         orch_so_dedup_.emplace(hash, entry);
         dev_addr = reinterpret_cast<uint64_t>(buf);
-        LOG_INFO_V0("record_device_orch_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
+        LOG_INFO_V0("register_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
     } else {
         buf_it->second.refcount++;
         dev_addr = reinterpret_cast<uint64_t>(buf_it->second.dev_addr);
-        LOG_INFO_V0(
-            "record_device_orch_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount
-        );
+        LOG_INFO_V0("register_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount);
     }
 
     CallableState state;
@@ -844,22 +538,22 @@ int DeviceRunnerBase::record_device_orch_callable(
     return 0;
 }
 
-int DeviceRunnerBase::record_host_orch_callable(
+int DeviceRunnerBase::register_callable_host_orch(
     int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
         LOG_ERROR(
-            "record_host_orch_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
+            "register_callable_host_orch: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
         );
         return -1;
     }
     if (host_dlopen_handle == nullptr || host_orch_func_ptr == nullptr) {
-        LOG_ERROR("record_host_orch_callable: null handle/fn for callable_id=%d", callable_id);
+        LOG_ERROR("register_callable_host_orch: null handle/fn for callable_id=%d", callable_id);
         return -1;
     }
     if (callables_.count(callable_id) != 0) {
-        LOG_ERROR("record_host_orch_callable: callable_id=%d already registered", callable_id);
+        LOG_ERROR("register_callable_host_orch: callable_id=%d already registered", callable_id);
         return -1;
     }
 
@@ -870,7 +564,7 @@ int DeviceRunnerBase::record_host_orch_callable(
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     ++host_dlopen_total_;
-    LOG_INFO_V0("record_host_orch_callable: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
+    LOG_INFO_V0("register_callable_host_orch: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
     return 0;
 }
 
@@ -901,69 +595,38 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool DeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
-uint64_t DeviceRunnerBase::callable_hash(int32_t callable_id) const {
-    auto it = callables_.find(callable_id);
-    return it == callables_.end() ? 0 : it->second.hash;
-}
-
-// Per-run binding half, defined in each runtime's runtime_maker.cpp and linked
-// into this same host_runtime.so. Declared here (rather than only in
-// c_api_shared.cpp) so bind_callable_to_runtime can call it directly, keeping
-// the CallableState-derived host_orch_func_ptr / signature internal to the
-// runner instead of returning them across the c_api boundary.
-extern "C" int bind_callable_to_runtime_impl(
-    Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
-    const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
-    const uint64_t *ring_dep_pool
-);
-
-int DeviceRunnerBase::bind_callable_to_runtime(
-    Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
-    const uint64_t *ring_heap, const uint64_t *ring_dep_pool
-) {
+BindCallableResult DeviceRunnerBase::bind_callable_to_runtime(Runtime &runtime, int32_t callable_id) {
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
         LOG_ERROR("bind_callable_to_runtime: callable_id=%d not registered", callable_id);
-        return -1;
+        return {-1, nullptr, nullptr, 0};
     }
     const auto &state = it->second;
 
-    // Replay each prepared kernel address into runtime.func_id_to_addr_.
-    // The kernel binaries are owned by the shared DeviceRunner pool and
-    // survive across runs — freed only by `finalize()`, never by
-    // validate_runtime_impl or `unregister_callable`.
+    // Replay kernel addresses directly into runtime.func_id_to_addr_ without
+    // going through set_function_bin_addr. The latter records func_ids in
+    // registered_kernel_func_ids_, which validate_runtime_impl iterates to
+    // free kernel binaries — but registered kernels must survive across runs
+    // and are only freed by `finalize()` / `unregister_callable`.
     for (const auto &kv : state.kernel_addrs) {
         if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
-            return -1;
+            return {-1, nullptr, nullptr, 0};
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
     }
-    // Tell the AICPU which orch_so_table_ slot this run dispatches. The orch SO
-    // descriptor itself was delivered at register time via RegisterCallableArgs.
-    runtime.set_active_callable_id(callable_id);
-
-    // Per-run binding (tensor args, GM heap, SM alloc). host_orch_func_ptr is
-    // non-null only on the hbg path; signature is the cached ChipCallable
-    // signature_[], plumbed end-to-end for per-tensor H2D/D2H direction
-    // decisions in runtime_maker (trb consumes it, hbg ignores it). Both stay
-    // internal to the runner now — they are no longer returned to the c_api.
-    return bind_callable_to_runtime_impl(
-        &runtime, api, reinterpret_cast<const ChipStorageTaskArgs *>(orch_args), state.host_orch_func_ptr,
-        state.signature.empty() ? nullptr : state.signature.data(), static_cast<int>(state.signature.size()),
-        ring_task_window, ring_heap, ring_dep_pool
-    );
-}
-
-void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
-    set_l2_swimlane_enabled(config.enable_l2_swimlane);
-    set_dump_tensor_enabled(config.enable_dump_tensor);
-    set_pmu_enabled(config.enable_pmu);
-    // Virtual: a2a3 and a5 wire through to their enable_dep_gen_; an arch
-    // without dep_gen falls through to the base no-op.
-    set_dep_gen_enabled(config.enable_dep_gen != 0);
-    set_scope_stats_enabled(config.enable_scope_stats != 0);
-    set_output_prefix(config.output_prefix);
+    runtime.set_device_orch_func_name(state.func_name.c_str());
+    runtime.set_device_orch_config_name(state.config_name.c_str());
+    // Stamp callable_id with is_new=false; prepare_orch_so refreshes the flag
+    // with the authoritative first_sighting answer right before launch.
+    runtime.set_active_callable_id(callable_id, /*is_new=*/false);
+    // hbg path: host_orch_func_ptr travels back to the c_api caller, which
+    // hands it to bind_callable_to_runtime_impl. trb path: stays null and
+    // the device-side orch SO is resolved from the symbol names above.
+    return {
+        0, state.host_orch_func_ptr, state.signature.empty() ? nullptr : state.signature.data(),
+        static_cast<int>(state.signature.size())
+    };
 }
 
 // =============================================================================
@@ -977,13 +640,7 @@ int DeviceRunnerBase::launch_aicpu_kernel(
     // exported symbol (simpler_aicpu_exec). LaunchBuiltInOp dispatches via
     // rtsLaunchCpuKernel on the cached rtFuncHandle resolved by
     // LoadAicpuOp::Init at first-time bootstrap.
-    return load_aicpu_op_.LaunchBuiltInOp(stream, k_args, sizeof(KernelArgs), aicpu_num, kernel_name);
-}
-
-int DeviceRunnerBase::launch_aicpu_payload(
-    rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num
-) {
-    return load_aicpu_op_.LaunchBuiltInOp(stream, args, args_size, aicpu_num, kernel_name);
+    return load_aicpu_op_.LaunchBuiltInOp(stream, k_args, aicpu_num, kernel_name);
 }
 
 int DeviceRunnerBase::finalize_common() {
@@ -991,21 +648,6 @@ int DeviceRunnerBase::finalize_common() {
     auto capture = [&rc](int err) {
         if (err != 0 && rc == 0) rc = err;
     };
-
-    // Teardown invariant: finalize_common() is the single place that releases
-    // every RTS/device-owning resource, and the subclass runs it BEFORE its
-    // device reset / aclFinalize. Several base-class members have destructors
-    // that themselves call an RTS API -- LoadAicpuOp::~ -> rtsBinaryUnload,
-    // MemoryAllocator::~ -> finalize -> rtFree, DeviceArena::~ -> release ->
-    // rtFree. A member destructor runs (per C++ rules) only AFTER finalize()
-    // returns, i.e. AFTER aclFinalize has torn down the RTS context, and
-    // touching an RTS interface on a dead context segfaults on a5 (a2a3 happens
-    // to tolerate it). So each such member is released explicitly here while RTS
-    // is live; every release is idempotent (guarded on a handle / committed_ /
-    // raw_base_ flag) so the eventual destructor no-ops. Any new member owning
-    // an RTS/device resource must be released here, with an idempotent
-    // destructor as the backstop. See issue #1197.
-    capture(l3_l2_orch_comm_shutdown());
 
     // Streams are persistent for the DeviceRunner's lifetime; destroy them here.
     // Intentionally no pre-destroy sync: when a run hits the AICore op-timeout
@@ -1023,19 +665,17 @@ int DeviceRunnerBase::finalize_common() {
         stream_aicore_ = nullptr;
     }
 
-    // LoadAicpuOp holds a binary_handle_ from rtsBinaryLoadFromFile; unload it
-    // here while RTS is live so ~LoadAicpuOp's idempotent Finalize() no-ops
-    // instead of unloading after aclFinalize (see the invariant above).
-    load_aicpu_op_.Finalize();
+    // Cleanup kernel args (deviceArgs); device-side KernelArgs + runtime args
+    // are released by runtime_args_cleanup RAII so they also unwind on errors.
+    capture(kernel_args_.finalize_device_args());
 
+    // load_aicpu_op_ has no per-task host-side state to release —
+    // rtsLaunchCpuKernel does not hand back any per-launch handle, and the
+    // dispatcher itself was a transient libaicpu_extend_kernels dlopen.
     // aicore_bin_handle_ was registered once via rtRegisterAllKernel; CANN
     // releases its device-side state when the device context tears down.
     aicore_bin_handle_ = nullptr;
     binaries_loaded_ = false;
-    // The inner AICPU SO is unloaded with the binaries above, so its latched
-    // globals are gone too — clear the one-shot guard so a reused runner
-    // re-launches simpler_aicpu_init after the next ensure_binaries_loaded().
-    aicpu_init_launched_ = false;
 
     // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
     // Pool semantics mirror per-fid binaries: never freed until finalize.
@@ -1078,14 +718,6 @@ int DeviceRunnerBase::finalize_common() {
     gm_heap_arena_.release();
     gm_sm_arena_.release();
     runtime_arena_pool_.release();
-    prebuilt_runtime_arena_cache_valid_ = false;
-    prebuilt_runtime_arena_cache_key_.clear();
-    prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-    prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-    prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-    prebuilt_runtime_arena_cache_image_.clear();
-
-    clear_temporary_buffer();
 
     // Free the 8-byte device_wall buffer (allocated lazily in run()) while
     // mem_alloc_ and the device context are still live. free_tensor() routes
@@ -1167,34 +799,30 @@ int DeviceRunnerBase::validate_launch_aicpu_num(int launch_aicpu_num) {
 }
 
 void DeviceRunnerBase::ensure_device_wall_buffer() {
-    // Per-thread fixed AICPU phase records (thread-major:
-    // AicpuPhaseRecord[NUM_AICPU_PHASES] per launched AICPU thread). Slot
-    // AicpuPhase::RunWall keeps the original whole-run wall; the rest subdivide
-    // the on-NPU portion. Each surviving AICPU thread writes its own records
-    // (plain stores, no atomics); read_device_phases() reduces RunWall as
-    // max(end) - min(start) and surfaces the other phases as trace markers. The
-    // buffer is allocated once (lazy) but RESET every run so a stale prior run
-    // cannot leak into the reduction.
-    constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    constexpr int kRecords = kThreads * NUM_AICPU_PHASES;
-    constexpr size_t kBytes = static_cast<size_t>(kRecords) * sizeof(AicpuPhaseRecord);
+    // Run-wall slots: one { start_cycle, end_cycle } pair per launched AICPU
+    // thread. Each surviving AICPU thread writes its own slot (plain stores,
+    // no atomics); read_device_wall_ns() reduces max(end) - min(start). The
+    // buffer is allocated once (lazy) but RESET every run so a stale prior
+    // run cannot leak into the reduction.
+    constexpr int kWallSlots = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    constexpr size_t kWallBytes = static_cast<size_t>(kWallSlots) * 2 * sizeof(uint64_t);
     if (device_wall_dev_ptr_ == nullptr) {
-        device_wall_dev_ptr_ = allocate_tensor(kBytes);
+        device_wall_dev_ptr_ = allocate_tensor(kWallBytes);
         if (device_wall_dev_ptr_ != nullptr) {
             kernel_args_.args.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
         }
     }
     if (device_wall_dev_ptr_ != nullptr) {
-        AicpuPhaseRecord init[kRecords];
-        for (int i = 0; i < kRecords; ++i) {
-            init[i].start_cycle = kPhaseUnset;  // start: sentinel so min()/unset-check ignore unused slots
-            init[i].end_cycle = 0;              // end: 0 so max() ignores unused slots
+        uint64_t init[kWallSlots * 2];
+        for (int i = 0; i < kWallSlots; ++i) {
+            init[i * 2] = UINT64_MAX;  // start: MAX so min() ignores unused slots
+            init[i * 2 + 1] = 0;       // end: 0 so max() ignores unused slots
         }
         if (copy_to_device(device_wall_dev_ptr_, init, sizeof(init)) != 0) {
-            // Reset failed — disable capture for this run so stale slot data
-            // can't leak into the reduction. Cleared pointer means the buffer
-            // is re-allocated (and re-reset) on the next run.
-            LOG_WARN("device_phase reset H2D failed; disabling phase capture this run");
+            // Reset failed — disable wall capture for this run so stale slot
+            // data can't leak into the reduction. Cleared pointer means the
+            // buffer is re-allocated (and re-reset) on the next run.
+            LOG_WARN("device_wall reset H2D failed; disabling wall capture this run");
             free_tensor(device_wall_dev_ptr_);
             device_wall_dev_ptr_ = nullptr;
             kernel_args_.args.device_wall_data_base = 0;
@@ -1231,18 +859,17 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
         return -1;
     }
 
-    runtime.set_worker_count(num_aicore);
+    runtime.worker_count = num_aicore;
     worker_count_ = num_aicore;  // Stored for print_handshake_results in destructor
-    runtime.set_aicpu_thread_num(launch_aicpu_num);
+    runtime.aicpu_thread_num = launch_aicpu_num;
 
     // First `block_dim` cores are AIC; remaining ~2/3 are AIV.
     int num_aic = block_dim;
-    Handshake *workers = runtime.get_workers();
     for (int i = 0; i < num_aicore; i++) {
-        workers[i].aicpu_ready = 0;
-        workers[i].aicore_done = 0;
-        workers[i].task = 0;
-        workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
+        runtime.workers[i].aicpu_ready = 0;
+        runtime.workers[i].aicore_done = 0;
+        runtime.workers[i].task = 0;
+        runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
     }
 
     // Set function_bin_addr for all tasks: Runtime::func_id_to_addr_[] stores
@@ -1264,11 +891,11 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
 
 int DeviceRunnerBase::sync_run_streams() {
     LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
-    int rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, timeout_config_.stream_sync_timeout_ms);
+    int rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
-            timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
         );
         return rc;
     }
@@ -1278,11 +905,11 @@ int DeviceRunnerBase::sync_run_streams() {
     }
 
     LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, timeout_config_.stream_sync_timeout_ms);
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
-            timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
         );
         return rc;
     }
@@ -1294,52 +921,38 @@ int DeviceRunnerBase::sync_run_streams() {
 }
 
 void DeviceRunnerBase::read_device_wall_ns() {
-    // Pull the per-thread AICPU phase records back from the device buffer that
-    // AICPU writes through via KernelArgs::device_wall_data_base. (We can't use
-    // the device_k_args_ shadow here — CANN's rtAicpuKernelLaunchExWithArgs
-    // copies KernelArgs into AICPU-private memory at launch, so AICPU's writes
-    // to its local copy don't propagate to device_k_args_.) Failure path is a
-    // soft warn — wall + phases stay zero.
+    // Pull the platform-level device wall (ns) back from the 8-byte
+    // device buffer that AICPU writes through via
+    // KernelArgs::device_wall_data_base. (We can't use the
+    // device_k_args_ shadow here — CANN's rtAicpuKernelLaunchExWithArgs
+    // copies KernelArgs into AICPU-private memory at launch, so AICPU's
+    // writes to its local copy don't propagate to device_k_args_.)
+    // Failure path is a soft warn — wall stays zero.
     device_wall_ns_ = 0;
-    for (int p = 0; p < NUM_AICPU_PHASES; ++p) {
-        device_phase_ns_[p] = 0;
-        device_phase_start_ns_[p] = 0;
-    }
     if (device_wall_dev_ptr_ == nullptr) return;
 
-    constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    constexpr int kRecords = kThreads * NUM_AICPU_PHASES;
-    AicpuPhaseRecord buf[kRecords] = {};
+    constexpr int kWallSlots = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    uint64_t buf[kWallSlots * 2] = {};
     int wall_rc = rtMemcpy(buf, sizeof(buf), device_wall_dev_ptr_, sizeof(buf), RT_MEMCPY_DEVICE_TO_HOST);
     if (wall_rc != 0) {
-        LOG_WARN("rtMemcpy(device_phase) D2H failed: %d", wall_rc);
+        LOG_WARN("rtMemcpy(device_wall) D2H failed: %d", wall_rc);
         return;
     }
 
-    // Reduce across threads: per phase, min(start) + span = max(end) - min(start)
-    // in cycles. RunWall (slot 0) is published as device_wall_ns_ for backward
-    // compatibility; its duration is the whole-run wall.
-    uint64_t start_cycles[NUM_AICPU_PHASES];
-    uint64_t span_cycles[NUM_AICPU_PHASES];
-    reduce_aicpu_phase_windows(buf, kThreads, start_cycles, span_cycles);
-
-    // Origin = earliest sub-phase start (Preamble..SchedWindow share the device
-    // clock; RunWall is the bracket at offset 0). Sub-phase start offsets from
-    // this origin give a common device-clock timeline so the orchestrator and
-    // scheduler windows are comparable (their union is the "Effective" window).
-    uint64_t origin = kPhaseUnset;
-    for (int p = static_cast<int>(AicpuPhase::Preamble); p < NUM_AICPU_PHASES; ++p) {
-        if (start_cycles[p] != kPhaseUnset && start_cycles[p] < origin) origin = start_cycles[p];
+    // Reduce the per-thread slots: wall = max(end) - min(start) in cycles,
+    // converted to ns. Unused/dropped slots stay at { MAX, 0 } from the reset
+    // and are skipped by the sentinel checks.
+    uint64_t min_start = UINT64_MAX;
+    uint64_t max_end = 0;
+    for (int i = 0; i < kWallSlots; ++i) {
+        uint64_t s = buf[i * 2];
+        uint64_t e = buf[i * 2 + 1];
+        if (s != UINT64_MAX && s < min_start) min_start = s;
+        if (e > max_end) max_end = e;
     }
-
-    for (int p = 0; p < NUM_AICPU_PHASES; ++p) {
-        device_phase_ns_[p] = span_cycles[p] > 0 ? static_cast<uint64_t>(cycles_to_us(span_cycles[p]) * 1000.0) : 0;
-        if (p != static_cast<int>(AicpuPhase::RunWall) && start_cycles[p] != kPhaseUnset && origin != kPhaseUnset &&
-            start_cycles[p] >= origin) {
-            device_phase_start_ns_[p] = static_cast<uint64_t>(cycles_to_us(start_cycles[p] - origin) * 1000.0);
-        }
+    if (min_start != UINT64_MAX && max_end > min_start) {
+        device_wall_ns_ = static_cast<uint64_t>(cycles_to_us(max_end - min_start) * 1000.0);
     }
-    device_wall_ns_ = device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)];
 }
 
 int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime) {
@@ -1348,9 +961,14 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime) {
         LOG_ERROR("init_runtime_args failed: %d", rc);
         return rc;
     }
-    // Log config and device ordinal are no longer published per-run on
-    // KernelArgs — they were latched once into the AICPU SO globals by
-    // simpler_aicpu_init (ensure_aicpu_init_launched) at device init.
+    // Publish log config to AICPU via KernelArgs (severity floor + INFO verbosity).
+    // HostLogger is the single source of truth for log config (seeded by
+    // libsimpler_log.so via simpler_log_init before host_runtime.so was even
+    // dlopen'd). Read it directly when populating KernelArgs.
+    kernel_args_.args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
+    kernel_args_.args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
+    // Device ordinal for the AICPU executor's per-device orchestration-SO name.
+    kernel_args_.args.device_id = static_cast<uint32_t>(device_id_);
     return 0;
 }
 

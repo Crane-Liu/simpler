@@ -37,10 +37,10 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
                 "name": "PA_AIC",
                 "source": "kernels/mix/paged_attention_parallel.cpp",
                 "core_type": "aic",
-                # Cooperative mix: AIC and AIV share one 9-tensor args[]. Each
-                # half declares the shared payload (task-level directions); the
-                # dump records each tensor once per declaring subtask, under its
-                # own func_id. Consumed only by the dump; dispatch ignores it.
+                # Declare the full 9-tensor layout here (AIV entry left empty)
+                # so the tensor dump — which sums per-subtask signature tensors
+                # and matches them to the payload — captures all args under
+                # func_id 0. Consumed only by the dump; dispatch ignores it.
                 "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.INOUT, D.OUT, D.OUT, D.OUT],
             },
             {
@@ -48,7 +48,6 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
                 "name": "PA_AIV",
                 "source": "kernels/mix/paged_attention_parallel.cpp",
                 "core_type": "aiv",
-                "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.INOUT, D.OUT, D.OUT, D.OUT],
             },
         ],
     }

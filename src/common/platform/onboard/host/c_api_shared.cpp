@@ -25,7 +25,6 @@
  */
 
 #include "callable.h"
-#include "call_config.h"
 #include "device_runner_base.h"
 #include "prepare_callable_common.h"
 #include "pto_runtime_c_api.h"
@@ -34,12 +33,11 @@
 #include <dlfcn.h>
 #include <pthread.h>
 
+#include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <utility>
 #include <vector>
 
-#include "common/strace.h"
 #include "common/unified_log.h"
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
@@ -55,11 +53,16 @@ extern "C" {
 /* ===========================================================================
  * Runtime Implementation Functions (defined in each runtime's runtime_maker.cpp)
  * =========================================================================== */
-int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
-int validate_runtime_impl(Runtime *runtime, const HostApi *api);
+int prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
+int bind_callable_to_runtime_impl(
+    Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
+    int sig_count, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
+    const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools
+);
+int validate_runtime_impl(Runtime *runtime);
 
 /* ===========================================================================
- * Per-thread DeviceRunnerBase binding (set by simpler_register_callable / simpler_run)
+ * Per-thread DeviceRunnerBase binding (set by prepare_callable / run_prepared)
  * =========================================================================== */
 
 static pthread_key_t g_runner_key;
@@ -69,8 +72,7 @@ static void create_runner_key() { pthread_key_create(&g_runner_key, nullptr); }
 static DeviceRunnerBase *current_runner() { return static_cast<DeviceRunnerBase *>(pthread_getspecific(g_runner_key)); }
 
 /* ===========================================================================
- * Internal device-memory functions (wired into a HostApi and passed to the
- * runtime impls, NOT dlsym'd)
+ * Internal device-memory functions (used via Runtime.host_api, NOT dlsym'd)
  * =========================================================================== */
 
 static void *device_malloc(size_t size) {
@@ -115,21 +117,6 @@ static int device_memset(void *dev_ptr, int value, size_t size) {
     }
 }
 
-static void get_retained_temp_buffer(void **addr, size_t *size) {
-    try {
-        current_runner()->get_retained_temp_buffer(addr, size);
-    } catch (...) {
-        if (addr != nullptr) *addr = nullptr;
-        if (size != nullptr) *size = 0;
-    }
-}
-
-static void set_retained_temp_buffer(void *addr, size_t size) {
-    try {
-        current_runner()->set_retained_temp_buffer(addr, size);
-    } catch (...) {}
-}
-
 static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     try {
         return current_runner()->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));
@@ -169,52 +156,6 @@ static void *acquire_pooled_runtime_arena_wrapper() {
         return nullptr;
     }
 }
-
-static bool lookup_prebuilt_runtime_arena_cache_wrapper(
-    uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
-    void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
-) {
-    try {
-        return current_runner()->lookup_prebuilt_runtime_arena_cache(
-            hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off, image_data, image_size
-        );
-    } catch (...) {
-        return false;
-    }
-}
-
-static void mark_prebuilt_runtime_arena_cached_wrapper(
-    uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base, void *runtime_arena_base,
-    size_t runtime_off, const void *image_data, size_t image_size
-) {
-    try {
-        current_runner()->mark_prebuilt_runtime_arena_cached(
-            hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off, image_data, image_size
-        );
-    } catch (...) {}
-}
-
-// The HostApi is a set of context-free function pointers: each wrapper above
-// recovers its runner from the thread-local current_runner(), so a single
-// filled table is valid for every runner and every run. Build it once at load
-// time rather than reassembling the pointer table on each simpler_run. Passed by
-// address into bind_callable_to_runtime_impl / validate_runtime_impl.
-static const HostApi g_host_api = {
-    .device_malloc = device_malloc,
-    .device_free = device_free,
-    .copy_to_device = copy_to_device,
-    .copy_from_device = copy_from_device,
-    .device_memset = device_memset,
-    .get_retained_temp_buffer = get_retained_temp_buffer,
-    .set_retained_temp_buffer = set_retained_temp_buffer,
-    .setup_static_arena = setup_static_arena_wrapper,
-    .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,
-    .acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper,
-    .acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper,
-    .lookup_prebuilt_runtime_arena_cache = lookup_prebuilt_runtime_arena_cache_wrapper,
-    .mark_prebuilt_runtime_arena_cached = mark_prebuilt_runtime_arena_cached_wrapper,
-    .upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper,
-};
 
 /* ===========================================================================
  * Public C API (resolved by ChipWorker via dlsym)
@@ -265,35 +206,7 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return -1;
     try {
-        DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
-        int rc = runner->l3_l2_orch_comm_shutdown();
-        int finalize_rc = runner->finalize();
-        if (rc == 0) {
-            rc = finalize_rc;
-        }
-        return rc;
-    } catch (...) {
-        return -1;
-    }
-}
-
-int l3_l2_orch_comm_init_ctx(DeviceContextHandle ctx, void *control_block, size_t control_block_size) {
-    if (ctx == NULL || control_block == NULL) return -1;
-    try {
-        DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
-        if (!runner->l3_l2_orch_comm_supported()) {
-            return PTO_RUNTIME_ERR_UNSUPPORTED;
-        }
-        return runner->l3_l2_orch_comm_init(control_block, control_block_size);
-    } catch (...) {
-        return -1;
-    }
-}
-
-int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx) {
-    if (ctx == NULL) return -1;
-    try {
-        return static_cast<DeviceRunnerBase *>(ctx)->l3_l2_orch_comm_shutdown();
+        return static_cast<DeviceRunnerBase *>(ctx)->finalize();
     } catch (...) {
         return -1;
     }
@@ -327,7 +240,7 @@ int simpler_init(
     if (rc != 0) return rc;
 
     // Transfer ownership of the executor binaries to the runner. Subsequent
-    // simpler_register_callable / simpler_run invocations reuse them — no per-run
+    // prepare_callable / run_prepared invocations reuse them — no per-run
     // binary push across the C ABI.
     try {
         std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
@@ -349,8 +262,8 @@ int simpler_init(
 
     // Eagerly run the one-shot device setup: create persistent AICPU/AICore
     // streams, upload the dispatcher + inner SO bundle, and resolve the per-
-    // symbol rtFuncHandle for per-task launch — so the first simpler_register_callable
-    // / simpler_run does not pay any of these costs. Streams live until
+    // symbol rtFuncHandle for per-task launch — so the first prepare_callable
+    // / run_prepared does not pay any of these costs. Streams live until
     // finalize_device; the cached rtFuncHandle on LoadAicpuOp and the
     // preinstall file both live until ~DeviceRunner.
     try {
@@ -366,7 +279,7 @@ int simpler_init(
  * Per-callable_id preparation
  * =========================================================================== */
 
-int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
+int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
     if (ctx == NULL || callable == NULL) return -1;
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
 
@@ -381,7 +294,7 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
         if (rc != 0) return rc;
 
         CallableArtifacts artifacts;
-        rc = register_callable_impl(
+        rc = prepare_callable_impl(
             reinterpret_cast<const ChipCallable *>(callable), upload_chip_callable_buffer_wrapper, &artifacts
         );
         if (rc != 0) {
@@ -394,7 +307,7 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
         });
 
         // Re-pack ChildKernelAddr -> std::pair to match the existing
-        // record_device_orch_callable* signature. The named struct only crosses
+        // register_callable* signature. The named struct only crosses
         // the runtime-maker / device-runner interface; CallableState
         // stores the historical pair shape.
         std::vector<std::pair<int, uint64_t>> kernel_addrs;
@@ -403,102 +316,43 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
             kernel_addrs.emplace_back(c.func_id, c.device_addr);
         }
 
-        // hbg's register_callable_impl populates host_dlopen_handle; trb's
+        // hbg's prepare_callable_impl populates host_dlopen_handle; trb's
         // leaves it null and fills orch_so_data + func_name/config_name.
-        bool needs_aicpu_register = false;
         if (artifacts.host_dlopen_handle != nullptr) {
-            rc = runner->record_host_orch_callable(
+            rc = runner->register_callable_host_orch(
                 callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
                 std::move(artifacts.signature)
             );
-            if (rc != 0) return rc;
-            host_dlopen_guard.dismiss();
-        } else {
-            rc = runner->record_device_orch_callable(
-                callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
-                artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
-            );
-            if (rc != 0) return rc;
-            needs_aicpu_register = true;
-        }
-        if (needs_aicpu_register) {
-            rc = runner->launch_device_register(callable_id);
-            if (rc != 0) {
-                runner->unregister_callable(callable_id);
-                return rc;
+            if (rc == 0) {
+                host_dlopen_guard.dismiss();
             }
+            return rc;
         }
-        return 0;
+        return runner->register_callable(
+            callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
+            artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
+        );
     } catch (...) {
         return -1;
     }
 }
 
-// Runtime gate for device-domain phase emission. SIMPLER_DEVICE_PROFILING=0
-// suppresses the device (clk=dev) markers so a deployment can profile host and
-// device independently; any other value (or unset) keeps them on. Host-side
-// [STRACE] spans are unaffected — they ride SIMPLER_PROFILING + the log level.
-// Read once and cached: getenv is not thread-safe against setenv, and the value
-// is a process-lifetime config knob.
-static bool device_profiling_enabled() {
-    static const bool enabled = [] {
-        const char *v = std::getenv("SIMPLER_DEVICE_PROFILING");
-        return v == nullptr || std::strcmp(v, "0") != 0;
-    }();
-    return enabled;
-}
-
-// Emit device-domain trace markers for the AICPU phases. RunWall (the whole
-// on-NPU wall, i.e. the former RunTiming.device_wall) is emitted at depth 2
-// under runner_run; its preamble/so_load/graph_build/post_orch subdivisions are
-// emitted at depth 3 beneath it. Phases never stamped (0 ns) are skipped.
-// STRACE_DEV_SPAN_AT self-compiles to nothing when profiling is off, so no extra
-// gate is needed here.
-static void emit_device_phase_markers(DeviceRunnerBase *runner) {
-    if (!device_profiling_enabled()) return;
-    const uint64_t run_wall_ns = runner->last_device_phase_ns(AicpuPhase::RunWall);
-    if (run_wall_ns != 0) {
-        STRACE_DEV_SPAN_AT("simpler_run.runner_run.device_wall", 0, static_cast<long long>(run_wall_ns), 2);
-    }
-    struct PhaseName {
-        AicpuPhase phase;
-        const char *name;
-    };
-    static const PhaseName kPhases[] = {
-        {AicpuPhase::Preamble, "simpler_run.runner_run.device_wall.preamble"},
-        {AicpuPhase::SoLoad, "simpler_run.runner_run.device_wall.so_load"},
-        {AicpuPhase::GraphBuild, "simpler_run.runner_run.device_wall.graph_build"},
-        {AicpuPhase::ConfigValidate, "simpler_run.runner_run.device_wall.config_validate"},
-        {AicpuPhase::ArenaWire, "simpler_run.runner_run.device_wall.arena_wire"},
-        {AicpuPhase::SmReset, "simpler_run.runner_run.device_wall.sm_reset"},
-        {AicpuPhase::PostOrch, "simpler_run.runner_run.device_wall.post_orch"},
-        {AicpuPhase::OrchWindow, "simpler_run.runner_run.device_wall.orch"},
-        {AicpuPhase::SchedWindow, "simpler_run.runner_run.device_wall.sched"},
-    };
-    // RunWall is emitted above as device_wall; every other phase is in the table.
-    static_assert(
-        sizeof(kPhases) / sizeof(kPhases[0]) == NUM_AICPU_PHASES - 1,
-        "kPhases[] must list every AicpuPhase except RunWall — add the new phase here"
-    );
-    for (const auto &p : kPhases) {
-        const uint64_t ns = runner->last_device_phase_ns(p.phase);
-        if (ns != 0) {
-            STRACE_DEV_SPAN_AT(
-                p.name, static_cast<long long>(runner->last_device_phase_start_ns(p.phase)), static_cast<long long>(ns),
-                3
-            );
-        }
-    }
-}
-
-int simpler_run(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config
+int run_prepared(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
+    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
+    int enable_scope_stats, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
+    const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools,
+    const char *output_prefix, PtoRunTiming *out_timing
 ) {
-    if (ctx == NULL || runtime == NULL || config == NULL) return -1;
+    if (out_timing != NULL) {
+        out_timing->host_wall_ns = 0;
+        out_timing->device_wall_ns = 0;
+    }
+    if (ctx == NULL || runtime == NULL) return -1;
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
 
     if (!runner->has_callable(callable_id)) {
-        LOG_ERROR("simpler_run: callable_id=%d not registered", callable_id);
+        LOG_ERROR("run_prepared: callable_id=%d not prepared", callable_id);
         return -1;
     }
 
@@ -508,9 +362,7 @@ int simpler_run(
         pthread_setspecific(g_runner_key, nullptr);
     });
 
-    STRACE_NEW_INV();
-    STRACE_SET_HID(runner->callable_hash(callable_id));
-    STRACE("simpler_run");
+    const auto host_t0 = std::chrono::steady_clock::now();
 
     try {
         int rc = runner->attach_current_thread(runner->device_id());
@@ -524,54 +376,70 @@ int simpler_run(
         auto runtime_guard = RAIIScopeGuard([r]() {
             r->~Runtime();
         });
-        // Platform device-memory hooks. host_api is a platform capability, not
-        // runtime state — the shared g_host_api table (built once at load time)
-        // is passed explicitly into the runtime impls rather than stored on
-        // `Runtime` or reassembled per run.
-        {
-            STRACE("simpler_run.bind");
-            // One-step bind: restore kernel addrs + active_callable_id and run
-            // the per-run binding (tensor args, GM heap, SM alloc). The
-            // CallableState-derived host_orch_func_ptr + signature stay inside
-            // the runner — no longer returned across this boundary.
-            rc = runner->bind_callable_to_runtime(
-                *r, callable_id, &g_host_api, args, config->runtime_env.ring_task_window, config->runtime_env.ring_heap,
-                config->runtime_env.ring_dep_pool
-            );
+        r->host_api.device_malloc = device_malloc;
+        r->host_api.device_free = device_free;
+        r->host_api.copy_to_device = copy_to_device;
+        r->host_api.copy_from_device = copy_from_device;
+        r->host_api.device_memset = device_memset;
+        r->host_api.setup_static_arena = setup_static_arena_wrapper;
+        r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
+        r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
+        r->host_api.acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper;
+        r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
+
+        // Restore kernel addrs + orch symbol names + active_callable_id; the
+        // returned host_orch_func_ptr is non-null only on the hbg path and is
+        // handed straight into bind_callable_to_runtime_impl below. signature
+        // is the cached ChipCallable signature_[]; it's plumbed end-to-end for
+        // per-tensor direction decisions in runtime_maker. trb consumes it to
+        // skip the D2H copy-back of read-only INPUT tensors; hbg still
+        // ignores it — see bind_callable_to_runtime_impl.
+        auto bind_result = runner->bind_callable_to_runtime(*r, callable_id);
+        if (bind_result.rc != 0) {
+            return bind_result.rc;
         }
+
+        // Per-run binding (tensor args, GM heap, SM alloc)
+        rc = bind_callable_to_runtime_impl(
+            r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
+            bind_result.signature, bind_result.sig_count, ring_task_window, ring_heap, ring_dep_pool, ring_task_windows,
+            ring_heaps, ring_dep_pools
+        );
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
-            validate_runtime_impl(r, &g_host_api);
+            validate_runtime_impl(r);
             return rc;
         }
 
-        {
-            STRACE("simpler_run.runner_run");
-            // run() latches the diagnostic enables from config via
-            // apply_call_config() and consumes block_dim / aicpu_thread_num.
-            rc = runner->run(*r, *config);
-        }
+        runner->set_l2_swimlane_enabled(enable_l2_swimlane);
+        runner->set_dump_tensor_enabled(enable_dump_tensor);
+        runner->set_pmu_enabled(enable_pmu);
+        // Virtual: a2a3 and a5 wire through to their enable_dep_gen_; an arch
+        // without dep_gen falls through to the base no-op.
+        runner->set_dep_gen_enabled(enable_dep_gen != 0);
+        runner->set_scope_stats_enabled(enable_scope_stats != 0);
+        runner->set_output_prefix(output_prefix);
+
+        rc = runner->run(*r, block_dim, aicpu_thread_num);
         if (rc != 0) {
-            validate_runtime_impl(r, &g_host_api);
+            validate_runtime_impl(r);
             return rc;
         }
 
-        {
-            STRACE("simpler_run.validate");
-            rc = validate_runtime_impl(r, &g_host_api);
+        rc = validate_runtime_impl(r);
+        if (out_timing != NULL) {
+            const auto host_t1 = std::chrono::steady_clock::now();
+            out_timing->host_wall_ns =
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(host_t1 - host_t0).count());
+            out_timing->device_wall_ns = runner->last_device_wall_ns();
         }
-        // Device-domain phase markers: the AICPU subdivision of the on-NPU wall
-        // (device_wall + preamble/so_load/graph_build/post_orch/orch/sched).
-        // host_wall is the simpler_run STRACE span; both flow via the log, not a
-        // return value.
-        emit_device_phase_markers(runner);
         return rc;
     } catch (...) {
         return -1;
     }
 }
 
-int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
+int unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     if (ctx == NULL) return -1;
     try {
         return static_cast<DeviceRunnerBase *>(ctx)->unregister_callable(callable_id);

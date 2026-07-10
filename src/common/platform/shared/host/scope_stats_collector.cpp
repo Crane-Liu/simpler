@@ -33,6 +33,7 @@
 #include <cassert>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
@@ -60,6 +61,7 @@ int ScopeStatsCollector::init(
         return -1;
     }
 
+    num_threads_ = num_threads;
     total_collected_ = 0;
     records_.clear();
     recovered_current_buf_ = 0;
@@ -376,6 +378,7 @@ void ScopeStatsCollector::finalize(ScopeStatsUnregisterCallback unregister_cb, c
     manager_.clear_mappings();
 
     initialized_ = false;
+    num_threads_ = 0;
     total_collected_ = 0;
     clear_memory_context();
     LOG_INFO_V0("ScopeStats collector finalized");

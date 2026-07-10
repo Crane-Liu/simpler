@@ -25,14 +25,10 @@ task's fanout being counted once per perf row), and the differential gate
 would fire.
 """
 
-import json
-import time
-
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
-from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 
 from ._swimlane_validate import validate_perf_artifact
 
@@ -63,23 +59,20 @@ class TestL2SwimlaneMixed(SceneTestCase):
             "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.IN, D.IN, D.INOUT, D.INOUT, D.OUT, D.OUT],
         },
-        # No arg_index: both incores declare the FULL 6-tensor mix signature
-        # (chained_mix_orch.cpp bundles MATMUL's 3 args + ADD's 3 args); the dump
-        # maps signature entry i to payload slot i positionally.
         "incores": [
             {
                 "func_id": 0,
                 "name": "MATMUL",
                 "source": "../../mixed_example/kernels/aic/kernel_matmul.cpp",
                 "core_type": "aic",
-                "signature": [D.IN, D.IN, D.OUT, D.IN, D.IN, D.OUT],
+                "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 1,
                 "name": "ADD",
                 "source": "../../mixed_example/kernels/aiv/kernel_add.cpp",
                 "core_type": "aiv",
-                "signature": [D.IN, D.IN, D.OUT, D.IN, D.IN, D.OUT],
+                "signature": [D.IN, D.IN, D.OUT],
             },
         ],
     }
@@ -133,46 +126,16 @@ class TestL2SwimlaneMixed(SceneTestCase):
         args.ws_aiv[_TILE_ELEMS:_WS_ELEMS] = s2_aiv
 
     def test_run(self, st_platform, st_worker, request):
-        # Marker taken before the run so the validators below bind to this
-        # invocation's output dir rather than a stale same-label leftover.
-        run_marker = int(time.time())  # floor to whole seconds: safe if outputs/ ever lands on a coarse-mtime fs
         super().test_run(st_platform, st_worker, request)
-        if request.config.getoption("--enable-l2-swimlane", default=False):
-            for case in self.CASES:
-                if st_platform in case["platforms"]:
-                    # Rely on the differential gate (Pop / Fanout / Fanin) —
-                    # the chain produces 3 MIX task_ids × 2 subtask rows = 6
-                    # perf rows and 2 deps.json edges, so the dedup branch in
-                    # the oracle has an arithmetically observable effect.
-                    validate_perf_artifact(f"TestL2SwimlaneMixed_{case['name']}", since=run_marker)
-        # Full-dump modes give the func_id array its regression barrier on the
-        # cooperative-mix path (single-kernel coverage lives in test_args_dump).
-        if int(request.config.getoption("--dump-args", default=0)) >= 2:
-            self._validate_dump_func_ids(run_marker)
-
-    def _validate_dump_func_ids(self, since):
-        """#1181: every chained_mix task is a 2-way cooperative MIX (MATMUL
-        func 0 + AIV ADD func 1) sharing one 6-tensor payload, so every dumped
-        slot must carry the same active-subtask membership ``func_id == [0, 1]``,
-        and each ``(task, slot, stage)`` is emitted exactly once — not
-        duplicated per subtask as the pre-#1181 geometry did.
-        """
-        safe_label = _sanitize_for_filename("TestL2SwimlaneMixed_default")
-        matches = [p for p in _outputs_dir().glob(f"{safe_label}_*") if p.stat().st_mtime >= since]
-        assert matches, "no args dump output directory created this run"
-        out_dir = max(matches, key=lambda p: p.stat().st_mtime)
-        manifest = out_dir / "args_dump" / "args_dump.json"
-        assert manifest.exists(), f"args_dump.json missing under {out_dir}"
-        with manifest.open() as f:
-            data = json.load(f)
-        tensors = [t for t in data.get("args", []) if t.get("kind") == "tensor"]
-        assert tensors, f"no tensor entries dumped: {data}"
-        for t in tensors:
-            assert sorted(t.get("func_id", [])) == [0, 1], (
-                f"mix slot {t['task_id']}:{t.get('arg_index')} func_id={t.get('func_id')} — expected membership [0, 1]"
-            )
-        seen = [(t["task_id"], t["arg_index"], t.get("stage")) for t in tensors]
-        assert len(seen) == len(set(seen)), f"a payload slot was emitted more than once: {seen}"
+        if not request.config.getoption("--enable-l2-swimlane", default=False):
+            return
+        for case in self.CASES:
+            if st_platform in case["platforms"]:
+                # Rely on the differential gate (Pop / Fanout / Fanin) —
+                # the chain produces 3 MIX task_ids × 2 subtask rows = 6
+                # perf rows and 2 deps.json edges, so the dedup branch in
+                # the oracle has an arithmetically observable effect.
+                validate_perf_artifact(f"TestL2SwimlaneMixed_{case['name']}")
 
 
 if __name__ == "__main__":

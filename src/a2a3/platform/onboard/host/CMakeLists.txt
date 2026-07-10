@@ -50,7 +50,6 @@ list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_topology_probe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
@@ -74,7 +73,6 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_helpers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l3_l2_orch_comm_service.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
@@ -113,25 +111,6 @@ target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a2a3")
 
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
-endif()
-
-set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
-    "PTO-ISA commit used for host_runtime cache key")
-
-# Bake the resolved pto-isa commit into the compile command. pto-isa headers
-# (e.g. kSdmaMaxChan in sdma_workspace_manager.hpp) are compiled into this .so,
-# but a pto-isa update leaves the runtime repo HEAD — and the pto-isa header
-# mtimes — untouched, so a plain reinstall serves a stale object from ccache.
-# This define perturbs the ccache key so a pto-isa bump forces a real recompile.
-# It is intentionally unused in code (cache-bust only). See issue #1139.
-# RuntimeBuilder passes the current pto_isa.pin for a2a3 onboard, regardless
-# of SIMPLER_ENABLE_PTO_SDMA_WORKSPACE. If that workspace is ever turned off,
-# a pto-isa bump still forces a rebuild of a target that no longer embeds
-# pto-isa. That over-invalidation only costs a rebuild and never serves stale
-# objects, so erring wide is intentional (see _resolve_build_pto_isa_commit).
-if(NOT "${SIMPLER_PTO_ISA_BUILD_COMMIT}" STREQUAL "")
-    target_compile_definitions(host_runtime PRIVATE
-        SIMPLER_PTO_ISA_BUILD_COMMIT="${SIMPLER_PTO_ISA_BUILD_COMMIT}")
 endif()
 
 # Include directories - always include local headers
@@ -181,16 +160,11 @@ endif()
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
 # when performance profiling is enabled
-# HcclGetRootInfo/HcclCommInitRootInfo are declared weak in CANN's hccl_comm.h.
-# Under a toolchain that defaults to --as-needed (Ubuntu/conda gcc on x86), a
-# weak undefined ref does not mark libhcomm "needed", so its DT_NEEDED is
-# dropped and the symbols resolve to NULL at runtime -> SIGSEGV on the first
-# HcclGetRootInfo call. Force the dependency so it survives any default. See #1018.
 target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
-        -Wl,--no-as-needed ${HCCL_LINK_TARGETS} -Wl,--as-needed
+        ${HCCL_LINK_TARGETS}
         dl
 )
 

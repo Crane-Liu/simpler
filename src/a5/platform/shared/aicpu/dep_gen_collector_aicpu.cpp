@@ -20,17 +20,15 @@
  *   - Host pushes free DepGenBuffers via free_queue.
  *   - AICPU pops when current buffer fills; pushes full buffer to per-thread
  *     ready_queue (indexed by orch_thread_idx).
- *   - Full buffers are published before AICPU tries to recover a replacement.
- *     If recovery is delayed, later records are counted as dropped until host
- *     replenishes free_queue. Host reads dropped at finalize to decide whether
- *     to emit deps.json.
+ *   - On free_queue empty or ready_queue full: overwrite current buffer
+ *     (record dropped_record_count, keep AICPU alive). Host reads dropped
+ *     at finalize to decide whether to emit deps.json.
  */
 
 #include "aicpu/dep_gen_collector_aicpu.h"
 
 #include <cstring>
 
-#include "aicpu/device_time.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -42,8 +40,6 @@ static bool g_enable_dep_gen = false;
 static DepGenDataHeader *s_dep_gen_header = nullptr;
 static DepGenBufferState *s_dep_gen_state = nullptr;
 static int s_orch_thread_idx = -1;  // set via dep_gen_aicpu_set_orch_thread_idx
-
-static constexpr uint64_t kDepGenQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
 
 extern "C" void set_platform_dep_gen_base(uint64_t dep_gen_data_base) { g_platform_dep_gen_base = dep_gen_data_base; }
 
@@ -59,92 +55,25 @@ void dep_gen_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thr
 // Internal: enqueue full buffer to per-thread ready_queue
 // ---------------------------------------------------------------------------
 
-static bool
-wait_for_ready_queue_space(DepGenDataHeader *header, int thread_idx, uint32_t *tail_out, uint32_t *head_out) {
-    if (header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
-        return false;
-    }
-    const uint32_t capacity = PLATFORM_DEP_GEN_READYQUEUE_SIZE;
-    const uint64_t start = get_sys_cnt_aicpu();
-
-    do {
-        uint32_t current_tail = header->queue_tails[thread_idx];
-        uint32_t current_head = header->queue_heads[thread_idx];
-        uint32_t next_tail = (current_tail + 1) % capacity;
-        if (next_tail != current_head) {
-            *tail_out = current_tail;
-            *head_out = current_head;
-            return true;
-        }
-        if (get_sys_cnt_aicpu() - start >= kDepGenQueueBackpressureWaitCycles) {
-            break;
-        }
-    } while (true);
-    return false;
-}
-
-static bool wait_for_free_queue_entry(DepGenFreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
-    if (free_queue == nullptr) {
-        return false;
-    }
-    const uint64_t start = get_sys_cnt_aicpu();
-
-    do {
-        uint32_t head = free_queue->head;
-        uint32_t tail = free_queue->tail;
-        if (head != tail) {
-            *head_out = head;
-            *tail_out = tail;
-            rmb();  // acquire: order the tail read above before the caller's buffer_ptrs read
-            return true;
-        }
-        if (get_sys_cnt_aicpu() - start >= kDepGenQueueBackpressureWaitCycles) {
-            break;
-        }
-    } while (true);
-    return false;
-}
-
 static int enqueue_dep_gen_ready_buffer(uint64_t buffer_ptr, uint32_t buffer_seq) {
-    int q = s_orch_thread_idx;
-    uint32_t capacity = PLATFORM_DEP_GEN_READYQUEUE_SIZE;
-    uint32_t current_tail = 0;
-    uint32_t current_head = 0;
-    if (!wait_for_ready_queue_space(s_dep_gen_header, q, &current_tail, &current_head)) {
+    if (s_orch_thread_idx < 0 || s_orch_thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
         return -1;
     }
+    int q = s_orch_thread_idx;
+    uint32_t capacity = PLATFORM_DEP_GEN_READYQUEUE_SIZE;
+    uint32_t current_tail = s_dep_gen_header->queue_tails[q];
+    uint32_t current_head = s_dep_gen_header->queue_heads[q];
 
     uint32_t next_tail = (current_tail + 1) % capacity;
+    if (next_tail == current_head) {
+        return -1;  // Queue full
+    }
+
     s_dep_gen_header->queues[q][current_tail].instance_index = 0;
     s_dep_gen_header->queues[q][current_tail].buffer_ptr = buffer_ptr;
     s_dep_gen_header->queues[q][current_tail].buffer_seq = buffer_seq;
-    wmb();  // publish: entry fields visible before the tail advance
     s_dep_gen_header->queue_tails[q] = next_tail;
     return 0;
-}
-
-static DepGenBuffer *try_pop_dep_gen_buffer(uint32_t next_seq) {
-    if (s_dep_gen_state == nullptr) {
-        return nullptr;
-    }
-    uint32_t head = 0;
-    uint32_t tail = 0;
-    if (!wait_for_free_queue_entry(&s_dep_gen_state->free_queue, &head, &tail)) {
-        return nullptr;
-    }
-
-    uint64_t new_buf_ptr = s_dep_gen_state->free_queue.buffer_ptrs[head % PLATFORM_DEP_GEN_SLOT_COUNT];
-    s_dep_gen_state->free_queue.head = head + 1;
-    if (new_buf_ptr == 0) {
-        return nullptr;
-    }
-
-    DepGenBuffer *new_buf = reinterpret_cast<DepGenBuffer *>(new_buf_ptr);
-    new_buf->count = 0;
-    s_dep_gen_state->current_buf_ptr = new_buf_ptr;
-    s_dep_gen_state->current_buf_seq = next_seq;
-    wmb();
-    return new_buf;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +89,21 @@ static void dep_gen_switch_buffer() {
         return;
     }
 
+    // Check free_queue before committing the full buffer
+    rmb();
+    uint32_t head = s_dep_gen_state->free_queue.head;
+    uint32_t tail = s_dep_gen_state->free_queue.tail;
+
+    if (head == tail) {
+        // No replacement buffer available — overwrite current buffer to keep
+        // the orch loop alive; account every record we drop.
+        LOG_WARN("dep_gen: no free buffer, overwriting current (dropped %u records)", full_buf->count);
+        s_dep_gen_state->dropped_record_count += full_buf->count;
+        full_buf->count = 0;
+        wmb();
+        return;
+    }
+
     uint32_t seq = s_dep_gen_state->current_buf_seq;
     int rc = enqueue_dep_gen_ready_buffer(s_dep_gen_state->current_buf_ptr, seq);
     if (rc != 0) {
@@ -170,12 +114,16 @@ static void dep_gen_switch_buffer() {
         return;
     }
 
-    uint32_t next_seq = seq + 1;
-    s_dep_gen_state->current_buf_ptr = 0;
-    s_dep_gen_state->current_buf_seq = next_seq;
+    // Pop next buffer from free_queue
+    uint64_t new_buf_ptr = s_dep_gen_state->free_queue.buffer_ptrs[head % PLATFORM_DEP_GEN_SLOT_COUNT];
+    rmb();
+    s_dep_gen_state->free_queue.head = head + 1;
+    s_dep_gen_state->current_buf_ptr = new_buf_ptr;
+    s_dep_gen_state->current_buf_seq = seq + 1;
     wmb();
 
-    (void)try_pop_dep_gen_buffer(next_seq);
+    DepGenBuffer *new_buf = reinterpret_cast<DepGenBuffer *>(new_buf_ptr);
+    new_buf->count = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,8 +144,14 @@ void dep_gen_aicpu_init() {
     uint32_t tail = s_dep_gen_state->free_queue.tail;
 
     if (head != tail) {
-        (void)try_pop_dep_gen_buffer(0);
-        uint64_t buf_ptr = s_dep_gen_state->current_buf_ptr;
+        uint64_t buf_ptr = s_dep_gen_state->free_queue.buffer_ptrs[head % PLATFORM_DEP_GEN_SLOT_COUNT];
+        rmb();
+        s_dep_gen_state->free_queue.head = head + 1;
+        s_dep_gen_state->current_buf_ptr = buf_ptr;
+        s_dep_gen_state->current_buf_seq = 0;
+        wmb();
+        DepGenBuffer *buf = reinterpret_cast<DepGenBuffer *>(buf_ptr);
+        buf->count = 0;
         LOG_INFO_V0("dep_gen: popped initial buffer addr=0x%lx", buf_ptr);
     } else {
         LOG_ERROR("dep_gen: free_queue empty during init");
@@ -208,8 +162,7 @@ void dep_gen_aicpu_init() {
 
 void dep_gen_aicpu_record_submit(
     uint64_t task_id_raw, bool in_manual_scope, int tensor_count, const void *const *tensor_ptrs,
-    const uint8_t *arg_types, int explicit_dep_count, const uint64_t *explicit_deps_raw, int block_num,
-    const int32_t kernel_ids[3]
+    const uint8_t *arg_types, int explicit_dep_count, const uint64_t *explicit_deps_raw, const int32_t kernel_ids[3]
 ) {
     if (!g_enable_dep_gen || s_dep_gen_state == nullptr) {
         return;
@@ -226,13 +179,9 @@ void dep_gen_aicpu_record_submit(
     rmb();
     uint64_t cur_ptr = s_dep_gen_state->current_buf_ptr;
     if (cur_ptr == 0) {
-        DepGenBuffer *recovered = try_pop_dep_gen_buffer(s_dep_gen_state->current_buf_seq);
-        if (recovered == nullptr) {
-            s_dep_gen_state->dropped_record_count += 1;
-            wmb();
-            return;
-        }
-        cur_ptr = s_dep_gen_state->current_buf_ptr;
+        s_dep_gen_state->dropped_record_count += 1;
+        wmb();
+        return;
     }
     DepGenBuffer *buf = reinterpret_cast<DepGenBuffer *>(cur_ptr);
 
@@ -255,13 +204,9 @@ void dep_gen_aicpu_record_submit(
         rmb();
         cur_ptr = s_dep_gen_state->current_buf_ptr;
         if (cur_ptr == 0) {
-            DepGenBuffer *recovered = try_pop_dep_gen_buffer(s_dep_gen_state->current_buf_seq);
-            if (recovered == nullptr) {
-                s_dep_gen_state->dropped_record_count += 1;
-                wmb();
-                return;
-            }
-            cur_ptr = s_dep_gen_state->current_buf_ptr;
+            s_dep_gen_state->dropped_record_count += 1;
+            wmb();
+            return;
         }
         buf = reinterpret_cast<DepGenBuffer *>(cur_ptr);
         local_count = buf->count;  // refresh after switch — new buffer starts at 0
@@ -312,7 +257,6 @@ void dep_gen_aicpu_record_submit(
     }
     rec->flags = base_flags;
     rec->tensor_count = static_cast<uint16_t>(tc);
-    rec->block_num = block_num > 0 ? static_cast<uint32_t>(block_num) : 1u;
 
     int base_dc = (dc < DEP_GEN_MAX_EXPLICIT_DEPS) ? dc : DEP_GEN_MAX_EXPLICIT_DEPS;
     rec->explicit_dep_count = static_cast<uint16_t>(base_dc);

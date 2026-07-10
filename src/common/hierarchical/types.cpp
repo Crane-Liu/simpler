@@ -26,7 +26,7 @@ void TaskSlotState::reset() {
     }
     fanout_released.store(0, std::memory_order_relaxed);
     output_keys.clear();
-    eligible_worker_ids.clear();
+    eligible_endpoint_ids.clear();
     fanin_producers.clear();
     failure_message.clear();
     worker_type = WorkerType::NEXT_LEVEL;
@@ -73,11 +73,6 @@ bool ReadyQueue::try_pop(TaskSlot &out) {
     out = q_.front();
     q_.pop();
     return true;
-}
-
-bool ReadyQueue::empty() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return q_.empty();
 }
 
 bool ReadyQueue::wait_pop(TaskSlot &out) {

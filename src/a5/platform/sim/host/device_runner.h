@@ -32,7 +32,7 @@ public:
     DeviceRunner() = default;
     ~DeviceRunner() override;
 
-    int run(Runtime &runtime, const CallConfig &config) override;
+    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) override;
     int finalize() override;
     // a5 dep_gen enablement setter, overriding the base no-op (the c_api
     // unconditionally calls it).
@@ -40,7 +40,6 @@ public:
 
 private:
     int ensure_binaries_loaded() override;
-    int invoke_device_register(const RegisterCallableArgs &reg_args) override;
     void unload_executor_binaries();
 
     int init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id);
@@ -57,15 +56,9 @@ private:
     // a5 sim's dlsym'd function-pointer table. Loaded once via
     // ensure_binaries_loaded(), nulled on unload_executor_binaries().
     int (*aicpu_execute_func_)(Runtime *){nullptr};
-    // The runtime exports simpler_aicpu_register_callable(void*) directly (TMARB
-    // only; hbg does not export it). Optional dlsym: null on the hbg SO.
-    int (*aicpu_register_callable_func_)(void *){nullptr};
     void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t){nullptr};
     void (*set_platform_regs_func_)(uint64_t){nullptr};
-    void (*set_orch_device_id_func_)(int){nullptr};
-    void (*set_scheduler_timeout_ms_func_)(int){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
-    void (*set_platform_phase_base_func_)(uint64_t){nullptr};
     void (*set_platform_pmu_base_func_)(uint64_t){nullptr};
     void (*set_dump_args_enabled_func_)(bool){nullptr};
     void (*set_platform_l2_swimlane_base_func_)(uint64_t){nullptr};

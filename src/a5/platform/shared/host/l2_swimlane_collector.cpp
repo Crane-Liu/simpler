@@ -75,9 +75,9 @@ int L2SwimlaneCollector::initialize(
     aicpu_thread_num_ = aicpu_thread_num;
     l2_swimlane_level_ = l2_swimlane_level;
     output_prefix_ = output_prefix;
-    total_perf_collected_.store(0, std::memory_order_relaxed);
-    total_sched_phase_collected_.store(0, std::memory_order_relaxed);
-    total_orch_phase_collected_.store(0, std::memory_order_relaxed);
+    total_perf_collected_ = 0;
+    total_sched_phase_collected_ = 0;
+    total_orch_phase_collected_ = 0;
 
     // Stash the memory context on the base up-front so alloc_paired_buffer
     // sees consistent values during init. shm_host_ stays nullptr until the
@@ -243,26 +243,22 @@ int L2SwimlaneCollector::initialize(
     // direct access to `&ac_state->head` device addresses, no
     // host-to-device translation needed). AICore reads
     // rotation_table[block_idx] at kernel entry.
-    // Held in a local and published to aicore_ring_addr_table_dev_ only after
-    // guard.commit() (see end of this function). The alloc registers the buffer
-    // in the rollback guard, so a later init failure frees it via
-    // release_all_owned; assigning the member here would leave it dangling.
-    void *rotation_table_dev = nullptr;
     {
         size_t table_bytes = static_cast<size_t>(num_aicore) * sizeof(uint64_t);
         void *rotation_table_host = nullptr;
-        rotation_table_dev = alloc_paired_buffer(table_bytes, &rotation_table_host);
+        void *rotation_table_dev = alloc_paired_buffer(table_bytes, &rotation_table_host);
         if (rotation_table_dev == nullptr) {
             LOG_ERROR("Failed to allocate l2_swimlane_aicore_rotation_table (rotation) table (%zu bytes)", table_bytes);
             return -1;
         }
+        aicore_ring_addr_table_dev_ = rotation_table_dev;
     }
 
     // Step 6: Initialize per-thread phase pools — both sched and orch. Each
-    // pool is sized to its own PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD
-    // (1 in free_queue, rest in the recycled pool tagged by kind). Templated on the
+    // pool is sized to PLATFORM_PROF_BUFFERS_PER_THREAD buffers (1 in
+    // free_queue, rest in the recycled pool tagged by kind). Templated on the
     // concrete TypedBuffer so the `count` zero-store uses the matching layout
-    // — sched and orch buffers have DIFFERENT sizes (64B vs 32B records),
+    // — sched and orch buffers have DIFFERENT sizes (40B vs 32B records),
     // so a single cast type for both would land the count store past the end
     // of the orch allocation and corrupt the heap.
     // state_count pool states are zeroed (so the host's [0, PLATFORM_MAX)
@@ -271,7 +267,7 @@ int L2SwimlaneCollector::initialize(
     // equal; orch is a single instance (pool 0), so it zeroes all slots but
     // allocates buffers for just pool 0 — no buffers wasted on unused slots.
     auto init_phase_pools = [&](auto buffer_tag, L2SwimlaneAicpuTaskPool *(*get_state)(void *, int, int),
-                                int state_count, int buffer_count, int buffers_per_thread, ProfBufferType recycle_kind,
+                                int state_count, int buffer_count, ProfBufferType recycle_kind,
                                 const char *kind_label) -> int {
         using Buffer = typename decltype(buffer_tag)::type;
         constexpr size_t buffer_bytes = sizeof(Buffer);
@@ -279,7 +275,7 @@ int L2SwimlaneCollector::initialize(
             auto *state = get_state(perf_host_ptr, num_aicore, t);
             memset(state, 0, sizeof(L2SwimlaneAicpuTaskPool));
             if (t >= buffer_count) continue;  // zeroed state only; no buffers (unused slot)
-            for (int s = 0; s < buffers_per_thread; s++) {
+            for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_THREAD; s++) {
                 void *host_buf_ptr = nullptr;
                 void *dev_buf_ptr = alloc_paired_buffer(buffer_bytes, &host_buf_ptr);
                 if (dev_buf_ptr == nullptr) {
@@ -318,8 +314,7 @@ int L2SwimlaneCollector::initialize(
     // allocate buffers for just one pool while still zeroing all MAX states.
     if (init_phase_pools(
             SchedTag{}, get_sched_phase_buffer_state, /*state_count=*/num_phase_threads,
-            /*buffer_count=*/num_phase_threads, /*buffers_per_thread=*/PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD,
-            ProfBufferType::AICPU_SCHED_PHASE, "sched"
+            /*buffer_count=*/num_phase_threads, ProfBufferType::AICPU_SCHED_PHASE, "sched"
         ) != 0) {
         return -1;
     }
@@ -328,13 +323,13 @@ int L2SwimlaneCollector::initialize(
     };
     if (init_phase_pools(
             OrchTag{}, orch_get_state, /*state_count=*/num_phase_threads, /*buffer_count=*/1,
-            /*buffers_per_thread=*/PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD, ProfBufferType::AICPU_ORCH_PHASE, "orch"
+            ProfBufferType::AICPU_ORCH_PHASE, "orch"
         ) != 0) {
         return -1;
     }
     LOG_DEBUG(
-        "Initialized %d sched (%d buf/thread) + 1 orch (%d buf) PhaseBufferStates", num_phase_threads,
-        PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD, PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD
+        "Initialized %d sched (+1 orch) PhaseBufferStates: 1 buffer/thread, %d in recycled pool each",
+        num_phase_threads, PLATFORM_PROF_BUFFERS_PER_THREAD - 1
     );
 
     wmb();
@@ -351,12 +346,14 @@ int L2SwimlaneCollector::initialize(
     // kernel_args.l2_swimlane_data_base (read back via get_l2_swimlane_setup_device_ptr()).
     LOG_DEBUG("L2 swimlane device base = 0x%lx", reinterpret_cast<uint64_t>(perf_dev_ptr));
 
-    // Reserve the per-core / per-thread record vectors while the rollback guard
-    // is still armed, so a std::bad_alloc here unwinds through the guard and
-    // frees every buffer. Publication of the device pointers and the memory
-    // context is deferred to after commit (below): otherwise a throw here would
-    // leave perf_shared_mem_dev_ dangling and shm_host_ non-null, which would
-    // make is_initialized() report true and finalize() double-free.
+    perf_shared_mem_dev_ = perf_dev_ptr;
+    // Refresh memory context with the now-known SHM tuple. start(tf) (inherited)
+    // gates on shm_host_, so this is the moment the collector becomes startable.
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        perf_dev_ptr, perf_host_ptr, total_size, device_id
+    );
+
     collected_perf_records_.assign(num_aicore_, {});
     collected_aicore_records_.assign(num_aicore_, {});
     collected_sched_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
@@ -364,17 +361,6 @@ int L2SwimlaneCollector::initialize(
 
     LOG_INFO_V0("Performance profiling initialized (dynamic buffer mode)");
     guard.commit();
-    // Publish device-buffer members + memory context only after the rollback
-    // guard is disarmed: on a failed init they stay nullptr / shm_host_ stays
-    // null, so is_initialized() is false and finalize() never frees buffers the
-    // guard already freed. set_memory_context publishes shm_host_; start(tf)
-    // gates on it, so this is the moment the collector becomes startable.
-    perf_shared_mem_dev_ = perf_dev_ptr;
-    aicore_ring_addr_table_dev_ = rotation_table_dev;
-    set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
-        perf_dev_ptr, perf_host_ptr, total_size, device_id
-    );
     return 0;
 }
 
@@ -391,11 +377,10 @@ void L2SwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info) {
     }
     uint32_t core_index = info.index;
     if (core_index < static_cast<uint32_t>(num_aicore_)) {
-        std::scoped_lock<std::mutex> lock(perf_record_mutexes_[core_index]);
         for (uint32_t i = 0; i < count; i++) {
             collected_perf_records_[core_index].push_back(buf->records[i]);
         }
-        total_perf_collected_.fetch_add(count, std::memory_order_relaxed);
+        total_perf_collected_ += count;
     }
 }
 
@@ -408,13 +393,12 @@ void L2SwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info) {
     }
     uint32_t tidx = info.index;
     if (tidx < collected_sched_phase_records_.size()) {
-        std::scoped_lock<std::mutex> lock(sched_phase_record_mutexes_[tidx]);
         for (uint32_t i = 0; i < count; i++) {
             collected_sched_phase_records_[tidx].push_back(buf->records[i]);
         }
-        total_sched_phase_collected_.fetch_add(count, std::memory_order_relaxed);
+        total_sched_phase_collected_ += count;
         if (count > 0) {
-            has_phase_data_.store(true, std::memory_order_relaxed);
+            has_phase_data_ = true;
         }
     }
 }
@@ -428,13 +412,12 @@ void L2SwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info) {
     }
     uint32_t tidx = info.index;
     if (tidx < collected_orch_phase_records_.size()) {
-        std::scoped_lock<std::mutex> lock(orch_phase_record_mutexes_[tidx]);
         for (uint32_t i = 0; i < count; i++) {
             collected_orch_phase_records_[tidx].push_back(buf->records[i]);
         }
-        total_orch_phase_collected_.fetch_add(count, std::memory_order_relaxed);
+        total_orch_phase_collected_ += count;
         if (count > 0) {
-            has_phase_data_.store(true, std::memory_order_relaxed);
+            has_phase_data_ = true;
         }
     }
 }
@@ -469,19 +452,16 @@ void L2SwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info) {
     if (count > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) {
         count = PLATFORM_AICORE_BUFFER_SIZE;
     }
+    auto &dst = collected_aicore_records_[core_index];
+    dst.reserve(dst.size() + count);
     uint32_t skipped = 0;
-    {
-        std::scoped_lock<std::mutex> lock(aicore_record_mutexes_[core_index]);
-        auto &dst = collected_aicore_records_[core_index];
-        dst.reserve(dst.size() + count);
-        for (uint32_t i = 0; i < count; i++) {
-            const L2SwimlaneAicoreTaskRecord &r = buf->records[i];
-            if (r.start_time == 0) {
-                skipped++;
-                continue;
-            }
-            dst.push_back(r);
+    for (uint32_t i = 0; i < count; i++) {
+        const L2SwimlaneAicoreTaskRecord &r = buf->records[i];
+        if (r.start_time == 0) {
+            skipped++;
+            continue;
         }
+        dst.push_back(r);
     }
     if (skipped > 0) {
         LOG_WARN(
@@ -585,7 +565,8 @@ void L2SwimlaneCollector::reconcile_counters() {
 
         if (dropped_device > 0) {
             LOG_WARN(
-                "L2Swimlane reconcile: %lu %s records dropped on device side.",
+                "L2Swimlane reconcile: %lu %s records dropped on device side (buffer full / "
+                "ready_queue full).",
                 static_cast<unsigned long>(dropped_device), kind
             );
         }
@@ -621,7 +602,7 @@ void L2SwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(host_ptr)->count;
         },
-        sizeof(L2SwimlaneAicpuTaskBuffer), total_perf_collected_.load(std::memory_order_relaxed), /*optional=*/false
+        sizeof(L2SwimlaneAicpuTaskBuffer), total_perf_collected_, /*optional=*/false
     );
 
     reconcile_one(
@@ -632,8 +613,7 @@ void L2SwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(host_ptr)->count;
         },
-        sizeof(L2SwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_.load(std::memory_order_relaxed),
-        /*optional=*/true
+        sizeof(L2SwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_, /*optional=*/true
     );
 
     reconcile_one(
@@ -644,8 +624,7 @@ void L2SwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<L2SwimlaneAicpuOrchPhaseBuffer *>(host_ptr)->count;
         },
-        sizeof(L2SwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_.load(std::memory_order_relaxed),
-        /*optional=*/true
+        sizeof(L2SwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true
     );
 }
 
@@ -711,10 +690,7 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
         LOG_INFO_V0("  Core-to-thread mapping: %d cores", num_phase_cores);
     }
 
-    LOG_INFO_V0(
-        "Phase metadata collection complete: has_phase_data=%s",
-        has_phase_data_.load(std::memory_order_relaxed) ? "yes" : "no"
-    );
+    LOG_INFO_V0("Phase metadata collection complete: has_phase_data=%s", has_phase_data_ ? "yes" : "no");
 }
 
 void L2SwimlaneCollector::set_core_types(const CoreType *types, int n) {
@@ -887,7 +863,9 @@ int L2SwimlaneCollector::export_swimlane_json() {
                     outfile << ", \"pop_hit\": " << pr.pop_hit << ", \"pop_miss\": " << pr.pop_miss;
                 }
                 // Queue-depth snapshots — [AIC, AIV, MIX] per L2SwimlaneAicpuSchedPhaseRecord docstring.
+                emit_depth_array("local_at_start", pr.local_depth_at_start);
                 emit_depth_array("shared_at_start", pr.shared_depth_at_start);
+                emit_depth_array("local_at_end", pr.local_depth_at_end);
                 emit_depth_array("shared_at_end", pr.shared_depth_at_end);
                 outfile << "}";
                 first = false;
@@ -1057,10 +1035,10 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
     collected_sched_phase_records_.clear();
     collected_orch_phase_records_.clear();
     core_to_thread_.clear();
-    has_phase_data_.store(false, std::memory_order_relaxed);
-    total_perf_collected_.store(0, std::memory_order_relaxed);
-    total_sched_phase_collected_.store(0, std::memory_order_relaxed);
-    total_orch_phase_collected_.store(0, std::memory_order_relaxed);
+    has_phase_data_ = false;
+    total_perf_collected_ = 0;
+    total_sched_phase_collected_ = 0;
+    total_orch_phase_collected_ = 0;
     clear_memory_context();
 
     LOG_DEBUG("Performance profiling cleanup complete");

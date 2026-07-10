@@ -237,13 +237,12 @@ AICore uses `last_reg_val` to detect new dispatches — identical values cause s
 
 ### 7.2 Runtime Overrides
 
-Each ring resource (`ring_task_window` / `ring_heap` / `ring_dep_pool`) is a
-single `CallConfig.runtime_env` field that accepts **either** a scalar (broadcast
-to every ring) **or** a list of four per-ring values. Precedence is resolved
-independently for each resource and ring:
+Ring sizing can be configured either uniformly for every ring or independently
+per ring. Precedence is resolved independently for each resource and ring:
 
 ```text
-per-ring CallConfig entry (a scalar is broadcast to every entry)
+per-ring CallConfig value
+  > scalar CallConfig value
   > per-ring PTO2_RING_* env value
   > scalar PTO2_RING_* env value
   > compile-time default
@@ -260,7 +259,8 @@ scope depth >=3 -> ring 3
 
 Per-task via `CallConfig.runtime_env` — different L2 tasks in one launch can
 each carry their own sizes. Invalid values raise at submit time (`validate()`).
-Assign a scalar to size every ring the same:
+The scalar fields preserve the old behavior and broadcast one value to all
+rings:
 
 ```python
 cfg = CallConfig()
@@ -270,33 +270,33 @@ cfg.runtime_env.ring_dep_pool = 256      # 4 .. INT32_MAX
 orchestrator.submit_next_level(handle, args, cfg)
 ```
 
-Assign a four-entry list to tune the scope-depth rings independently. The list
-must contain exactly four entries; use `0` for an entry that should fall through
-to the next precedence tier. All `CallConfig` values are integer byte/count
-values, and each field always reads back as a four-entry list.
+Set the array fields to tune the four scope-depth rings independently. Each
+array must contain exactly four entries; use `0` for an entry that should fall
+through to the next precedence tier. All `CallConfig` values are integer
+byte/count values.
 
 ```python
 cfg = CallConfig()
-cfg.runtime_env.ring_task_window = [8192, 16384, 131072, 524288]
-cfg.runtime_env.ring_heap = [
+cfg.runtime_env.ring_task_windows = [8192, 16384, 131072, 524288]
+cfg.runtime_env.ring_heaps = [
     128 * 1024 * 1024,
     256 * 1024 * 1024,
     384 * 1024 * 1024,
     512 * 1024 * 1024,
 ]
-cfg.runtime_env.ring_dep_pool = [4096, 8192, 16384, 32768]
+cfg.runtime_env.ring_dep_pools = [4096, 8192, 16384, 32768]
 orchestrator.submit_next_level(handle, args, cfg)
 ```
 
 Scene tests set the same keys under a nested `runtime_env` block in the
-per-case `config` dict — each value is a scalar or a four-entry list:
+per-case `config` dict:
 
 ```python
 "config": {
     "runtime_env": {
-        "ring_task_window": [8192, 16384, 131072, 524288],
-        "ring_heap": [134217728, 268435456, 402653184, 536870912],
-        "ring_dep_pool": 256,  # scalar broadcasts to every ring
+        "ring_task_windows": [8192, 16384, 131072, 524288],
+        "ring_heaps": [134217728, 268435456, 402653184, 536870912],
+        "ring_dep_pools": [4096, 8192, 16384, 32768],
     }
 }
 ```

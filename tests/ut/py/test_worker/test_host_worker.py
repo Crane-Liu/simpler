@@ -18,7 +18,6 @@ import threading
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
-import simpler.worker as worker_mod
 from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
 from simpler.callable_identity import (
     CallableHandle,
@@ -108,9 +107,9 @@ def _slot_for(worker: Worker, handle: CallableHandle) -> int:
 
 
 class _FakeControlResult:
-    def __init__(self, worker_type: str, worker_id: int = 0, ok: bool = True, error_message: str = ""):
+    def __init__(self, worker_type: str, worker_index: int = 0, ok: bool = True, error_message: str = ""):
         self.worker_type = worker_type
-        self.worker_id = worker_id
+        self.worker_index = worker_index
         self.ok = ok
         self.error_message = error_message
 
@@ -121,45 +120,6 @@ def _chip_payload_shm(callable_obj: ChipCallable) -> SharedMemory:
     assert shm.buf is not None
     shm.buf[: len(payload)] = payload
     return shm
-
-
-def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
-    events: list[tuple] = []
-
-    class FakeChipWorker:
-        def init(self, device_id, bins, *, log_level, log_info_v):
-            events.append(("init", device_id, bins, log_level, log_info_v))
-
-        def finalize(self) -> None:
-            events.append(("finalize",))
-
-    def fake_run_chip_main_loop(cw, *_args, chip_platform, chip_runtime):
-        events.append(("main_loop", cw, chip_platform, chip_runtime))
-
-    monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
-    monkeypatch.setattr(worker_mod, "_run_chip_main_loop", fake_run_chip_main_loop)
-
-    shm = SharedMemory(create=True, size=MAILBOX_SIZE)
-    try:
-        assert shm.buf is not None
-        worker_mod._chip_process_loop(
-            shm.buf,
-            "bins",
-            7,
-            {},
-            {},
-            {},
-            platform="a2a3",
-            runtime="tensormap_and_ringbuffer",
-        )
-    finally:
-        shm.close()
-        shm.unlink()
-
-    assert events[0] == ("init", 7, "bins", 1, 5)
-    assert events[1][0] == "main_loop"
-    assert events[1][2:] == ("a2a3", "tensormap_and_ringbuffer")
-    assert events[2] == ("finalize",)
 
 
 def _chip_digest(callable_obj: ChipCallable, *, platform: str = "", runtime: str = "") -> bytes:
@@ -207,23 +167,6 @@ class TestLifecycle:
         hw = Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
         with pytest.raises(TypeError, match="level 2 only supports ChipCallable"):
             hw.register(lambda args: None)
-
-    def test_close_releases_registered_callables(self):
-        # close() must drop every Worker-held reference to registered callables.
-        # A ChipCallable is a nanobind instance; if close() leaves it in one of
-        # the registries, a closed Worker kept alive past interpreter exit (e.g.
-        # a failing test's traceback pinning the frame's `worker` local) keeps
-        # the instance live, which blocks nanobind's module unload and prints a
-        # leak dump at shutdown.
-        hw = Worker(level=3, num_sub_workers=0)
-        hw.init()
-        handle = hw.register(_unique_chip_callable(1))
-        assert _slot_for(hw, handle) in hw._callable_registry
-        assert hw._identity_registry and hw._live_handles
-        hw.close()
-        assert hw._callable_registry == {}
-        assert hw._identity_registry == {}
-        assert hw._live_handles == {}
 
     def test_prepare_python_fn_after_init_before_start_succeeds(self):
         # init() allocates mailboxes but does not fork children. Python
@@ -1210,7 +1153,7 @@ class TestLifecycle:
 
             for result in (register_results[0], unregister_results[0]):
                 assert isinstance(result.worker_type, str)
-                assert isinstance(result.worker_id, int)
+                assert isinstance(result.worker_index, int)
                 assert isinstance(result.ok, bool)
                 assert isinstance(result.error_message, str)
             assert not register_results[0].ok
@@ -1276,9 +1219,9 @@ class TestLifecycle:
                     return [_FakeControlResult("NEXT_LEVEL", 0, True), _FakeControlResult("NEXT_LEVEL", 1, True)]
                 return [_FakeControlResult("NEXT_LEVEL", 0, True), _FakeControlResult("NEXT_LEVEL", 1, False, "boom")]
 
-            def control_digest_only(self, worker_type, worker_id, sub_cmd, digest, timeout_s=None):
-                calls.append(("cleanup_one", worker_type, worker_id, sub_cmd, digest))
-                return _FakeControlResult("NEXT_LEVEL", worker_id, True)
+            def control_digest_only(self, worker_type, worker_index, sub_cmd, digest, timeout_s=None):
+                calls.append(("cleanup_one", worker_type, worker_index, sub_cmd, digest))
+                return _FakeControlResult("NEXT_LEVEL", worker_index, True)
 
         hw = Worker(level=3, num_sub_workers=1)
         hw._initialized = True
@@ -1843,26 +1786,6 @@ class TestChipMainLoopDigestRegister:
         _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
 
     @staticmethod
-    def _send_ctrl_l3_l2_orch_comm_init(buf, state_addr, shm_name: str):
-        from simpler.worker import (  # noqa: PLC0415
-            _CONTROL_REQUEST,
-            _CTRL_L3_L2_ORCH_COMM_INIT,
-            _CTRL_SHM_NAME_BYTES,
-            _OFF_ARGS,
-            _OFF_CALLABLE,
-            _mailbox_store_i32,
-        )
-
-        struct.pack_into("Q", buf, _OFF_CALLABLE, _CTRL_L3_L2_ORCH_COMM_INIT)
-        encoded = shm_name.encode("utf-8")
-        assert len(encoded) + 1 <= _CTRL_SHM_NAME_BYTES
-        buf[_OFF_ARGS : _OFF_ARGS + len(encoded)] = encoded
-        buf[_OFF_ARGS + len(encoded) : _OFF_ARGS + _CTRL_SHM_NAME_BYTES] = b"\x00" * (
-            _CTRL_SHM_NAME_BYTES - len(encoded)
-        )
-        _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
-
-    @staticmethod
     def _wait_for_done_and_reset(buf, state_addr, timeout: float = 5.0):
         """Block until the loop publishes _CONTROL_DONE, then read the error
         code and reset the mailbox to _IDLE so the next round can start."""
@@ -1920,7 +1843,7 @@ class TestChipMainLoopDigestRegister:
         cw = MagicMock()
         cw._impl = MagicMock()
         cw._unregister_slot = MagicMock()
-        cw._impl.register_callable_from_blob = MagicMock()
+        cw._impl.prepare_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)
@@ -1939,8 +1862,8 @@ class TestChipMainLoopDigestRegister:
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 0
                 assert cw._unregister_slot.call_count == 0
-                cw._impl.register_callable_from_blob.assert_called_once()
-                assert cw._impl.register_callable_from_blob.call_args.args[0] == 0
+                cw._impl.prepare_callable_from_blob.assert_called_once()
+                assert cw._impl.prepare_callable_from_blob.call_args.args[0] == 0
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)
@@ -1950,41 +1873,13 @@ class TestChipMainLoopDigestRegister:
             payload_shm.close()
             payload_shm.unlink()
 
-    def test_l3_l2_orch_comm_init_passes_control_shm_mapping_to_chip_worker(self):
-        from unittest.mock import MagicMock  # noqa: PLC0415
-
-        cw = MagicMock()
-        cw.l3_l2_orch_comm_init_from_addr = MagicMock()
-
-        control_shm = SharedMemory(create=True, size=4096)
-        shm, buf, state_addr = self._build_mailbox()
-        try:
-            t = self._spawn_loop(cw, buf, state_addr)
-            try:
-                self._send_ctrl_l3_l2_orch_comm_init(buf, state_addr, control_shm.name)
-                assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                cw.l3_l2_orch_comm_init_from_addr.assert_called_once()
-                addr, size = cw.l3_l2_orch_comm_init_from_addr.call_args.args
-                assert isinstance(addr, int)
-                assert addr != 0
-                assert size == control_shm.size
-            finally:
-                self._shutdown(state_addr)
-                t.join(timeout=2.0)
-                assert not t.is_alive()
-        finally:
-            shm.close()
-            shm.unlink()
-            control_shm.close()
-            control_shm.unlink()
-
     def test_register_reads_only_declared_payload_size(self):
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         cw = MagicMock()
         cw._impl = MagicMock()
         cw._unregister_slot = MagicMock()
-        cw._impl.register_callable_from_blob = MagicMock()
+        cw._impl.prepare_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         payload = ctypes.string_at(int(callable_obj.buffer_ptr()), int(callable_obj.buffer_size()))
@@ -2009,7 +1904,7 @@ class TestChipMainLoopDigestRegister:
                     payload_size=len(payload),
                 )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                cw._impl.register_callable_from_blob.assert_called_once()
+                cw._impl.prepare_callable_from_blob.assert_called_once()
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)
@@ -2025,7 +1920,7 @@ class TestChipMainLoopDigestRegister:
         cw = MagicMock()
         cw._impl = MagicMock()
         cw._unregister_slot = MagicMock()
-        cw._impl.register_callable_from_blob = MagicMock()
+        cw._impl.prepare_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         wrong_digest = _chip_digest(_unique_chip_callable(8))
@@ -2047,7 +1942,7 @@ class TestChipMainLoopDigestRegister:
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 1
                 assert "HASHID_DESCRIPTOR_MISMATCH" in self._read_error_message(buf)
-                cw._impl.register_callable_from_blob.assert_not_called()
+                cw._impl.prepare_callable_from_blob.assert_not_called()
                 cw._unregister_slot.assert_not_called()
                 assert registry == {}
                 assert identity_table == {}
@@ -2067,7 +1962,7 @@ class TestChipMainLoopDigestRegister:
         cw = MagicMock()
         cw._impl = MagicMock()
         cw._unregister_slot = MagicMock()
-        cw._impl.register_callable_from_blob = MagicMock()
+        cw._impl.prepare_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)
@@ -2094,7 +1989,7 @@ class TestChipMainLoopDigestRegister:
                 )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
                 assert cw._unregister_slot.call_count == 0
-                assert cw._impl.register_callable_from_blob.call_count == 1
+                assert cw._impl.prepare_callable_from_blob.call_count == 1
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)
@@ -2110,7 +2005,7 @@ class TestChipMainLoopDigestRegister:
         cw = MagicMock()
         cw._impl = MagicMock()
         cw._unregister_slot = MagicMock()
-        cw._impl.register_callable_from_blob = MagicMock()
+        cw._impl.prepare_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)

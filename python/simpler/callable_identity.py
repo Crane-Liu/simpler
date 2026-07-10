@@ -13,7 +13,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from .task_interface import ArgDirection, ChipCallable
@@ -50,6 +50,10 @@ _PY_CALLABLE_MAGIC = b"SPYC"
 _PY_CALLABLE_VERSION = 1
 _PY_CALLABLE_SERIALIZER_CLOUDPICKLE = 1
 _PY_CALLABLE_HEADER = struct.Struct("<4sBBHQ")
+
+
+def _pack_u8(value: int) -> bytes:
+    return struct.pack("<B", int(value))
 
 
 def _pack_u32(value: int) -> bytes:
@@ -267,4 +271,3 @@ class _CallableIdentityState:
     target: Any
     ref_count: int = 0
     state: str = "INSTALLED"
-    eligible_worker_ids: tuple[int, ...] = field(default_factory=tuple)

@@ -183,10 +183,6 @@ function(add_hierarchical_test name src)
         ${GTEST_LIB}
         pthread
     )
-    # worker_manager.cpp uses shm_open/shm_unlink; librt on glibc < 2.34, libSystem on macOS.
-    if(UNIX AND NOT APPLE)
-        target_link_libraries(${name} PRIVATE rt)
-    endif()
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
@@ -316,7 +312,6 @@ function(add_common_utils_test name src)
         # src/common is needed so utils/elf_build_id.h, utils/device_arena.h,
         # etc. resolve via the "utils/..." prefix.
         ${CMAKE_SOURCE_DIR}/../../../src/common
-        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     )
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
@@ -371,142 +366,7 @@ set_tests_properties(test_chip_callable_upload_immutable PROPERTIES LABELS "no_h
 # ---------------------------------------------------------------------------
 add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
-# RegisterCallableArgs lives in the arch platform headers (identical across
-# arches); pull in a2a3's so `common/kernel_args.h` resolves for this no-hardware
-# POD-shape test.
-target_include_directories(test_runtime_orch_so PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
-)
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
-add_common_utils_test(test_buffer_pool_manager common/test_buffer_pool_manager.cpp)
-target_include_directories(test_buffer_pool_manager PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
-)
-add_common_utils_test(test_l3_l2_orch_comm common/test_l3_l2_orch_comm.cpp)
-
-add_executable(test_trb_runtime_temp_buffer
-    common/test_trb_runtime_temp_buffer.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/platform_compile_info.cpp
-)
-target_compile_definitions(test_trb_runtime_temp_buffer PRIVATE SIMPLER_PLATFORM_NAME="a2a3sim")
-target_include_directories(test_trb_runtime_temp_buffer PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/host
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
-    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common
-)
-target_link_libraries(test_trb_runtime_temp_buffer PRIVATE
-    a2a3_rt_objs
-    ${GTEST_MAIN_LIB}
-    ${GTEST_LIB}
-    pthread
-)
-add_test(NAME test_trb_runtime_temp_buffer COMMAND test_trb_runtime_temp_buffer)
-set_tests_properties(test_trb_runtime_temp_buffer PROPERTIES LABELS "no_hardware")
-
-add_executable(test_l3_l2_message_queue
-    common/test_l3_l2_message_queue.cpp
-    stubs/test_stubs.cpp
-)
-target_include_directories(test_l3_l2_message_queue PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
-)
-target_link_libraries(test_l3_l2_message_queue PRIVATE
-    ${GTEST_MAIN_LIB}
-    ${GTEST_LIB}
-    pthread
-)
-add_test(NAME test_l3_l2_message_queue COMMAND test_l3_l2_message_queue)
-set_tests_properties(test_l3_l2_message_queue PROPERTIES LABELS "no_hardware")
-
-add_executable(test_l3_l2_orch_endpoint
-    common/test_l3_l2_orch_endpoint.cpp
-    stubs/test_stubs.cpp
-)
-target_include_directories(test_l3_l2_orch_endpoint PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
-)
-target_link_libraries(test_l3_l2_orch_endpoint PRIVATE
-    ${GTEST_MAIN_LIB}
-    ${GTEST_LIB}
-    pthread
-)
-add_test(NAME test_l3_l2_orch_endpoint COMMAND test_l3_l2_orch_endpoint)
-set_tests_properties(test_l3_l2_orch_endpoint PROPERTIES LABELS "no_hardware")
-
-add_executable(test_l3_l2_orch_comm_service
-    common/test_l3_l2_orch_comm_service.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/l3_l2_orch_comm_service.cpp
-)
-target_include_directories(test_l3_l2_orch_comm_service PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
-)
-target_link_libraries(test_l3_l2_orch_comm_service PRIVATE
-    ${GTEST_MAIN_LIB}
-    ${GTEST_LIB}
-    pthread
-)
-add_test(NAME test_l3_l2_orch_comm_service COMMAND test_l3_l2_orch_comm_service)
-set_tests_properties(test_l3_l2_orch_comm_service PROPERTIES LABELS "no_hardware")
-
-add_executable(test_l3_l2_orch_comm_sim_runner
-    common/test_l3_l2_orch_comm_sim_runner.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/l3_l2_orch_comm_service.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/host/device_runner_base.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/host/memory_allocator.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/sim_context/cpu_sim_context.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/shared/host/l2_swimlane_collector.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/shared/host/pmu_collector.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/tensor_dump_collector.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/scope_stats_collector.cpp
-    stubs/test_stubs.cpp
-)
-target_include_directories(test_l3_l2_orch_comm_sim_runner PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/host
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/sim_context
-    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
-    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
-)
-target_link_libraries(test_l3_l2_orch_comm_sim_runner PRIVATE
-    ${GTEST_MAIN_LIB}
-    ${GTEST_LIB}
-    pthread
-    dl
-)
-add_test(NAME test_l3_l2_orch_comm_sim_runner COMMAND test_l3_l2_orch_comm_sim_runner)
-set_tests_properties(test_l3_l2_orch_comm_sim_runner PROPERTIES LABELS "no_hardware")
-
-add_common_utils_test(test_runtime_timeout_config common/test_runtime_timeout_config.cpp)
-target_include_directories(test_runtime_timeout_config PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/a2a3/platform/include
-)
-add_common_utils_test(test_runtime_timeout_config_a5 common/test_runtime_timeout_config.cpp)
-target_include_directories(test_runtime_timeout_config_a5 PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/a5/platform/include
-)
 
 add_executable(test_scope_stats_collector
     common/test_scope_stats_collector.cpp
@@ -569,6 +429,10 @@ add_a2a3_runtime_test(test_wiring           a2a3/test_wiring.cpp)
 add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
 add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_collector.cpp)
 
+# replay_graph runtime UTs live in their own subdirectory: own OBJECT lib and
+# auto-discovery of test_*.cpp, kept isolated from the trb runtime UTs above.
+add_subdirectory(a2a3/replay_graph)
+
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------
@@ -610,31 +474,6 @@ target_link_libraries(test_host_log_off PRIVATE
 )
 add_test(NAME test_host_log_off COMMAND test_host_log_off)
 
-# a2a3 host-side AICPU affinity selection (compute_allowed_cpus). Pure logic —
-# no CANN headers, no hardware: compile the probe .cpp alongside the test. The
-# test provides its own no-op logger stubs, so no logger sources are linked.
-# The dlopen/dlsym HAL path is never exercised by these tests (only
-# compute_allowed_cpus is), but the .cpp references libdl symbols, so link it.
-# Regression barrier for issue #1045 (all survivors in one cluster).
-set(A2A3_ONBOARD_HOST_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/onboard/host)
-add_executable(test_a2a3_aicpu_affinity_select
-    a2a3/test_aicpu_affinity_select.cpp
-    ${A2A3_ONBOARD_HOST_DIR}/aicpu_topology_probe.cpp
-)
-target_include_directories(test_a2a3_aicpu_affinity_select PRIVATE
-    ${GTEST_INCLUDE_DIRS}
-    ${A2A3_ONBOARD_HOST_DIR}
-    ${SIMPLER_LOG_DIR}/include
-)
-target_link_libraries(test_a2a3_aicpu_affinity_select PRIVATE
-    ${GTEST_MAIN_LIB}
-    ${GTEST_LIB}
-    ${CMAKE_DL_LIBS}
-    pthread
-)
-add_test(NAME test_a2a3_aicpu_affinity_select COMMAND test_a2a3_aicpu_affinity_select)
-set_tests_properties(test_a2a3_aicpu_affinity_select PROPERTIES LABELS "no_hardware")
-
 # Hardware-gated tests.  Block is only entered when the project is configured
 # with -DSIMPLER_ENABLE_HARDWARE_TESTS=ON.  CI's no-hw `ut` job does not pass
 # this flag, so nothing here is compiled there — this is the structural
@@ -672,12 +511,6 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     set(ASCEND_HOME_PATH "$ENV{ASCEND_HOME_PATH}")
     find_library(ASCENDCL_LIB ascendcl
         PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH REQUIRED)
-    find_library(RUNTIME_LIB runtime
-        PATHS
-            ${ASCEND_HOME_PATH}/lib64
-            ${ASCEND_HOME_PATH}/runtime/lib64
-            ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64
-        NO_DEFAULT_PATH REQUIRED)
 
     # Black-box lifecycle UT for the comm_* C API on Path D. See the file
     # header for the contract it pins down.
@@ -706,61 +539,5 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     set_tests_properties(test_comm_lifecycle PROPERTIES
         LABELS "requires_hardware_a2a3"
         RESOURCE_GROUPS "2,npus:1"
-    )
-
-    add_executable(test_l3_l2_orch_comm_onboard_runner
-        hardware/test_l3_l2_orch_comm_onboard_runner.cpp
-        ${PROJECT_ROOT}/src/common/aicpu_loader/host/load_aicpu_op.cpp
-        ${PROJECT_ROOT}/src/common/log/host_log.cpp
-        ${PROJECT_ROOT}/src/common/log/unified_log_host.cpp
-        ${PROJECT_ROOT}/src/common/platform/onboard/host/device_runner_base.cpp
-        ${PROJECT_ROOT}/src/common/platform/shared/host/l3_l2_orch_comm_service.cpp
-        ${PROJECT_ROOT}/src/common/platform/shared/host/scope_stats_collector.cpp
-        ${PROJECT_ROOT}/src/common/platform/shared/host/tensor_dump_collector.cpp
-        ${PROJECT_ROOT}/src/a5/platform/onboard/host/profiling_copy.cpp
-        ${PROJECT_ROOT}/src/a5/platform/onboard/host/memory_allocator.cpp
-        ${PROJECT_ROOT}/src/a5/platform/shared/host/l2_swimlane_collector.cpp
-        ${PROJECT_ROOT}/src/a5/platform/shared/host/pmu_collector.cpp
-    )
-    target_compile_options(test_l3_l2_orch_comm_onboard_runner PRIVATE
-        -ffunction-sections
-        -fdata-sections
-    )
-    target_include_directories(test_l3_l2_orch_comm_onboard_runner PRIVATE
-        ${GTEST_INCLUDE_DIRS}
-        ${PROJECT_ROOT}/src/a5/platform/include
-        ${PROJECT_ROOT}/src/a5/runtime
-        ${PROJECT_ROOT}/src/a5/runtime/tensormap_and_ringbuffer/common
-        ${PROJECT_ROOT}/src/a5/runtime/tensormap_and_ringbuffer/orchestration
-        ${PROJECT_ROOT}/src/a5/runtime/tensormap_and_ringbuffer/runtime
-        ${PROJECT_ROOT}/src/common
-        ${PROJECT_ROOT}/src/common/aicpu_loader/host
-        ${PROJECT_ROOT}/src/common/log/include
-        ${PROJECT_ROOT}/src/common/platform/include
-        ${PROJECT_ROOT}/src/common/platform/onboard/host
-        ${PROJECT_ROOT}/src/common/task_interface
-        ${PROJECT_ROOT}/src/common/worker
-        ${ASCEND_HOME_PATH}/include
-        ${ASCEND_HOME_PATH}/pkg_inc
-        ${ASCEND_HOME_PATH}/pkg_inc/runtime
-        ${ASCEND_HOME_PATH}/pkg_inc/runtime/runtime
-        ${ASCEND_HOME_PATH}/pkg_inc/profiling
-        ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
-    )
-    target_link_libraries(test_l3_l2_orch_comm_onboard_runner PRIVATE
-        ${GTEST_MAIN_LIB}
-        ${GTEST_LIB}
-        ${RUNTIME_LIB}
-        ${ASCENDCL_LIB}
-        pthread
-        dl
-    )
-    if(NOT APPLE)
-        target_link_options(test_l3_l2_orch_comm_onboard_runner PRIVATE -Wl,--gc-sections)
-    endif()
-    add_test(NAME test_l3_l2_orch_comm_onboard_runner COMMAND test_l3_l2_orch_comm_onboard_runner)
-    set_tests_properties(test_l3_l2_orch_comm_onboard_runner PROPERTIES
-        LABELS "requires_hardware_a5"
-        RESOURCE_GROUPS "1,npus:1"
     )
 endif()

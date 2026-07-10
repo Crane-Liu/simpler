@@ -22,15 +22,45 @@
 
 #include "common/unified_log.h"
 
+int KernelArgsHelper::init_device_args(const DeviceArgs &host_device_args, MemoryAllocator &allocator) {
+    allocator_ = &allocator;
+
+    // Allocate device memory for device_args
+    if (args.device_args == nullptr) {
+        uint64_t device_args_size = sizeof(DeviceArgs);
+        void *device_args_dev = allocator_->alloc(device_args_size);
+        if (device_args_dev == nullptr) {
+            LOG_ERROR("Alloc for device_args failed");
+            return -1;
+        }
+        args.device_args = reinterpret_cast<DeviceArgs *>(device_args_dev);
+    }
+    // Copy host_device_args to device memory via device_args
+    int rc =
+        rtMemcpy(args.device_args, sizeof(DeviceArgs), &host_device_args, sizeof(DeviceArgs), RT_MEMCPY_HOST_TO_DEVICE);
+    if (rc != 0) {
+        LOG_ERROR("rtMemcpy failed: %d", rc);
+        allocator_->free(args.device_args);
+        args.device_args = nullptr;
+        return rc;
+    }
+    return 0;
+}
+
+int KernelArgsHelper::finalize_device_args() {
+    if (args.device_args != nullptr && allocator_ != nullptr) {
+        int rc = allocator_->free(args.device_args);
+        args.device_args = nullptr;
+        return rc;
+    }
+    return 0;
+}
+
 int KernelArgsHelper::init_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator) {
     allocator_ = &allocator;
 
-    // Only the device-read prefix of Runtime crosses to the device: trb copies
-    // its `dev` descriptor (offset 0), hbg copies the whole object. Both start
-    // at &host_runtime; runtime_device_copy_size() picks the right length per
-    // runtime variant so this shared path stays runtime-agnostic.
-    const uint64_t runtime_size = runtime_device_copy_size(host_runtime);
     if (args.runtime_args == nullptr) {
+        uint64_t runtime_size = sizeof(Runtime);
         void *runtime_dev = allocator_->alloc(runtime_size);
         if (runtime_dev == nullptr) {
             LOG_ERROR("Alloc for runtime_args failed");
@@ -38,7 +68,7 @@ int KernelArgsHelper::init_runtime_args(const Runtime &host_runtime, MemoryAlloc
         }
         args.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
     }
-    int rc = rtMemcpy(args.runtime_args, runtime_size, &host_runtime, runtime_size, RT_MEMCPY_HOST_TO_DEVICE);
+    int rc = rtMemcpy(args.runtime_args, sizeof(Runtime), &host_runtime, sizeof(Runtime), RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy for runtime failed: %d", rc);
         allocator_->free(args.runtime_args);

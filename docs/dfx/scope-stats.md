@@ -309,7 +309,7 @@ render `used/cap` without a second device→host query.
 | PMU | platform only | all runtimes | reads hardware registers |
 | L2 swimlane | platform only | all runtimes | reads AICore ring buffers |
 | dep_gen | platform only | all runtimes | traces `submit_task` |
-| args dump | platform only | all runtimes | dumps argument data |
+| tensor dump | platform only | all runtimes | dumps tensor data |
 | **scope stats** | **platform API + runtime call sites** | **T&R only** | runtime extracts values, platform tracks peaks |
 
 ### 4.4 Symbol resolution
@@ -331,7 +331,7 @@ ScopeStatsCollector                platform scope_stats_collector_aicpu.cpp
   set kernel_args fields             runtime: scope_stats_set_ring_capacity()
   launch kernel                      runtime: scope_stats_set_tensormap_capacity()
       │                                  │
-  collector shard(s):                on PTO2_SCOPE begin/end:
+  poll thread:                       on PTO2_SCOPE begin/end:
    append records to memory  ◀──┐      runtime samples task/heap/dep_pool/tensormap
       │                         │      runtime: scope_stats_begin()/end()
       │                         │         └─ emit record, append to buffer;

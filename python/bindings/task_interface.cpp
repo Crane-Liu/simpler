@@ -296,7 +296,7 @@ NB_MODULE(_task_interface, m) {
         .value("NO_DEP", TensorArgType::NO_DEP);
 
     // --- TaskArgs (unified vector-backed builder with per-tensor TensorArgType tags) ---
-    nb::class_<TaskArgs>(m, "TaskArgs", nb::is_weak_referenceable())
+    nb::class_<TaskArgs>(m, "TaskArgs")
         .def(nb::init<>())
 
         .def(
@@ -394,9 +394,7 @@ NB_MODULE(_task_interface, m) {
                 );
                 return PyCoreCallable{std::move(buf)};
             },
-            nb::arg("signature"), nb::arg("binary"),
-            "Build a CoreCallable from a signature list and binary bytes. The dump "
-            "maps signature entry i to payload slot i positionally."
+            nb::arg("signature"), nb::arg("binary"), "Build a CoreCallable from a signature list and binary bytes."
         )
 
         .def(
@@ -616,10 +614,6 @@ NB_MODULE(_task_interface, m) {
         });
 
     // --- RuntimeEnv (per-task PTO2_RING_* overrides; nested under CallConfig.runtime_env) ---
-    // Each ring resource is exposed as ONE property that accepts either an int
-    // (broadcast to every ring) or a list of RUNTIME_ENV_RING_COUNT ints
-    // (per-ring). The value always reads back as a list — the wire layout is the
-    // four-entry array, so a broadcast scalar is stored as [v, v, v, v].
     auto get_ring_values = [](const uint64_t values[RUNTIME_ENV_RING_COUNT]) -> std::vector<uint64_t> {
         std::vector<uint64_t> out;
         out.reserve(RUNTIME_ENV_RING_COUNT);
@@ -628,38 +622,21 @@ NB_MODULE(_task_interface, m) {
         }
         return out;
     };
-    auto set_ring_values = [](uint64_t values[RUNTIME_ENV_RING_COUNT], nb::handle obj, const char *name) {
-        uint64_t scalar = 0;
-        if (nb::try_cast<uint64_t>(obj, scalar)) {  // int -> broadcast to every ring
-            for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
-                values[i] = scalar;
-            }
-            return;
+    auto set_ring_values = [](uint64_t values[RUNTIME_ENV_RING_COUNT], const std::vector<uint64_t> &input,
+                              const char *name) {
+        if (input.size() != RUNTIME_ENV_RING_COUNT) {
+            throw std::invalid_argument(
+                std::string("RuntimeEnv.") + name + " must contain exactly " + std::to_string(RUNTIME_ENV_RING_COUNT) +
+                " entries"
+            );
         }
-        std::vector<uint64_t> input;
-        if (nb::try_cast<std::vector<uint64_t>>(obj, input)) {  // list -> per-ring
-            if (input.size() != RUNTIME_ENV_RING_COUNT) {
-                throw std::invalid_argument(
-                    std::string("RuntimeEnv.") + name + " list must contain exactly " +
-                    std::to_string(RUNTIME_ENV_RING_COUNT) + " entries"
-                );
-            }
-            for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
-                values[i] = input[static_cast<size_t>(i)];
-            }
-            return;
+        for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
+            values[i] = input[static_cast<size_t>(i)];
         }
-        throw std::invalid_argument(
-            std::string("RuntimeEnv.") + name + " must be an int (broadcast) or a list of " +
-            std::to_string(RUNTIME_ENV_RING_COUNT) + " ints"
-        );
     };
-    auto append_ring_values = [](std::ostringstream &os, const char *name, bool leading_comma,
+    auto append_ring_values = [](std::ostringstream &os, const char *name,
                                  const uint64_t values[RUNTIME_ENV_RING_COUNT]) {
-        if (leading_comma) {
-            os << ", ";
-        }
-        os << name << "=[";
+        os << ", " << name << "=[";
         for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
             if (i != 0) {
                 os << ", ";
@@ -671,39 +648,45 @@ NB_MODULE(_task_interface, m) {
 
     nb::class_<RuntimeEnv>(m, "RuntimeEnv")
         .def(nb::init<>())
+        .def_rw("ring_task_window", &RuntimeEnv::ring_task_window)
+        .def_rw("ring_heap", &RuntimeEnv::ring_heap)
+        .def_rw("ring_dep_pool", &RuntimeEnv::ring_dep_pool)
         .def_prop_rw(
-            "ring_task_window",
+            "ring_task_windows",
             [get_ring_values](const RuntimeEnv &self) {
-                return get_ring_values(self.ring_task_window);
+                return get_ring_values(self.ring_task_windows);
             },
-            [set_ring_values](RuntimeEnv &self, nb::handle value) {
-                set_ring_values(self.ring_task_window, value, "ring_task_window");
+            [set_ring_values](RuntimeEnv &self, const std::vector<uint64_t> &values) {
+                set_ring_values(self.ring_task_windows, values, "ring_task_windows");
             }
         )
         .def_prop_rw(
-            "ring_heap",
+            "ring_heaps",
             [get_ring_values](const RuntimeEnv &self) {
-                return get_ring_values(self.ring_heap);
+                return get_ring_values(self.ring_heaps);
             },
-            [set_ring_values](RuntimeEnv &self, nb::handle value) {
-                set_ring_values(self.ring_heap, value, "ring_heap");
+            [set_ring_values](RuntimeEnv &self, const std::vector<uint64_t> &values) {
+                set_ring_values(self.ring_heaps, values, "ring_heaps");
             }
         )
         .def_prop_rw(
-            "ring_dep_pool",
+            "ring_dep_pools",
             [get_ring_values](const RuntimeEnv &self) {
-                return get_ring_values(self.ring_dep_pool);
+                return get_ring_values(self.ring_dep_pools);
             },
-            [set_ring_values](RuntimeEnv &self, nb::handle value) {
-                set_ring_values(self.ring_dep_pool, value, "ring_dep_pool");
+            [set_ring_values](RuntimeEnv &self, const std::vector<uint64_t> &values) {
+                set_ring_values(self.ring_dep_pools, values, "ring_dep_pools");
             }
         )
         .def("__repr__", [append_ring_values](const RuntimeEnv &self) -> std::string {
             std::ostringstream os;
-            os << "RuntimeEnv(";
-            append_ring_values(os, "ring_task_window", false, self.ring_task_window);
-            append_ring_values(os, "ring_heap", true, self.ring_heap);
-            append_ring_values(os, "ring_dep_pool", true, self.ring_dep_pool);
+            os << "RuntimeEnv(ring_task_window=" << self.ring_task_window << ", ring_heap=" << self.ring_heap
+               << ", ring_dep_pool=" << self.ring_dep_pool;
+            if (self.per_ring_any()) {
+                append_ring_values(os, "ring_task_windows", self.ring_task_windows);
+                append_ring_values(os, "ring_heaps", self.ring_heaps);
+                append_ring_values(os, "ring_dep_pools", self.ring_dep_pools);
+            }
             os << ")";
             return os.str();
         });
@@ -749,7 +732,7 @@ NB_MODULE(_task_interface, m) {
             },
             // Accept either an int dump level (0=off, 1=partial, 2=full,
             // 3=full_json_only) or a Python bool. `True` maps to level 1
-            // (partial) — the default when --dump-args is passed without a
+            // (partial) — the default when --dump-tensor is passed without a
             // value; `False` maps to 0.
             [](CallConfig &c, nb::object v) {
                 if (PyBool_Check(v.ptr())) {
@@ -804,9 +787,14 @@ NB_MODULE(_task_interface, m) {
                << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
                << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
             if (self.runtime_env.any()) {
-                append_ring_values(os, "runtime_env.ring_task_window", true, self.runtime_env.ring_task_window);
-                append_ring_values(os, "runtime_env.ring_heap", true, self.runtime_env.ring_heap);
-                append_ring_values(os, "runtime_env.ring_dep_pool", true, self.runtime_env.ring_dep_pool);
+                os << ", runtime_env.ring_task_window=" << self.runtime_env.ring_task_window
+                   << ", runtime_env.ring_heap=" << self.runtime_env.ring_heap
+                   << ", runtime_env.ring_dep_pool=" << self.runtime_env.ring_dep_pool;
+                if (self.runtime_env.per_ring_any()) {
+                    append_ring_values(os, "runtime_env.ring_task_windows", self.runtime_env.ring_task_windows);
+                    append_ring_values(os, "runtime_env.ring_heaps", self.runtime_env.ring_heaps);
+                    append_ring_values(os, "runtime_env.ring_dep_pools", self.runtime_env.ring_dep_pools);
+                }
             }
             if (self.output_prefix_set()) {
                 os << ", output_prefix='" << self.output_prefix << "'";
@@ -820,9 +808,59 @@ NB_MODULE(_task_interface, m) {
     // one, change the other.
     m.attr("DEFAULT_LOG_THRESHOLD") = 20;  // V5 = Python INFO
 
-    // Per-stage run timing (host wall, on-NPU device wall + AICPU phase
-    // breakdown) is no longer returned from run(); the platform emits it as
-    // `[STRACE]` log markers — parse with simpler_setup.tools.strace_timing.
+    // --- RunTiming ---
+    // Returned by ChipWorker.run_prepared* / Worker.run. Cycles → ns conversion
+    // happens on the platform side (frequency known there); units exposed to
+    // Python are µs as floats to match historical benchmark_rounds.sh output.
+    nb::class_<RunTiming>(m, "RunTiming")
+        .def(nb::init<>())
+        .def(
+            "__init__",
+            [](RunTiming *self, uint64_t host_wall_ns, uint64_t device_wall_ns) {
+                new (self) RunTiming{host_wall_ns, device_wall_ns};
+            },
+            nb::arg("host_wall_ns"), nb::arg("device_wall_ns") = 0,
+            "Construct with explicit ns values (used by the Python Worker.run "
+            "wrapper to surface host-side timing for L3+ DAGs)."
+        )
+        .def_prop_ro(
+            "host_wall_us",
+            [](const RunTiming &t) {
+                return t.host_wall_ns / 1000.0;
+            },
+            "Host steady-clock wall around the dispatch, in microseconds."
+        )
+        .def_prop_ro(
+            "device_wall_us",
+            [](const RunTiming &t) {
+                return t.device_wall_ns / 1000.0;
+            },
+            "Full on-NPU kernel wall, in microseconds: earliest simpler_aicpu_exec "
+            "start -> latest simpler_aicpu_exec end across launched threads (run + "
+            "teardown), NOT just the orch span — "
+            "it is larger than the device-log Orch/Sched/Total. Populated whenever the "
+            "runtime was built with PTO2_PROFILING (the default); independent of "
+            "enable_l2_swimlane after the orch_summary capture was decoupled from the "
+            "swimlane shared region. Zero only on a PTO2_PROFILING-off build."
+        )
+        .def_prop_ro(
+            "host_wall_ns",
+            [](const RunTiming &t) {
+                return t.host_wall_ns;
+            }
+        )
+        .def_prop_ro(
+            "device_wall_ns",
+            [](const RunTiming &t) {
+                return t.device_wall_ns;
+            }
+        )
+        .def("__repr__", [](const RunTiming &t) {
+            std::ostringstream os;
+            os << "RunTiming(host_wall_us=" << t.host_wall_ns / 1000.0
+               << ", device_wall_us=" << t.device_wall_ns / 1000.0 << ")";
+            return os.str();
+        });
 
     // --- ChipWorker ---
     nb::class_<ChipWorker>(m, "_ChipWorker")
@@ -833,48 +871,48 @@ NB_MODULE(_task_interface, m) {
         )
         .def("finalize", &ChipWorker::finalize)
         .def(
-            "register_callable",
+            "prepare_callable",
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
-                self.register_callable(callable_id, callable.buffer_.data());
+                self.prepare_callable(callable_id, callable.buffer_.data());
             },
             nb::arg("callable_id"), nb::arg("callable"),
             "Stage a ChipCallable under callable_id for cheap repeated launches "
             "via run. Variants without per-callable_id support raise."
         )
         .def(
-            "register_callable_from_blob",
+            "prepare_callable_from_blob",
             [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr) {
-                self.register_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
+                self.prepare_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
             },
             nb::arg("callable_id"), nb::arg("blob_ptr"),
             "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
             "post-fork dynamic register handlers that receive the ChipCallable "
             "bytes via shared memory; see docs/callable-identity-registration.md). "
-            "Equivalent to register_callable(callable_id, ChipCallable) but accepts the "
+            "Equivalent to prepare_callable(callable_id, ChipCallable) but accepts the "
             "ChipCallable layout pointer directly so chip-child loops can prepare "
             "from shm without rebuilding a PyChipCallable wrapper."
         )
         .def(
             "run",
             [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config) {
-                self.run(callable_id, &args, config);
+                return self.run(callable_id, &args, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
-            "Launch a callable_id previously staged via register_callable. Returns "
-            "None; per-stage timing is emitted as `[STRACE]` log markers."
+            "Launch a callable_id previously staged via prepare_callable. "
+            "Returns RunTiming with host/device wall."
         )
         .def(
             "run",
             [](ChipWorker &self, int32_t callable_id, TaskArgs &args, const CallConfig &config) {
                 TaskArgsView view = make_view(args);
-                self.run(callable_id, view, config);
+                return self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
             "Launch a callable_id from a TaskArgs (used for in-process callers). "
-            "Returns None; timing is emitted as `[STRACE]` log markers."
+            "Returns RunTiming."
         )
         .def(
-            "run_from_blob",
+            "run_prepared_from_blob",
             [](ChipWorker &self, int32_t callable_id, uint64_t args_blob_ptr, size_t blob_capacity,
                const CallConfig &config) {
                 // The mailbox region is the on-wire format `write_blob` produced;
@@ -884,7 +922,7 @@ NB_MODULE(_task_interface, m) {
                 // loops never re-implement the tensor/scalar layout in Python
                 // (where it has historically dropped fields like child_memory).
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
-                self.run(callable_id, view, config);
+                return self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
             "Launch a callable_id from a raw mailbox-blob pointer + capacity "
@@ -909,11 +947,11 @@ NB_MODULE(_task_interface, m) {
             "Number of distinct callable entries the AICPU has dlopened for on the "
             "bound device. Equals 0 when not initialized or the runtime "
             "variant lacks prepared-callable registration. Tests assert this to verify "
-            "register_callable + repeated run do not redundantly dlopen."
+            "prepare_callable + repeated run do not redundantly dlopen."
         )
         .def_prop_ro(
             "host_dlopen_count", &ChipWorker::host_dlopen_count,
-            "Number of host-side dlopens triggered by register_callable on "
+            "Number of host-side dlopens triggered by prepare_callable on "
             "host_build_graph variants. Mirrors aicpu_dlopen_count for the "
             "host-orchestration path; 0 on device-orch variants."
         )
@@ -921,15 +959,6 @@ NB_MODULE(_task_interface, m) {
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
         .def("copy_from", &ChipWorker::copy_from, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
-        .def(
-            "l3_l2_orch_comm_init_from_addr", &ChipWorker::l3_l2_orch_comm_init, nb::arg("control_block_addr"),
-            nb::arg("control_block_size"),
-            "Start the independent L3-L2 orchestrator communication service from a mapped control-block address."
-        )
-        .def(
-            "l3_l2_orch_comm_shutdown", &ChipWorker::l3_l2_orch_comm_shutdown,
-            "Stop the independent L3-L2 orchestrator communication service."
-        )
         .def(
             "comm_init", &ChipWorker::comm_init, nb::arg("rank"), nb::arg("nranks"), nb::arg("rootinfo_path"),
             "Initialize a communicator for this rank.  ChipWorker owns ACL + stream "

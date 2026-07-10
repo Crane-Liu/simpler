@@ -84,9 +84,10 @@ def build_chip_callable(platform: str) -> ChipCallable:
     runtime = "tensormap_and_ringbuffer"
 
     # 1. Compile the AIV kernel source to a .o. ``pto_isa_root`` is the
-    # sibling header repo; ``ensure_pto_isa_root()`` clones/updates the
-    # managed checkout on first run (see docs/getting-started.md).
-    pto_isa_root = ensure_pto_isa_root()
+    # sibling header repo; ``ensure_pto_isa_root()`` clones it on first run
+    # (see docs/getting-started.md). Uses HTTPS clone by default; set
+    # PTO_ISA_ROOT to skip the clone and point at an existing checkout.
+    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     kernel_bytes = kc.compile_incore(
         source_path=os.path.join(HERE, "kernels/aiv/vector_add_kernel.cpp"),
@@ -155,9 +156,8 @@ def _run(worker: Worker, chip_handle: CallableHandle):
     # --- 4. Run. CallConfig() defaults are fine for this kernel. ---
     config = CallConfig()
     print("[vector_add] running on device...")
-    # run() returns None; per-stage timing is emitted as [STRACE] log markers
-    # (see docs/dfx/host-trace.md) — parse with simpler_setup.tools.strace_timing.
-    worker.run(chip_handle, args, config)
+    timing = worker.run(chip_handle, args, config)
+    print(f"[vector_add] {timing}")
 
     # --- 5. D2H copy back + verify ---
     worker.copy_from(host_out.data_ptr(), dev_out, NBYTES)
@@ -171,6 +171,7 @@ def _run(worker: Worker, chip_handle: CallableHandle):
     print(f"[vector_add] max |host_out - expected| = {max_diff:.3e}")
     assert torch.allclose(host_out, expected, rtol=1e-5, atol=1e-5)
     print("[vector_add] golden check PASSED")
+    return timing
 
 
 def run(platform: str, device_id: int) -> int:

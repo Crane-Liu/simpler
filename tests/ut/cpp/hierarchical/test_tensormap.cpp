@@ -13,11 +13,11 @@
 
 #include "tensormap.h"
 
-// Helper: host key (worker_id=-1)
-static TensorKey hk(uint64_t ptr) { return TensorKey::local_host(ptr); }
+// Helper: host key (worker=-1)
+static TensorKey hk(uint64_t ptr) { return {ptr, -1}; }
 
-// Helper: child key scoped by NEXT_LEVEL worker id.
-static TensorKey ck(uint64_t ptr, int32_t worker_id) { return TensorKey::local_child(ptr, worker_id); }
+// Helper: child key (worker=w)
+static TensorKey ck(uint64_t ptr, int8_t w) { return {ptr, w}; }
 
 TEST(TensorMap, LookupEmptyReturnsInvalid) {
     TensorMap tm;
@@ -72,7 +72,7 @@ TEST(TensorMap, MultipleEntries) {
 
 // --- TensorKey compound key tests ---
 
-TEST(TensorMap, SamePtrDifferentEndpointAreDistinct) {
+TEST(TensorMap, SamePtrDifferentWorkerAreDistinct) {
     TensorMap tm;
     tm.insert(ck(0xABC, 0), 10);
     tm.insert(ck(0xABC, 1), 20);
@@ -83,8 +83,8 @@ TEST(TensorMap, SamePtrDifferentEndpointAreDistinct) {
 
 TEST(TensorMap, HostAndChildKeyAreDistinct) {
     TensorMap tm;
-    tm.insert(hk(0x1000), 5);
-    tm.insert(ck(0x1000, 0), 6);
+    tm.insert(hk(0x1000), 5);     // host (worker=-1)
+    tm.insert(ck(0x1000, 0), 6);  // child worker 0
     EXPECT_EQ(tm.lookup(hk(0x1000)), 5);
     EXPECT_EQ(tm.lookup(ck(0x1000, 0)), 6);
     EXPECT_EQ(tm.size(), 2);

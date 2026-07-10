@@ -11,8 +11,8 @@ no repo checkout required.
 
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
-- **[strace_timing](#strace_timing)** — per-stage `simpler_run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
-- **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
+- **[device_log_timing](#device_log_timing)** — Total / Orch / Sched from a CANN device log (no swimlane JSON)
+- **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
 Auto-detection paths (`outputs/*/l2_swimlane_records.json`, `outputs/*/args_dump/`)
@@ -61,27 +61,6 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane
 > `--enable-l2-swimlane` runs that consume it. If no `deps.json` is found
 > alongside the perf JSON (and `--deps-json` isn't passed), the trace
 > still renders but has no arrows; the converter prints a warning.
-
-### SPMD dependency visualization
-
-For SPMD logical tasks (`block_num > 1` in `deps.json`), dependency
-arrows anchor on representative subtask rows on physical core lanes
-(not a dedicated block-level track). SPMD tasks use the minimum-`core_id`
-subtask row per `core_type` as the dependency anchor; MIX-type SPMD
-tasks pick the minimum separately for AIC and AIV. See
-[docs/dfx/l2-swimlane-profiling.md §3.5](../../docs/dfx/l2-swimlane-profiling.md#35-dependency-arrows-from-dep_gen).
-
-Each logical `(pred, succ)` edge emits flows for the Cartesian product
-of pred/succ anchor rows (`|pred_anchors| × |succ_anchors|`), not a
-per-subtask crossbar.
-
-SPMD lane labels append `_spmd` before `(rXtY)` unless the function
-name already contains `spmd` (case-insensitive), e.g.
-`v_proj_spmd(r2t10)` vs `SPMD_WRITE_AIV(t0)`.
-
-With `-v`, the converter prints
-`dependency arrows anchor on min core_id subtask per core_type` when
-SPMD tasks are present.
 
 ### Command-Line Options
 
@@ -177,8 +156,8 @@ python -m simpler_setup.tools.sched_overhead_analysis \
 ```
 
 > `deps.json` is topology-invariant — capture it once per graph and reuse it for
-> any number of swimlane runs. For Host / Device / Effective / Orch / Sched timing
-> from a plain run, use [`strace_timing --rounds-table`](#strace_timing) instead.
+> any number of swimlane runs. For Total / Orch / Sched timing from a plain run,
+> use [`device_log_timing`](#device_log_timing) instead.
 
 ### Command-Line Options
 
@@ -201,44 +180,51 @@ The perf JSON must be captured at l2_swimlane_level >= 3 so that `aicpu_schedule
 
 ---
 
-## strace_timing
+## device_log_timing
 
-Per-stage breakdown of every `simpler_run()` from `[STRACE]` host-trace
-markers in a log (host stderr or CANN device log). The runtime emits one
-`[STRACE]` line per span on scope exit (RAII, gated on `SIMPLER_PROFILING`,
-`LOG_INFO_V9`), including the AICPU device-phase subdivision (`clk=dev`). See
-[docs/dfx/host-trace.md](../../docs/dfx/host-trace.md) for the marker grammar.
+Print per-round **Total / Orch / Sched** timing parsed from a CANN device log's
+`PTO2_PROFILING` orch/sched markers. Unlike `sched_overhead_analysis` (which
+reads the swimlane JSON), this needs **no swimlane capture** — use it for a
+plain benchmark run, a `--rounds N` sweep, or an external workload that never
+produces an `l2_swimlane_records.json`.
+
+### Basic Usage
 
 ```bash
-# Per-callable TPOT table (decode = most-invoked hid bucket; prefill = once-seen)
-python -m simpler_setup.tools.strace_timing path/to/log
+# Explicit file or glob (quote the glob so the shell doesn't expand it; a glob
+# parses all matched rotated files)
+python -m simpler_setup.tools.device_log_timing \
+    --device-log '~/ascend/log/debug/device-0/device-*.log'
 
-# Per-round Host/Device/Orch/Sched table (the benchmark/--rounds N view)
-python -m simpler_setup.tools.strace_timing path/to/log --rounds-table
-
-# Indented nested span tree per callable (simpler_run → bind / runner_run →
-# device_wall → preamble/config_validate/arena_wire/sm_reset/orch/sched/post_orch)
-python -m simpler_setup.tools.strace_timing path/to/log --tree
-
-# Also emit a Chrome-trace / Perfetto JSON (one named lane per invocation, with
-# separate host and device(clk=dev) tracks; nested by span containment)
-python -m simpler_setup.tools.strace_timing path/to/log --trace-out strace.json
+# Auto-pick the newest log under device-<id>/
+python -m simpler_setup.tools.device_log_timing -d 0
 ```
 
-Groups spans by `(pid, inv)`, rebuilds each invocation's tree from `depth`,
-buckets by callable hash `hid`, and reports each callable's mean `simpler_run`
-plus per-stage means. It reads the host-emitted `[STRACE]` lines and shows the
-host stages (`bind`/`runner_run`/`validate`) alongside the AICPU phases.
+To get the same table emitted automatically by the test harness, pass
+`--enable-device-log-timing` to `scene_test` / pytest (onboard L2 only; works
+with `--rounds N`). See [docs/dfx/l2-timing.md](../../docs/dfx/l2-timing.md) for
+the full guide, including the `RunTiming` host_wall / device_wall numbers and
+how they relate to Orch / Sched / Total.
 
-`--rounds-table` renders one row per invocation of the busiest `hid` —
-**Host** always, plus **Device / Effective / Orch / Sched** when present, in the
-format `tools/benchmark_rounds.sh` parses. `Effective` is the orch∪sched merged
-window (`max(orch_end,sched_end) − min(orch_start,sched_start)`, the old
-device-log "Total"), recomputed from the orch/sched markers' `ts`+`dur` — no
-device log needed. The scene test only *emits* the markers to stderr; tee a run
-to a file (`python test_*.py … --rounds N > run.log 2>&1`) and pass `run.log`
-here. Because grouping is per `(pid, inv)`, this captures **L3 multi-round**
-(every chip-child invocation), not just round 0.
+### Command-Line Options
+
+| Option | Description |
+| ------ | ----------- |
+| `--device-log` | Path / dir / glob of a CANN device log. A glob parses every matched (rotated) file. |
+| `-d`, `--device-id` | Device id: auto-pick the newest log under `device-<id>/`. |
+
+### CANN device-log environment variables
+
+| Env var | Effect |
+| ------- | ------ |
+| `ASCEND_PROCESS_LOG_PATH` | Relocates the log root to `$ASCEND_PROCESS_LOG_PATH/debug` (highest precedence, above `ASCEND_WORK_PATH/log/debug` and the `<euid-home>/ascend/log/debug` default). Resolved automatically. |
+| `ASCEND_SLOG_PRINT_TO_STDOUT=1` | Routes CANN logs to stdout — **no device log file is written**; the CLI errors out and the harness flag skips. Unset it (or set `0`) to capture device timing. |
+| `ASCEND_HOST_LOG_FILE_NUM` | Rotated files retained per process (default 10). Each file caps at 20 MB; a long run can rotate mid-run, so the harness reads **all** files written after the run started, and a `--device-log` glob parses all matches. |
+
+The default root (no relocation env var) is `<euid-home>/ascend/log/debug`,
+using the effective uid's passwd home (e.g. `/root` under sudo / `task-submit`),
+which is where the driver actually writes device logs — not `$HOME`, which sudo
+often leaves pointing at the invoking user.
 
 ---
 
@@ -340,7 +326,7 @@ at view time.
 ## dump_viewer
 
 Inspect and export args captured by the runtime args-dump feature.
-See [docs/args-dump.md](../../docs/dfx/args-dump.md) for the full capture workflow;
+See [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for the full capture workflow;
 this section only documents CLI invocation.
 
 ### Basic Usage

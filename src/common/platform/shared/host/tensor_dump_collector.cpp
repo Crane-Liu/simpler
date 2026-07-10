@@ -186,6 +186,7 @@ void TensorDumpCollector::start_writer_thread_once() {
     bytes_written_.store(0);
     run_start_time_ = std::chrono::steady_clock::now();
     last_progress_time_ = run_start_time_;
+    buffers_collected_ = 0;
 
     writer_thread_ = std::thread(&TensorDumpCollector::writer_loop, this);
 }
@@ -223,21 +224,6 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
 
         DumpedTensor dt;
         dt.task_id = rec.task_id;
-        // rec is read from device shared memory (untrusted): clamp func_count so a
-        // corrupt oversized value can't drive an out-of-bounds read of the
-        // fixed-size dt.func_ids[] when the record is serialized later.
-        uint8_t func_count = rec.func_count;
-        if (func_count > TENSOR_DUMP_MAX_FUNC_IDS) {
-            LOG_WARN(
-                "Dump collector: func_count %u exceeds max %d (corrupt record?), clamping", func_count,
-                TENSOR_DUMP_MAX_FUNC_IDS
-            );
-            func_count = TENSOR_DUMP_MAX_FUNC_IDS;
-        }
-        dt.func_count = func_count;
-        for (uint8_t f = 0; f < func_count; f++) {
-            dt.func_ids[f] = (rec.func_ids[f] == 0xFFFF) ? -1 : static_cast<int32_t>(rec.func_ids[f]);
-        }
         dt.arg_index = rec.arg_index;
         dt.role = static_cast<TensorDumpRole>(rec.role);
         dt.stage = static_cast<TensorDumpStage>(rec.stage);
@@ -319,9 +305,9 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
 }
 
 void TensorDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info) {
-    std::scoped_lock<std::mutex> lock(collector_state_mutex_);
     start_writer_thread_once();
     process_dump_buffer(info);
+    buffers_collected_++;
 
     auto now = std::chrono::steady_clock::now();
     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_time_).count() >= 5) {
@@ -637,12 +623,6 @@ int TensorDumpCollector::export_dump_files() {
 
         json << "    {\"task_id\": \"0x" << std::hex << std::setfill('0') << std::setw(16) << dt.task_id << std::dec
              << "\"";
-        json << ", \"func_id\": [";
-        for (int32_t f = 0; f < dt.func_count; f++) {
-            if (f) json << ", ";
-            json << dt.func_ids[f];
-        }
-        json << "]";
         json << ", \"arg_index\": " << dt.arg_index << ", \"role\": \"" << tensor_dump_role_name(dt.role)
              << "\", \"stage\": \"" << tensor_dump_stage_name(dt.stage) << "\", \"kind\": \""
              << tensor_dump_kind_name(dt.kind) << "\", \"dtype\": \"" << dtype_name << "\"";

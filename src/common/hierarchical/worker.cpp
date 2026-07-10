@@ -74,31 +74,22 @@ void Worker::add_worker(WorkerType type, void *mailbox) {
     else manager_.add_sub(mailbox);
 }
 
-void Worker::add_next_level_worker(int32_t worker_id, void *mailbox) {
-    if (initialized_) throw std::runtime_error("Worker: add_next_level_worker after init");
-    manager_.add_next_level_at(worker_id, mailbox);
-}
-
 void Worker::add_remote_l3_socket(
-    int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &host, uint16_t port,
+    int32_t endpoint_id, uint64_t session_id, const std::string &transport_name, const std::string &host, uint16_t port,
     const std::string &health_host, uint16_t health_port, double timeout_s
 ) {
     if (initialized_) throw std::runtime_error("Worker: add_remote_l3_socket after init");
     auto transport = std::make_unique<RemoteL3SocketTransport>(host, port, health_host, health_port, timeout_s);
-    transport->expect_hello_ready(session_id, worker_id, transport_name);
+    transport->expect_hello_ready(session_id, endpoint_id, transport_name);
     manager_.add_next_level_endpoint(
-        std::make_unique<RemoteL3Endpoint>(worker_id, session_id, transport_name, std::move(transport))
+        std::make_unique<RemoteL3Endpoint>(endpoint_id, session_id, transport_name, std::move(transport))
     );
 }
 
 void Worker::init() {
     if (initialized_) throw std::runtime_error("Worker: already initialized");
 
-    orchestrator_.init(
-        &tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_, &manager_, [this] {
-            scheduler_.notify_ready();
-        }
-    );
+    orchestrator_.init(&tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_, &manager_);
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().

@@ -32,10 +32,8 @@
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
-#include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "callable_protocol.h"
-#include "call_config.h"
 #include "chip_callable_layout.h"
 #include "utils/elf_build_id.h"
 #include "host/host_regs.h"  // Register address retrieval
@@ -185,12 +183,7 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
-int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
-    // Latch this run's diagnostic enables onto the runner before the collector
-    // paths below read them; block_dim/aicpu_thread_num are consumed locally.
-    apply_call_config(config);
-    int block_dim = config.block_dim;
-    const int launch_aicpu_num = config.aicpu_thread_num;
+int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // A prior AICore launch/sync error poisoned the device context and the
     // in-place drain could not clear it. Refuse to run rather than cascade into
     // rtMalloc 507899 / halResMap rc=62 (init_aicore_register_addresses). A soft
@@ -270,53 +263,6 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
 
     if (prepare_runtime_for_launch(runtime, block_dim, launch_aicpu_num) != 0) return -1;
 
-    // a2a3 onboard now uses the same host-computed, device-filtered affinity
-    // shape as a5. Host probes the AICPU user pool once, chooses the active
-    // cpu_ids deterministically, writes them into Runtime, and the AICPU-side
-    // gate only matches sched_getcpu() against this table.
-    {
-        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
-        std::vector<int32_t> allowed;
-        runtime.set_aicpu_allowed_cpu_count(0);
-        runtime.set_aicpu_launch_count(0);
-        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
-            LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
-            return -1;
-        }
-        if (!pto::a2a3::compute_allowed_cpus(user_cpus, runtime.get_aicpu_thread_num(), allowed)) {
-            LOG_ERROR(
-                "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(),
-                runtime.get_aicpu_thread_num()
-            );
-            return -1;
-        }
-        const size_t cap = runtime.aicpu_allowed_cpus_capacity();
-        if (allowed.size() > cap) {
-            LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
-            return -1;
-        }
-        int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
-        for (size_t i = 0; i < allowed.size(); ++i)
-            allowed_cpus[i] = allowed[i];
-        runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
-        int32_t launch_n = static_cast<int32_t>(user_cpus.size());
-        if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
-            launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-        }
-        runtime.set_aicpu_launch_count(launch_n);
-
-        std::string dump;
-        for (size_t i = 0; i < allowed.size(); ++i) {
-            if (i) dump += ", ";
-            dump += std::to_string(allowed[i]);
-            if (i + 1 == allowed.size()) dump += "(last)";
-        }
-        LOG_INFO_V0(
-            "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
-            runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
-        );
-    }
-
     auto runtime_args_cleanup = RAIIScopeGuard([this]() {
         kernel_args_.finalize_device_kernel_args();
         kernel_args_.finalize_runtime_args();
@@ -324,7 +270,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
 
     // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_swimlane(num_aicore, runtime.get_aicpu_thread_num(), device_id_);
+        rc = init_l2_swimlane(num_aicore, runtime.aicpu_thread_num, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
@@ -417,7 +363,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     if (enable_l2_swimlane_ && l2_swimlane_collector_.is_initialized()) {
         std::vector<CoreType> core_types(num_aicore);
         for (int i = 0; i < num_aicore; i++) {
-            core_types[i] = runtime.get_workers()[i].core_type;
+            core_types[i] = runtime.workers[i].core_type;
         }
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
@@ -442,8 +388,9 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
-    int aicpu_launch_n = (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, aicpu_launch_n);
+    rc = launch_aicpu_kernel(
+        stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
+    );
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
         // The AICore worker was already launched above and is now spinning in
@@ -501,7 +448,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
 }
 
 // `print_handshake_results`, `prepare_orch_so`, `register_callable`,
-// `record_host_orch_callable`, `unregister_callable`, `has_callable`,
+// `register_callable_host_orch`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
 
@@ -525,7 +472,7 @@ void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
     // force reset (a soft reset/drain does not), so always mark the runner
     // unusable here: run() fails fast and finalize() force-resets the card, so
     // the next Worker.init lands clean regardless of what the drain reported.
-    int sync_rc = aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
+    int sync_rc = aclrtSynchronizeDeviceWithTimeout(PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (sync_rc != ACL_SUCCESS) {
         LOG_ERROR(
             "AICore error %d: bounded device drain failed: %d (force reset will follow in finalize)", aicore_rc, sync_rc
@@ -630,7 +577,7 @@ int DeviceRunner::force_reset_device() {
             LOG_ERROR("force_reset_device: could not bind device %d; reset skipped", device_id_);
             return -1;
         }
-        (void)aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
+        (void)aclrtSynchronizeDeviceWithTimeout(PLATFORM_STREAM_SYNC_TIMEOUT_MS);
         aclError rc = aclrtResetDeviceForce(device_id_);
         if (rc != ACL_SUCCESS) {
             LOG_ERROR("force_reset_device: aclrtResetDeviceForce(%d) failed: %d", device_id_, static_cast<int>(rc));
@@ -837,7 +784,7 @@ int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int dev
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
-    int num_dump_threads = runtime.get_aicpu_thread_num();
+    int num_dump_threads = runtime.aicpu_thread_num;
 
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);

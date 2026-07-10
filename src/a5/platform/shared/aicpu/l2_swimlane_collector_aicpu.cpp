@@ -69,7 +69,8 @@ static L2SwimlaneAicpuTaskBuffer *s_current_aicpu_task_buffers[PLATFORM_MAX_CORE
 static L2SwimlaneAicpuSchedPhasePool *s_sched_phase_pools[PLATFORM_MAX_AICPU_THREADS] = {};
 static L2SwimlaneAicpuSchedPhaseBuffer *s_current_sched_phase_buffers[PLATFORM_MAX_AICPU_THREADS] = {};
 
-// Per-thread orch-phase pool/buffer caches (one orch thread).
+// Per-thread orch-phase pool/buffer caches (typically one orch thread; in
+// orch_to_sched mode all aicpu threads can write here).
 static L2SwimlaneAicpuOrchPhasePool *s_orch_phase_pools[PLATFORM_MAX_AICPU_THREADS] = {};
 static L2SwimlaneAicpuOrchPhaseBuffer *s_current_orch_phase_buffers[PLATFORM_MAX_AICPU_THREADS] = {};
 
@@ -107,54 +108,6 @@ extern "C" uint64_t get_platform_l2_swimlane_aicore_rotation_table() {
 }
 L2SwimlaneLevel get_l2_swimlane_level() { return g_l2_swimlane_level; }
 
-static constexpr uint64_t kL2SwimlaneQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
-
-static bool
-wait_for_ready_queue_space(L2SwimlaneDataHeader *header, int thread_idx, uint32_t *tail_out, uint32_t *head_out) {
-    if (header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
-        return false;
-    }
-    const uint32_t capacity = PLATFORM_PROF_READYQUEUE_SIZE;
-    const uint64_t start = get_sys_cnt_aicpu();
-
-    do {
-        uint32_t current_tail = header->queue_tails[thread_idx];
-        uint32_t current_head = header->queue_heads[thread_idx];
-        uint32_t next_tail = (current_tail + 1) % capacity;
-        if (next_tail != current_head) {
-            *tail_out = current_tail;
-            *head_out = current_head;
-            return true;
-        }
-        if (get_sys_cnt_aicpu() - start >= kL2SwimlaneQueueBackpressureWaitCycles) {
-            break;
-        }
-    } while (true);
-    return false;
-}
-
-static bool wait_for_free_queue_entry(L2SwimlaneFreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
-    if (free_queue == nullptr) {
-        return false;
-    }
-    const uint64_t start = get_sys_cnt_aicpu();
-
-    do {
-        uint32_t head = free_queue->head;
-        uint32_t tail = free_queue->tail;
-        if (head != tail) {
-            *head_out = head;
-            *tail_out = tail;
-            rmb();  // acquire: order the tail read above before the caller's buffer_ptrs read
-            return true;
-        }
-        if (get_sys_cnt_aicpu() - start >= kL2SwimlaneQueueBackpressureWaitCycles) {
-            break;
-        }
-    } while (true);
-    return false;
-}
-
 /**
  * Enqueue ready buffer to per-thread queue
  *
@@ -171,48 +124,22 @@ static int enqueue_ready_buffer(
     L2SwimlaneBufferKind kind
 ) {
     uint32_t capacity = PLATFORM_PROF_READYQUEUE_SIZE;
-    uint32_t current_tail = 0;
-    uint32_t current_head = 0;
+    uint32_t current_tail = header->queue_tails[thread_idx];
+    uint32_t current_head = header->queue_heads[thread_idx];
 
-    if (!wait_for_ready_queue_space(header, thread_idx, &current_tail, &current_head)) {
+    // Check if queue is full
+    uint32_t next_tail = (current_tail + 1) % capacity;
+    if (next_tail == current_head) {
         return -1;
     }
-    uint32_t next_tail = (current_tail + 1) % capacity;
 
     header->queues[thread_idx][current_tail].core_index = core_index;
     header->queues[thread_idx][current_tail].kind = kind;
     header->queues[thread_idx][current_tail].buffer_ptr = buffer_ptr;
     header->queues[thread_idx][current_tail].buffer_seq = buffer_seq;
-    wmb();  // publish: entry fields visible before the tail advance
     header->queue_tails[thread_idx] = next_tail;
 
     return 0;
-}
-
-static L2SwimlaneAicpuTaskBuffer *
-try_pop_records_buffer(int core_id, L2SwimlaneAicpuTaskPool *state, uint32_t next_seq) {
-    uint32_t head = 0;
-    uint32_t tail = 0;
-    if (!wait_for_free_queue_entry(&state->free_queue, &head, &tail)) {
-        return nullptr;
-    }
-
-    uint64_t new_buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
-    rmb();
-    state->free_queue.head = head + 1;
-    if (new_buf_ptr == 0) {
-        return nullptr;
-    }
-
-    auto *new_buf = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(new_buf_ptr);
-    new_buf->count = 0;
-    wmb();
-
-    state->head.current_buf_ptr = new_buf_ptr;
-    state->head.current_buf_seq = next_seq;
-    s_current_aicpu_task_buffers[core_id] = new_buf;
-    wmb();
-    return new_buf;
 }
 
 void l2_swimlane_aicpu_init(int worker_count) {
@@ -353,34 +280,47 @@ static void switch_records_buffer(int core_id, int thread_idx) {
 
     LOG_INFO_V0("Thread %d: Core %d buffer is full (count=%u)", thread_idx, core_id, full_buf->count);
 
-    uint32_t seq = state->head.current_buf_seq;
-    uint64_t full_buf_ptr = state->head.current_buf_ptr;
-    int rc = enqueue_ready_buffer(
-        s_l2_swimlane_header, thread_idx, core_id, full_buf_ptr, seq, L2SwimlaneBufferKind::AicpuTask
-    );
-    if (rc != 0) {
-        LOG_ERROR("Thread %d: Core %d failed to enqueue buffer (queue full), data lost!", thread_idx, core_id);
+    // Check free_queue before committing the full buffer
+    rmb();
+    uint32_t head = state->free_queue.head;
+    uint32_t tail = state->free_queue.tail;
+
+    if (head == tail) {
+        // No replacement buffer available — overwrite current buffer to keep AICore alive
+        LOG_WARN("Thread %d: Core %d no free buffer, overwriting current buffer (data lost)", thread_idx, core_id);
         state->head.dropped_record_count = state->head.dropped_record_count + full_buf->count;
         full_buf->count = 0;
         wmb();
         return;
     }
 
-    uint32_t next_seq = seq + 1;
-    state->head.current_buf_ptr = 0;
-    state->head.current_buf_seq = next_seq;
-    s_current_aicpu_task_buffers[core_id] = nullptr;
-    wmb();
-
-    L2SwimlaneAicpuTaskBuffer *new_buf = try_pop_records_buffer(core_id, state, next_seq);
-    if (new_buf == nullptr) {
+    // Enqueue full buffer to ReadyQueue
+    uint32_t seq = state->head.current_buf_seq;
+    int rc = enqueue_ready_buffer(
+        s_l2_swimlane_header, thread_idx, core_id, state->head.current_buf_ptr, seq, L2SwimlaneBufferKind::AicpuTask
+    );
+    if (rc != 0) {
+        LOG_ERROR("Thread %d: Core %d failed to enqueue buffer (queue full), data lost!", thread_idx, core_id);
+        // Revert: discard data and keep writing
+        state->head.dropped_record_count = state->head.dropped_record_count + full_buf->count;
+        full_buf->count = 0;
+        wmb();
         return;
     }
 
-    LOG_INFO_V0(
-        "Thread %d: Core %d switched to new buffer (addr=0x%lx)", thread_idx, core_id,
-        reinterpret_cast<uint64_t>(new_buf)
-    );
+    // Pop next buffer from free_queue
+    uint64_t new_buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
+    rmb();
+    state->free_queue.head = head + 1;
+    state->head.current_buf_ptr = new_buf_ptr;
+    state->head.current_buf_seq = seq + 1;
+    wmb();
+
+    L2SwimlaneAicpuTaskBuffer *new_buf = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(new_buf_ptr);
+    new_buf->count = 0;
+    s_current_aicpu_task_buffers[core_id] = new_buf;
+
+    LOG_INFO_V0("Thread %d: Core %d switched to new buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
 }
 
 // Try to rotate the AICore buffer for `core_id`. Called from the completion
@@ -398,9 +338,10 @@ static void aicore_rotate(int core_id, int thread_idx) {
     uint64_t old_buf_ptr = ac_state->head.current_buf_ptr;
     uint32_t seq = ac_state->head.current_buf_seq;
 
-    uint32_t head = 0;
-    uint32_t tail = 0;
-    if (!wait_for_free_queue_entry(&ac_state->free_queue, &head, &tail)) {
+    rmb();
+    uint32_t head = ac_state->free_queue.head;
+    uint32_t tail = ac_state->free_queue.tail;
+    if (head == tail) {
         // No replacement available — AICore continues to write into the old
         // buffer; its slot counter will hit BUFFER_SIZE and the slot guard
         // silently drops further records. We deliberately do NOT bump
@@ -416,16 +357,6 @@ static void aicore_rotate(int core_id, int thread_idx) {
         // the failure mode.
         LOG_WARN(
             "Thread %d: Core %d AICore free_queue empty at rotation; AICore slot guard will drop overflow records",
-            thread_idx, core_id
-        );
-        return;
-    }
-
-    uint64_t new_buf_ptr = ac_state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
-    rmb();
-    if (new_buf_ptr == 0) {
-        LOG_WARN(
-            "Thread %d: Core %d AICore free_queue returned a null buffer at rotation; keeping old buffer active",
             thread_idx, core_id
         );
         return;
@@ -462,6 +393,8 @@ static void aicore_rotate(int core_id, int thread_idx) {
     // detect rotation, then reads head.current_buf_ptr. Write ptr first so
     // AICore can never see a new seq with a stale ptr. new_buf->count=0 must
     // also be visible before AICore's slot writes begin.
+    uint64_t new_buf_ptr = ac_state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
+    rmb();
     ac_state->free_queue.head = head + 1;
     L2SwimlaneAicoreTaskBuffer *new_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(new_buf_ptr);
     new_buf->count = 0;
@@ -528,14 +461,10 @@ int l2_swimlane_aicpu_complete_task(
 
     L2SwimlaneAicpuTaskBuffer *l2_swimlane_buf = s_current_aicpu_task_buffers[core_id];
     if (l2_swimlane_buf == nullptr) {
-        l2_swimlane_buf = try_pop_records_buffer(core_id, state, state->head.current_buf_seq);
-        if (l2_swimlane_buf == nullptr) {
-            // No active records buffer (init ran out of free buffers or host has
-            // not refilled after the last published full buffer); count as drop
-            // so host reconciliation stays consistent.
-            state->head.dropped_record_count += 1;
-            return -1;
-        }
+        // No active records buffer (init ran out of free buffers); count as drop
+        // so host reconciliation stays consistent.
+        state->head.dropped_record_count += 1;
+        return -1;
     }
     uint32_t count = l2_swimlane_buf->count;
     if (count >= PLATFORM_PROF_BUFFER_SIZE) {
@@ -792,22 +721,19 @@ static void switch_phase_buffer_kind(
         );
         state->head.dropped_record_count += full_buf->count;
         full_buf->count = 0;
+        *current_buf_out = nullptr;
+        state->head.current_buf_ptr = 0;
         wmb();
         return;
     }
 
-    uint32_t head = 0;
-    uint32_t tail = 0;
-    if (wait_for_free_queue_entry(&state->free_queue, &head, &tail)) {
+    rmb();
+    uint32_t head = state->free_queue.head;
+    uint32_t tail = state->free_queue.tail;
+    if (head != tail) {
         uint64_t new_buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
         rmb();
         state->free_queue.head = head + 1;
-        if (new_buf_ptr == 0) {
-            *current_buf_out = nullptr;
-            state->head.current_buf_ptr = 0;
-            wmb();
-            return;
-        }
         state->head.current_buf_ptr = new_buf_ptr;
         state->head.current_buf_seq = seq + 1;
         wmb();
@@ -838,15 +764,13 @@ static Record *acquire_phase_slot(
 ) {
     Buffer *buf = *current_buf_out;
     if (buf == nullptr) {
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        if (wait_for_free_queue_entry(&state->free_queue, &head, &tail)) {
+        rmb();
+        uint32_t head = state->free_queue.head;
+        uint32_t tail = state->free_queue.tail;
+        if (head != tail) {
             uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
             rmb();
             state->free_queue.head = head + 1;
-            if (buf_ptr == 0) {
-                return nullptr;
-            }
             state->head.current_buf_ptr = buf_ptr;
             state->head.current_buf_seq += 1;
             wmb();
@@ -873,8 +797,8 @@ static Record *acquire_phase_slot(
 
 void l2_swimlane_aicpu_record_sched_phase(
     int thread_idx, L2SwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint32_t tasks_processed, uint32_t pop_hit, uint32_t pop_miss, const int16_t *shared_at_start,
-    const int16_t *shared_at_end
+    uint32_t tasks_processed, uint32_t pop_hit, uint32_t pop_miss, const int16_t *local_at_start,
+    const int16_t *shared_at_start, const int16_t *local_at_end, const int16_t *shared_at_end
 ) {
     if (!s_phase_initialized) return;
     auto *state = s_sched_phase_pools[thread_idx];
@@ -906,7 +830,9 @@ void l2_swimlane_aicpu_record_sched_phase(
                 dst[i] = src[i];
         }
     };
+    copy_snapshot(record->local_depth_at_start, local_at_start);
     copy_snapshot(record->shared_depth_at_start, shared_at_start);
+    copy_snapshot(record->local_depth_at_end, local_at_end);
     copy_snapshot(record->shared_depth_at_end, shared_at_end);
 }
 

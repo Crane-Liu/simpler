@@ -1134,8 +1134,24 @@ int AicpuExecutor::run(Runtime *runtime) {
     return 0;
 }
 
-void AicpuExecutor::deinit(Runtime * /*runtime*/) {
+void AicpuExecutor::deinit(Runtime *runtime) {
     // === Exit cleanup: reset all inter-round state ===
+
+    // 1. Invalidate AICPU cache for Runtime address range.
+    //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
+    //    bypasses this cache. Invalidating now ensures next round reads from HBM.
+    cache_invalidate_range(runtime, sizeof(Runtime));
+    if (runtime->get_tensor_info_storage() != nullptr && runtime->get_tensor_info_storage_bytes() > 0) {
+        cache_invalidate_range(
+            runtime->get_tensor_info_storage(), static_cast<size_t>(runtime->get_tensor_info_storage_bytes())
+        );
+    }
+    if (runtime->get_tensor_allocation_storage() != nullptr && runtime->get_tensor_allocation_storage_bytes() > 0) {
+        cache_invalidate_range(
+            runtime->get_tensor_allocation_storage(),
+            static_cast<size_t>(runtime->get_tensor_allocation_storage_bytes())
+        );
+    }
 
     // === Existing reset logic ===
     ready_count_aic_.store(0, std::memory_order_release);
@@ -1285,11 +1301,6 @@ void AicpuExecutor::diagnose_stuck_state(
 }
 
 // ===== Public Entry Point =====
-
-// host_build_graph resolves orchestration on the host during prepare, so it has
-// no device-side registration: it deliberately does NOT export
-// simpler_aicpu_register_callable (only the TMARB runtime does). The host's
-// register launch is gated on the device-orch path and never targets hbg.
 
 /**
  * aicpu_execute - Main AICPU kernel execution entry point

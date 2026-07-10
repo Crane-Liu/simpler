@@ -41,22 +41,17 @@
 #include "prepare_callable_common.h"
 #include "utils/device_arena.h"
 #include "common/kernel_args.h"
-#include "common/device_phase.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/memory_allocator.h"
-#include "host/l3_l2_orch_comm_service.h"
 #include "host/l2_swimlane_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
 #include "runtime.h"
 
-struct HostApi;     // common/host_api.h — fwd-declared to keep task_interface headers out
-struct CallConfig;  // task_interface/call_config.h — per-run config threaded into run()
-
-class SimDeviceRunnerBase : public L3L2OrchCommBackend {
+class SimDeviceRunnerBase {
 public:
     SimDeviceRunnerBase() :
         gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
@@ -65,10 +60,10 @@ public:
 
     // Public virtual dtor so c_api_shared can `delete` a SimDeviceRunnerBase *
     // (destroy_device_context entrypoint).
-    ~SimDeviceRunnerBase() override = default;
+    virtual ~SimDeviceRunnerBase() = default;
 
     // --- Pure / no-op virtuals dispatched from the shared c_api glue ----
-    virtual int run(Runtime &runtime, const CallConfig &config) = 0;
+    virtual int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) = 0;
     virtual int finalize() = 0;
     // a2a3 and a5 both override; an arch without dep_gen leaves the no-op.
     virtual void set_dep_gen_enabled(bool /*enable*/) {}
@@ -80,14 +75,6 @@ public:
     void *acquire_pooled_gm_heap();
     void *acquire_pooled_gm_sm();
     void *acquire_pooled_runtime_arena();
-    bool lookup_prebuilt_runtime_arena_cache(
-        uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
-        void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
-    ) const;
-    void mark_prebuilt_runtime_arena_cached(
-        uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
-        void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
-    );
 
     std::thread create_thread(std::function<void()> fn);
     int attach_current_thread(int device_id);
@@ -97,35 +84,19 @@ public:
     int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
     int device_memset(void *dev_ptr, int value, size_t bytes);
-    void get_retained_temp_buffer(void **addr, size_t *size);
-    void set_retained_temp_buffer(void *addr, size_t size);
-    void clear_temporary_buffer();
 
-    int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
-    int l3_l2_orch_comm_shutdown();
-
-    int record_device_orch_callable(
+    int register_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
         const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
-    int record_host_orch_callable(
+    int register_callable_host_orch(
         int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
     int unregister_callable(int32_t callable_id);
     bool has_callable(int32_t callable_id) const;
-    // One-step bind: replay CallableState (kernel addrs + active_callable_id)
-    // then run the per-run bind_callable_to_runtime_impl with the state's
-    // host_orch_func_ptr + signature. `api` is g_host_api; `orch_args` is a
-    // const ChipStorageTaskArgs* (void* keeps task_interface headers out of this
-    // header). Returns 0 on success, non-zero on failure.
-    int bind_callable_to_runtime(
-        Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args,
-        const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
-    );
+    BindCallableResult bind_callable_to_runtime(Runtime &runtime, int32_t callable_id);
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
-    int launch_device_register(int32_t callable_id);
-    int commit_device_register(int32_t callable_id);
 
     void print_handshake_results();
 
@@ -135,16 +106,6 @@ public:
     }
     int device_id() const { return device_id_; }
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
-    // Per-phase AICPU wall (ns) from the most recent run; RunWall aliases
-    // last_device_wall_ns(). 0 for a phase that was never stamped. Used to emit
-    // device-phase trace markers from the sim c_api, mirroring onboard.
-    uint64_t last_device_phase_ns(AicpuPhase phase) const { return device_phase_ns_[static_cast<int>(phase)]; }
-    // Per-phase start offset (ns) on a common device-clock timeline (origin =
-    // earliest sub-phase start), so device spans carry a device-domain `ts` and
-    // the orch∪sched "Effective" window is computable. 0 for RunWall / unstamped.
-    uint64_t last_device_phase_start_ns(AicpuPhase phase) const {
-        return device_phase_start_ns_[static_cast<int>(phase)];
-    }
 
     void set_l2_swimlane_enabled(int level) {
         l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
@@ -164,12 +125,6 @@ public:
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
     const std::string &output_prefix() const { return output_prefix_; }
 
-    // Latch this run's per-run diagnostic config onto the runner's enable_*_
-    // members before run() uses them. Each arch's run() calls this at entry; the
-    // c_api threads the CallConfig through instead of calling set_*_enabled.
-    // Defined in the .cpp so this header does not need the full CallConfig.
-    void apply_call_config(const CallConfig &config);
-
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
@@ -177,12 +132,7 @@ protected:
     // --- Helpers usable by subclass run() / finalize() -------------------
     int ensure_device_initialized();
     virtual int ensure_binaries_loaded() = 0;
-    // Hand the orch-SO descriptor to the sim AICPU register entry. Built
-    // directly from CallableState by launch_device_register — no Runtime
-    // round-trip.
-    virtual int invoke_device_register(const RegisterCallableArgs &reg_args) = 0;
     int prepare_orch_so(Runtime &runtime);
-    int stamp_orch_so(Runtime &runtime, int32_t callable_id);
 
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.
@@ -205,8 +155,6 @@ protected:
     std::vector<uint8_t> aicore_kernel_binary_;
 
     MemoryAllocator mem_alloc_;
-    void *retained_temp_addr_ = nullptr;
-    size_t retained_temp_size_ = 0;
 
     // Three independent per-Worker arenas, each backing a single pooled
     // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime
@@ -228,14 +176,6 @@ protected:
     size_t cached_gm_heap_size_{0};
     size_t cached_gm_sm_size_{0};
     size_t cached_runtime_arena_size_{0};
-    bool prebuilt_runtime_arena_cache_valid_{false};
-    uint64_t prebuilt_runtime_arena_cache_hash_{0};
-    std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;
-    void *prebuilt_runtime_arena_cache_gm_heap_base_{nullptr};
-    void *prebuilt_runtime_arena_cache_sm_base_{nullptr};
-    void *prebuilt_runtime_arena_cache_runtime_arena_base_{nullptr};
-    size_t prebuilt_runtime_arena_cache_runtime_off_{0};
-    std::vector<uint8_t> prebuilt_runtime_arena_cache_image_;
 
     // Simulation state — written by run() / init_* and read by the AICPU /
     // AICore execute functions via the platform-regs setter functions.
@@ -248,10 +188,6 @@ protected:
     // last_device_wall_ns(). Allocated lazily in run(), freed in finalize().
     void *device_wall_dev_ptr_{nullptr};
     uint64_t device_wall_ns_{0};
-    uint64_t device_phase_ns_[NUM_AICPU_PHASES] = {0};
-    // Per-phase start offset (ns) from the earliest sub-phase start; see
-    // last_device_phase_start_ns().
-    uint64_t device_phase_start_ns_[NUM_AICPU_PHASES] = {0};
 
     // Chip-callable buffer pool (sim path). Keyed by FNV-1a 64-bit content
     // hash. Each entry owns a host scratch holding the ChipCallable with each
@@ -321,17 +257,6 @@ protected:
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                   // diagnostic artifact root directory
-
-private:
-    void *l3_l2_allocate_region_bytes(uint64_t bytes) override;
-    void l3_l2_free_region_bytes(void *ptr) override;
-    int l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) override;
-    int l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) override;
-    std::thread l3_l2_create_service_thread(std::function<void()> fn) override;
-
-    L3L2OrchCommService l3_l2_orch_comm_service_;
-    std::mutex l3_l2_alloc_mu_;
-    std::unordered_set<void *> l3_l2_allocations_;
 };
 
 namespace simpler::common::sim_host {

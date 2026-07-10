@@ -36,9 +36,19 @@ uint64_t PTO2SharedMemoryHandle::calculate_size(uint64_t task_window_size) {
 }
 
 uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
-    // Total SM size = offset just past the last ring, from the single source of
-    // truth for the layout (pto2_sm_layout::ring_segment_offsets).
-    return pto2_sm_layout::ring_segment_offsets(task_window_sizes, PTO2_MAX_RING_DEPTH - 1).end;
+    uint64_t size = 0;
+
+    // Header (aligned to cache line)
+    size += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
+
+    // Per-ring task descriptors and payloads
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+    }
+
+    return size;
 }
 
 // =============================================================================
@@ -46,18 +56,23 @@ uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(const uint64_t task_win
 // =============================================================================
 
 void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
-    char *base = (char *)sm_base;
-    header = (PTO2SharedMemoryHeader *)base;
+    char *ptr = (char *)sm_base;
 
-    // Per-ring descriptors / payloads / slot_states — offsets from the single
-    // source of truth (pto2_sm_layout::ring_segment_offsets), so this setup and
-    // the device-address helpers cannot drift.
+    // Header
+    header = (PTO2SharedMemoryHeader *)ptr;
+    ptr += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
+
+    // Per-ring task descriptors, payloads, and slot states
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        auto off = pto2_sm_layout::ring_segment_offsets(task_window_sizes, r);
         auto &ring = header->rings[r];
-        ring.task_descriptors = (PTO2TaskDescriptor *)(base + off.descriptors);
-        ring.task_payloads = (PTO2TaskPayload *)(base + off.payloads);
-        ring.slot_states = (PTO2TaskSlotState *)(base + off.slot_states);
+        ring.task_descriptors = (PTO2TaskDescriptor *)ptr;
+        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+
+        ring.task_payloads = (PTO2TaskPayload *)ptr;
+        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+
+        ring.slot_states = (PTO2TaskSlotState *)ptr;
+        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     }
 }
 
@@ -165,20 +180,23 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     header->sched_error_bitmap.store(0, std::memory_order_relaxed);
     header->sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);
     header->sched_error_thread.store(-1, std::memory_order_relaxed);
-    header->sched_stall_detail.store(PTO2_STALL_DETAIL_NONE, std::memory_order_relaxed);
-    header->sched_stall_completed.store(0, std::memory_order_relaxed);
-    header->sched_stall_total.store(0, std::memory_order_relaxed);
-    header->sched_stall_cnt_running.store(0, std::memory_order_relaxed);
-    header->sched_stall_cnt_ready.store(0, std::memory_order_relaxed);
-    header->sched_stall_cnt_waiting.store(0, std::memory_order_relaxed);
-    header->sched_stall_orch_done.store(0, std::memory_order_relaxed);
-    header->sched_stall_task_id.store(-1, std::memory_order_relaxed);
-    header->sched_stall_core.store(-1, std::memory_order_relaxed);
 
-    // No per-slot loop: prepare_task resets each slot when it allocates it, and
-    // the scheduler only scans submitted task_ids [last_task_alive,
-    // current_task_index), so unsubmitted slots are never read. Per-boot reset
-    // is just the header fields above; per-slot state is set lazily at submit.
+    // Per-ring slot_states reset. Previously lived in
+    // PTO2SchedulerState::RingSchedState::init(), but it writes into
+    // ring->slot_states[] which is SM-side storage — keeping it here lets
+    // host-side prebuilt-arena init skip all SM dereferences.
+    // bind_ring() pins the ring_id (slot-invariant after this point);
+    // reset_for_reuse() prepares dynamic fanout/refcount fields so the first
+    // submit doesn't need an explicit reset.
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        auto &ring = header->rings[r];
+        for (uint64_t i = 0; i < task_window_sizes[r]; i++) {
+            ring.slot_states[i].bind_ring(static_cast<uint8_t>(r));
+            ring.slot_states[i].reset_for_reuse();
+            ring.slot_states[i].fanin_count = 0;
+            ring.slot_states[i].active_mask = ActiveMask{};
+        }
+    }
 }
 
 // =============================================================================

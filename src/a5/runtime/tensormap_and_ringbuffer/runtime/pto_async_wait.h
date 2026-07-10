@@ -24,6 +24,7 @@
 #include "pto_runtime2_types.h"
 
 struct PTO2SchedulerState;
+struct PTO2LocalReadyBuffer;
 struct CompletionStats;
 
 inline constexpr int32_t MAX_ASYNC_WAITS = 64;
@@ -32,6 +33,10 @@ inline constexpr int32_t MAX_ASYNC_WAITS = 64;
 // try_push_normal_done / try_pop) lives as AICoreCompletionMailbox member
 // functions in aicore_completion_mailbox.h. This file only holds the
 // application layer: translating drained messages into wait-list state.
+
+inline uintptr_t mailbox_cache_line(const volatile void *addr) {
+    return reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
+}
 
 struct CompletionCondition;
 
@@ -147,12 +152,6 @@ struct AsyncWaitList {
     // Read by scheduler shutdown / l2 perf summary; not on the hot path.
     std::atomic<uint64_t> mpsc_skipped_count{0};
 
-    void reset_for_reuse() {
-        busy.store(0, std::memory_order_relaxed);
-        count = 0;
-        mpsc_skipped_count.store(0, std::memory_order_relaxed);
-    }
-
     bool try_lock() {
         int32_t expected = 0;
         return busy.compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed);
@@ -172,6 +171,7 @@ struct AsyncWaitList {
     // entries[]).
     struct DrainCompletionSink {
         PTO2SchedulerState *sched{nullptr};
+        PTO2LocalReadyBuffer *local_bufs{nullptr};
         PTO2TaskSlotState **deferred_release_slot_states{nullptr};
         int32_t *deferred_release_count{nullptr};
         int32_t deferred_release_capacity{0};
@@ -290,7 +290,7 @@ struct AsyncWaitList {
 
     template <bool Profiling>
     AsyncPollResult poll_and_complete(
-        AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched,
+        AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
         PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
         int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING

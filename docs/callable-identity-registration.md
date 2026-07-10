@@ -51,47 +51,6 @@ the explicit prewarm step was missed, the child prepares its private slot in
 the dispatch path and logs a warning. This is not a public cid compatibility
 path and it does not fetch missing callable bytes from the parent.
 
-### Chip Executable Prewarm
-
-Chip callable registration separates identity installation from executable
-materialization. A successful registration installs the target-local
-`hashid -> local_slot` mapping. For runtimes that need device-side executable
-state before the first dispatch, `register_callable()` also prewarms that state
-before returning success.
-
-For `tensormap_and_ringbuffer`, this prepare-ahead step runs a private AICPU
-entry, `simpler_aicpu_register_callable`, after the orchestration SO bytes and
-child kernel addresses have already been staged. The host passes a small
-`RegisterCallableArgs` descriptor (callable id, orch-SO device address/size,
-entry/config symbol names) extracted from the staged `CallableState` — not a
-full `Runtime`. The AICPU entry may materialize the orchestration SO into a
-temporary file, `dlopen` it, resolve the entry/config/bind symbols, and
-populate `orch_so_table_[callable_id]`. It must
-stop before any real task execution: it does not call the orchestration entry,
-does not configure runtime arguments from user task inputs, does not create a
-`PTO2Runtime`, does not enter runtime scopes, and does not submit scheduler or
-AICore work. `dlopen` may still run ELF or C++ static constructors; the
-contract is that prewarm does not explicitly invoke orchestration logic.
-
-`host_build_graph` does not support AICPU callable prewarm. Its orchestration
-SO is resolved on the host during prepare, so there is no AICPU
-`orch_so_table_` entry to populate and no AICPU dlopen accounting to update.
-The internal prewarm hook for that runtime is a no-op success.
-
-Host-visible cache-hit state is committed only after the device-side SO load
-has succeeded. Until that commit happens, the next real run must treat the
-callable as load-required rather than advertising an AICPU cache hit. If
-prewarm fails, `register_callable()` fails and rolls back the callable
-registration it just created. If a first real run performs the same load as a
-fallback, it follows the same success-before-commit rule. Reusing a
-`callable_id` slot after unregister forces the next prewarm or real run to
-reload and replace the AICPU table entry for that slot.
-
-`aicpu_dlopen_count` is host telemetry, not proof that the AICPU completed
-`dlopen`. Validation must also rely on an AICPU-side signal, such as a log from
-the SO-load helper, or on a follow-up real run that reuses a non-empty
-`orch_so_table_[callable_id]` with reload disabled.
-
 Introduce `hashid` as the stable callable identity:
 
 ```text
@@ -342,10 +301,7 @@ every active child endpoint in the handle's `target_namespace` for this
 worker subset is not part of this contract.
 `orch.submit_next_level(..., worker=...)` and
 `orch.submit_next_level_group(..., workers=...)` are submit-time affinity
-controls; they do not define registration scope. NEXT_LEVEL affinity consumes
-stable worker ids. Local Python Worker children and remote L3 workers use the
-worker ids returned by `add_worker(...)` / `add_remote_worker(...)`; L3 chip
-worker ids are the existing chip worker ids.
+controls; they do not define registration scope.
 
 `CallableHandle` is the public callable token returned by registration:
 
@@ -530,7 +486,7 @@ REGISTER_TOMBSTONE_ACTIVE
 UNREGISTER_TOMBSTONE_ACTIVE
 ```
 
-Error messages should include worker id, namespace, `hashid`, and operation.
+Error messages should include endpoint id, namespace, `hashid`, and operation.
 The current local mailbox has one outstanding operation per endpoint and does
 not carry a separate sequence field; a future multi-flight control channel must
 add one. Messages must not include user-specific local absolute paths.

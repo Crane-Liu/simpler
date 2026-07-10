@@ -29,19 +29,15 @@
 #ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
 #define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
 
-#include <stddef.h>  // for offsetof
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>   // for fprintf, printf
 #include <string.h>  // for memset
 
-#include <type_traits>
 #include <vector>
 
 #include "common/core_type.h"
-#include "common/host_api.h"
 #include "common/platform_config.h"
-#include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"
 
@@ -52,6 +48,7 @@
 #define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER 108  // 36 AIC + 72 AIV cores
 #define RUNTIME_MAX_FUNC_ID 1024
+#define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
 
 // Default ready queue shards: one shard per worker thread (total minus orchestrator)
@@ -111,16 +108,11 @@ struct Handshake {
     volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
-enum class TensorReleaseKind {
-    Free,
-    BufferNoop,
-    ExternalNoop,
-};
-
 /**
- * Tensor lease for tracking host-device memory mappings and release ownership.
+ * Tensor pair for tracking host-device memory mappings.
+ * Used for copy-back during finalize.
  */
-struct TensorLease {
+struct TensorPair {
     void *host_ptr;
     void *dev_ptr;
     size_t size;
@@ -128,7 +120,54 @@ struct TensorLease {
     // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
     // keep the safe default of copying back.
     bool needs_copy_back = true;
-    TensorReleaseKind release_kind = TensorReleaseKind::Free;
+};
+
+/**
+ * Host API function pointers for device memory operations.
+ * Allows runtime to use pluggable device memory backends.
+ */
+struct HostApi {
+    void *(*device_malloc)(size_t size);
+    void (*device_free)(void *dev_ptr);
+    int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
+    int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
+    // Set a device buffer to a byte value (device-side, no PCIe). Used to
+    // zero-init pure OUTPUT buffers in lieu of an H2D copy-in. May be
+    // null on backends that don't wire it; callers must fall back to
+    // copy_to_device.
+    int (*device_memset)(void *dev_ptr, int value, size_t size);
+    // Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
+    // memory, trb prebuilt runtime arena) as three independent device
+    // allocations. `runtime_arena_size == 0` skips the third region (hbg
+    // path: hbg has no prebuilt runtime arena). Idempotent on identical
+    // sizes; returns 0 on success, -1 on allocation failure.
+    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    // Return the per-Worker pooled pointer for the PTO2 GM heap / shared
+    // memory / prebuilt runtime arena. setup_static_arena must have already
+    // committed the relevant region; the returned pointer is owned by the
+    // DeviceRunner and freed in `DeviceRunner::finalize()` — do NOT pass it
+    // to device_free or record it in `tensor_pairs_`.
+    //
+    // acquire_pooled_runtime_arena is trb-only — the runtime-arena region is
+    // only committed when setup_static_arena was invoked with
+    // runtime_arena_size > 0. Calling it on the hbg path
+    // (setup_static_arena(...,0)) returns nullptr (not undefined).
+    void *(*acquire_pooled_gm_heap)();
+    void *(*acquire_pooled_gm_sm)();
+    void *(*acquire_pooled_runtime_arena)();
+    // Single-shot upload of the entire ChipCallable buffer. `callable` is a
+    // `const ChipCallable *` (declared void* to avoid pulling task_interface
+    // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
+    // total byte size, allocates device GM once, fixes up each child's
+    // resolved_addr_ in an internal host scratch (onboard: device addr; sim:
+    // dlopen function pointer), H2D's once, and returns the device-side
+    // address of the ChipCallable header. Pool-managed: identical buffer
+    // contents (FNV-1a 64-bit) hit the dedup cache; all chip buffers are
+    // bulk-freed in DeviceRunner::finalize(). Returns 0 on error or when
+    // child_count() == 0. Caller computes child addrs as
+    //     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
+    // and stores them via runtime->set_function_bin_addr(fid, child_dev).
+    uint64_t (*upload_chip_callable_buffer)(const void *callable);
 };
 
 /**
@@ -144,27 +183,18 @@ struct Task {
 };
 
 // =============================================================================
-// Device launch descriptor
+// Runtime Class
 // =============================================================================
 
 /**
- * DeviceRuntimeLaunchDesc - the device-copied half of Runtime.
+ * Runtime class for device execution and handshake control
  *
- * This is the ONLY part of Runtime that crosses the host->device boundary: the
- * host fills it, `device_runner_helpers.cpp` rtMemcpy's exactly
- * `sizeof(DeviceRuntimeLaunchDesc)` bytes from offset 0 of the Runtime image,
- * and the AICPU/AICore read these fields back. It is the first member of
- * Runtime (offsetof == 0), so the narrowed copy needs no offset arithmetic.
- *
- * Adding a field here grows the device image; adding a field to Runtime's
- * host-only tail does not. Keep it standard-layout (static_assert below) so the
- * rtMemcpy is well-defined. alignas(64) keeps sizeof a multiple of the cache
- * line so the device-copied image starts and ends on cache-line boundaries and
- * never shares a line with Runtime's host-only tail (the leading Handshake is
- * already 64-aligned, but the explicit alignas keeps the property if fields are
- * ever reordered).
+ * This class manages AICPU-AICore communication through handshake buffers.
+ * Task graph construction is handled by PTO2Runtime; this class only handles
+ * execution control and device orchestration state.
  */
-struct alignas(64) DeviceRuntimeLaunchDesc {
+class Runtime {
+public:
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
@@ -175,6 +205,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // (= orch + schedulers). AicpuExecutor splits this into one orchestrator
     // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
     // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
+    // The orch thread also dispatches when env PTO2_ORCH_TO_SCHED is set.
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
@@ -184,9 +215,9 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // sched_getcpu() lands on one of these cpu_ids; exec_idx = position in
     // this array drives sched/orch role assignment. Indices 0..count-2 are
     // scheduler slots, index count-1 is the orchestrator slot. Sized to
-    // MAX_GATE_THREADS (the shared gate/ABI bound, ≥ any launch count) for
-    // headroom — current policy is 4 sched + 1 orch = 5 active.
-    int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
+    // PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH for headroom — current
+    // policy is 4 sched + 1 orch = 5 active.
+    int32_t aicpu_allowed_cpus[16];
     int32_t aicpu_allowed_cpu_count;
     // Actual AICPU thread launch count for this run. Host sets from
     // popcount(OCCUPY) via the topology probe. See the matching field in
@@ -194,15 +225,23 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     int32_t aicpu_launch_count;
 
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
+    // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
-    // Serial orchestrator -> scheduler start control.
-    // When true, scheduler threads wait until orchestration has fully built the
-    // task graph before entering resolve_and_dispatch().
-    // Controlled via PTO2_SERIAL_ORCH_SCHED environment variable.
-    bool serial_orch_sched;
+    // Orchestrator-to-scheduler transition control
+    // When true, orchestrator threads convert to scheduler threads after orchestration completes.
+    // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
+    // Controlled via PTO2_ORCH_TO_SCHED environment variable.
+    bool orch_to_sched;
+
+private:
+    // Kernel binary tracking for cleanup
+    int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
+    int registered_kernel_count_;
 
     void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
+    void *gm_heap_ptr_;                      // GM heap for orchestrator output buffers (device)
+    void *slot_states_ptr_;                  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
     // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
@@ -212,59 +251,25 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     void *prebuilt_arena_base_;
     size_t prebuilt_runtime_offset_;
 
+    // Device orchestration SO (for dlopen on AICPU thread 3).
+    // The SO bytes themselves live in a separately-allocated device buffer
+    // owned by DeviceRunner; only the metadata below travels inside Runtime.
+    uint64_t dev_orch_so_addr_;
+    uint64_t dev_orch_so_size_;
     // Per-callable_id dispatch. AICPU dispatches via
-    // `orch_so_table_[active_callable_id_]`.
+    // `orch_so_table_[active_callable_id_]`; `register_new_callable_id_`
+    // signals whether the host is delivering a freshly-registered
+    // callable_id (write+dlopen) or reusing an already-loaded one.
     int32_t active_callable_id_;
-};
+    bool register_new_callable_id_;
+    char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
+    char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
 
-// =============================================================================
-// Runtime Class
-// =============================================================================
-
-/**
- * Runtime class for device execution and handshake control
- *
- * This class manages AICPU-AICore communication through handshake buffers.
- * Task graph construction is handled by PTO2Runtime; this class only handles
- * execution control and device orchestration state.
- *
- * Layout: the device-read fields live in the first member `dev`
- * (DeviceRuntimeLaunchDesc); everything below it is host-only and is never
- * uploaded. The host/device boundary is therefore the `dev.` prefix, not a
- * fragile field-ordering convention.
- */
-class Runtime {
 public:
-    // The device-copied half. MUST stay the first member: device_runner_helpers
-    // copies sizeof(DeviceRuntimeLaunchDesc) bytes from offset 0.
-    DeviceRuntimeLaunchDesc dev;
-
     /**
      * Constructor - zero-initialize all arrays
      */
     Runtime();
-
-    // =========================================================================
-    // Accessors for the device-copied fields in `dev`
-    //
-    // These exist with identical signatures on the host_build_graph Runtime so
-    // the shared platform layer (device_runner*.cpp, kernel.cpp) can compile
-    // against either variant. trb-only code reads `runtime->dev.X` directly.
-    // =========================================================================
-
-    int get_worker_count() const { return dev.worker_count; }
-    void set_worker_count(int n) { dev.worker_count = n; }
-    int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
-    void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
-    Handshake *get_workers() { return dev.workers; }
-    int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
-    void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
-    int32_t get_aicpu_launch_count() const { return dev.aicpu_launch_count; }
-    void set_aicpu_launch_count(int32_t n) { dev.aicpu_launch_count = n; }
-    int32_t *get_aicpu_allowed_cpus() { return dev.aicpu_allowed_cpus; }
-    size_t aicpu_allowed_cpus_capacity() const {
-        return sizeof(dev.aicpu_allowed_cpus) / sizeof(dev.aicpu_allowed_cpus[0]);
-    }
 
     // =========================================================================
     // Performance Profiling
@@ -275,8 +280,11 @@ public:
     // =========================================================================
 
     void *get_gm_sm_ptr() const;
+    void *get_gm_heap_ptr() const;
     const ChipStorageTaskArgs &get_orch_args() const;
     void set_gm_sm_ptr(void *p);
+    void set_gm_heap(void *p);
+    void set_slot_states_ptr(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Prebuilt-arena fast path (trb only). Set by host's
@@ -289,20 +297,35 @@ public:
     void *get_prebuilt_arena_base() const;
     size_t get_prebuilt_runtime_offset() const;
 
+    // Device orchestration SO binary (for dlopen on AICPU thread 3)
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size);
+    uint64_t get_dev_orch_so_addr() const;
+    uint64_t get_dev_orch_so_size() const;
     // Per-callable_id dispatch. callable_id must be in
-    // [0, MAX_REGISTERED_CALLABLE_IDS); the AICPU dispatches the orch SO via
-    // orch_so_table_[callable_id]. The SO itself is delivered to the AICPU at
-    // register time (RegisterCallableArgs), not through Runtime.
-    void set_active_callable_id(int32_t callable_id);
+    // [0, MAX_REGISTERED_CALLABLE_IDS); register_new_callable_id_ tells AICPU
+    // whether to (re)load the orch SO into orch_so_table_[callable_id] or
+    // reuse the cached entry.
+    void set_active_callable_id(int32_t callable_id, bool is_new);
     int32_t get_active_callable_id() const;
+    bool register_new_callable_id() const;
+    void set_device_orch_func_name(const char *name);
+    const char *get_device_orch_func_name() const;
+    void set_device_orch_config_name(const char *name);
+    const char *get_device_orch_config_name() const;
 
     uint64_t get_function_bin_addr(int func_id) const;
+    void set_function_bin_addr(int func_id, uint64_t addr);
     /**
-     * Replay a previously-uploaded kernel address onto a fresh Runtime.
-     * Used by DeviceRunner::bind_callable_to_runtime to rebind prepared
-     * kernel binaries onto the runtime before each run.
+     * Replay a previously-uploaded kernel address onto a fresh Runtime
+     * without recording it in registered_kernel_func_ids_. Used by
+     * DeviceRunner::bind_callable_to_runtime so prepared kernel
+     * binaries are not freed by validate_runtime_impl across runs.
      */
     void replay_function_bin_addr(int func_id, uint64_t addr);
+
+    int get_registered_kernel_count() const;
+    int get_registered_kernel_func_id(int index) const;
+    void clear_registered_kernels();
 
     // =========================================================================
     // Deprecated API (for platform compatibility, always returns 0/nullptr)
@@ -316,46 +339,20 @@ public:
     Task *get_task(int) { return nullptr; }
 
     // =========================================================================
-    // Host-only state (not copied to device)
+    // Host API (host-only, not copied to device)
     // =========================================================================
+
+    // Host API function pointers for device memory operations
+    // NOTE: Placed at end of class to avoid affecting device memory layout
+    HostApi host_api;
 
     // Host-side tensor ledger for D2H copy-back at finalize. Populated by
     // runtime_maker.cpp from orch_args at bind time, then iterated in
-    // validate_runtime_impl. Host-only (after `dev`): never uploaded.
-    std::vector<TensorLease> tensor_leases_;
+    // validate_runtime_impl. Not read by AICPU/AICore — the device-side
+    // Runtime image carries the std::vector control block as harmless
+    // garbage, identical to host_api above. No fixed cap — grows with the
+    // chip-level entry-tensor count.
+    std::vector<TensorPair> tensor_pairs_;
 };
-
-// `dev` must be the first member so the narrowed H2D copy starts at offset 0.
-// Runtime is not standard-layout (std::vector member + mixed access), so guard
-// the offsetof against -Winvalid-offsetof; the offset itself is well-defined
-// for a first member.
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Winvalid-offsetof"
-#endif
-static_assert(offsetof(Runtime, dev) == 0, "DeviceRuntimeLaunchDesc must be the first member of Runtime");
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
-static_assert(
-    std::is_standard_layout_v<DeviceRuntimeLaunchDesc>,
-    "DeviceRuntimeLaunchDesc must be standard-layout: it is rtMemcpy'd to device"
-);
-static_assert(
-    std::is_trivially_copyable_v<DeviceRuntimeLaunchDesc>,
-    "DeviceRuntimeLaunchDesc must be trivially copyable: it is rtMemcpy'd to device"
-);
-static_assert(
-    sizeof(DeviceRuntimeLaunchDesc) % 64 == 0,
-    "DeviceRuntimeLaunchDesc size must be a multiple of 64 so the device-copied image "
-    "stays cache-line aligned"
-);
-
-// Number of bytes of the Runtime image that must be copied to the device.
-// trb returns sizeof(DeviceRuntimeLaunchDesc) (only `dev` is device-read);
-// host_build_graph returns sizeof(Runtime) (its device image is the whole
-// object). Defined per-runtime so the shared device_runner_helpers.cpp copy
-// path stays runtime-agnostic.
-size_t runtime_device_copy_size(const Runtime &rt);
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

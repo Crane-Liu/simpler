@@ -50,27 +50,26 @@ public:
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
-    // Launch a cid previously staged via register_callable.
+    // Launch a cid previously staged via prepare_callable.
     // Materializes a ChipStorageTaskArgs from `args` (one memcpy of T*40B + S*8B
-    // into a stack POD), then delegates to the overload below. Per-stage timing
-    // (host wall, on-NPU device wall + AICPU phase breakdown) is emitted by the
-    // platform as `[STRACE]` log markers — see src/common/log/.../strace.h — not
-    // returned, so the L3 dispatcher and L2 child are observed uniformly.
-    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config);
+    // into a stack POD), then delegates to the overload below. Returns
+    // RunTiming with host wall (steady_clock around dispatch) + device wall
+    // (KernelArgs::device_wall_ns captured by the platform AICPU entry).
+    RunTiming run(int32_t callable_id, TaskArgsView args, const CallConfig &config);
     // Same launch, but the caller already holds the runtime.so-ABI POD —
     // skip the view→storage memcpy and hand the pointer straight to the C ABI.
     // Used by the ChipStorageTaskArgs path in the nanobind binding.
-    void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
+    RunTiming run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
-    void register_callable(int32_t callable_id, const void *callable);
+    void prepare_callable(int32_t callable_id, const void *callable);
     void unregister_callable(int32_t callable_id);
 
     /// Number of distinct callable_ids the AICPU has been asked to dlopen for
     /// on the bound device. Returns 0 when not initialized or the runtime
     /// variant has no per-cid registration support. Used by tests to assert
-    /// that register_callable + repeated run do not trigger redundant
+    /// that prepare_callable + repeated run do not trigger redundant
     /// AICPU dlopens.
     size_t aicpu_dlopen_count() const;
 
@@ -82,8 +81,6 @@ public:
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
-    void l3_l2_orch_comm_init(uint64_t control_block_addr, size_t control_block_size);
-    void l3_l2_orch_comm_shutdown();
 
     /// Distributed communication primitives (optional — only available when
     /// the bound runtime exports comm_*).  Wraps the backend-neutral C API
@@ -144,13 +141,14 @@ private:
     // CANN dlog sync. Reads the current log level off HostLogger itself.
     using SimplerInitFn =
         int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t);
-    using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
-    using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
-    using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
+    using PrepareCallableFn = int (*)(void *, int32_t, const void *);
+    using RunPreparedFn = int (*)(
+        void *, void *, int32_t, const void *, int, int, int, int, int, int, int, uint64_t, uint64_t, uint64_t,
+        const uint64_t *, const uint64_t *, const uint64_t *, const char *, PtoRunTiming *
+    );
+    using UnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);
-    using L3L2OrchCommInitFn = int (*)(void *, void *, size_t);
-    using L3L2OrchCommShutdownFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
     using DestroyCommStreamFn = int (*)(void *, void *);
@@ -191,14 +189,12 @@ private:
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     SimplerInitFn simpler_init_fn_ = nullptr;
-    SimplerRegisterCallableFn register_callable_fn_ = nullptr;
-    SimplerRunFn run_fn_ = nullptr;
-    SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
+    PrepareCallableFn prepare_callable_fn_ = nullptr;
+    RunPreparedFn run_prepared_fn_ = nullptr;
+    UnregisterCallableFn unregister_callable_fn_ = nullptr;
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
-    L3L2OrchCommInitFn l3_l2_orch_comm_init_fn_ = nullptr;
-    L3L2OrchCommShutdownFn l3_l2_orch_comm_shutdown_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
     DestroyCommStreamFn destroy_comm_stream_fn_ = nullptr;

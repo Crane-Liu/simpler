@@ -22,7 +22,6 @@
 #include <limits>
 #include <vector>
 #include "pto_runtime2.h"
-#include "pto_runtime_status.h"
 #include "pto_shared_memory.h"
 
 namespace {
@@ -87,55 +86,11 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
     EXPECT_EQ(hdr->sched_error_bitmap.load(), 0);
     EXPECT_EQ(hdr->sched_error_code.load(), 0);
 
-    // Stall sub-classification fields start cleared; task_id/core are -1 (no S1
-    // locator) so a stale read never points at a real task/core.
-    EXPECT_EQ(hdr->sched_stall_detail.load(), PTO2_STALL_DETAIL_NONE);
-    EXPECT_EQ(hdr->sched_stall_completed.load(), 0);
-    EXPECT_EQ(hdr->sched_stall_total.load(), 0);
-    EXPECT_EQ(hdr->sched_stall_cnt_running.load(), 0);
-    EXPECT_EQ(hdr->sched_stall_cnt_ready.load(), 0);
-    EXPECT_EQ(hdr->sched_stall_cnt_waiting.load(), 0);
-    EXPECT_EQ(hdr->sched_stall_orch_done.load(), 0);
-    EXPECT_EQ(hdr->sched_stall_task_id.load(), -1);
-    EXPECT_EQ(hdr->sched_stall_core.load(), -1);
-
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         auto &fc = hdr->rings[r].fc;
         EXPECT_EQ(fc.current_task_index.load(), 0);
         EXPECT_EQ(fc.last_task_alive.load(), 0);
     }
-}
-
-// =============================================================================
-// Stall sub-classification (pure decision, no scheduler state)
-// =============================================================================
-
-TEST(StallClassificationTest, PriorityRunningOverEverything) {
-    // RUNNING dominates regardless of ready/waiting/orch_done.
-    EXPECT_EQ(classify_stall_detail(2, 5, 7, 0), PTO2_STALL_DETAIL_RUNNING_STALLED);
-    EXPECT_EQ(classify_stall_detail(1, 0, 0, 1), PTO2_STALL_DETAIL_RUNNING_STALLED);
-}
-
-TEST(StallClassificationTest, PriorityReadyThenWaiting) {
-    EXPECT_EQ(classify_stall_detail(0, 3, 4, 0), PTO2_STALL_DETAIL_READY_IDLE);
-    EXPECT_EQ(classify_stall_detail(0, 0, 4, 1), PTO2_STALL_DETAIL_DEP_DEADLOCK);
-}
-
-TEST(StallClassificationTest, AllZeroSplitsOnOrchDone) {
-    // No running/ready/waiting: orchestrator-not-done is starvation; done is the
-    // accounting/corruption 'unknown' bucket.
-    EXPECT_EQ(classify_stall_detail(0, 0, 0, 0), PTO2_STALL_DETAIL_ORCH_STARVATION);
-    EXPECT_EQ(classify_stall_detail(0, 0, 0, 1), PTO2_STALL_DETAIL_UNKNOWN);
-}
-
-TEST(StallClassificationTest, NamesAreStableAndDistinct) {
-    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_NONE), "none");
-    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_RUNNING_STALLED), "S1:running-stalled");
-    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_READY_IDLE), "S3:ready-but-all-idle");
-    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_DEP_DEADLOCK), "S4:dependency-deadlock");
-    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_ORCH_STARVATION), "S5:orchestrator-starvation");
-    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_UNKNOWN), "unknown:accounting/corruption");
-    EXPECT_STREQ(stall_detail_name(12345), "invalid");
 }
 
 TEST_F(SharedMemoryTest, Validate) { EXPECT_TRUE(handle->validate()); }
@@ -259,9 +214,9 @@ TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
 
     EXPECT_EQ(rt->gm_heap_size, total_heap);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        EXPECT_EQ(layout.sizing.task_window_sizes[r], ws[r]);
-        EXPECT_EQ(layout.sizing.heap_sizes[r], heaps[r]);
-        EXPECT_EQ(layout.sizing.dep_pool_capacities[r], dep_caps[r]);
+        EXPECT_EQ(layout.task_window_sizes[r], ws[r]);
+        EXPECT_EQ(layout.heap_sizes[r], heaps[r]);
+        EXPECT_EQ(layout.dep_pool_capacities[r], dep_caps[r]);
         EXPECT_EQ(rt->orchestrator.rings[r].task_allocator.window_size(), static_cast<int32_t>(ws[r]));
         EXPECT_EQ(rt->orchestrator.rings[r].task_allocator.heap_capacity(), heaps[r]);
         EXPECT_EQ(rt->orchestrator.rings[r].fanin_pool.capacity, dep_caps[r]);
@@ -283,7 +238,7 @@ TEST(RuntimeArenaLayout, RejectsOverflowingPerRingHeapSum) {
     EXPECT_EQ(runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, &sm, 0, &gm, heaps), nullptr);
 
     PTO2OrchestratorState orch{};
-    EXPECT_FALSE(orch.init_data_from_layout(layout.offsets.orch, runtime_arena, &sm, &gm, heaps, ws));
+    EXPECT_FALSE(orch.init_data_from_layout(layout.orch, runtime_arena, &sm, &gm, heaps, ws));
 }
 
 // =============================================================================

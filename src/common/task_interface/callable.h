@@ -77,8 +77,8 @@ struct Callable<void, MaxSig, 0> {
     const void *binary_data() const { return reinterpret_cast<const char *>(this) + binary_data_offset(); }
 
     static constexpr size_t binary_data_offset() {
-        // sizeof(), not a manual member-size sum, so compiler padding can't overlap the binary.
-        return (sizeof(Callable<void, MaxSig, 0>) + CALLABLE_ALIGN - 1) & ~(static_cast<size_t>(CALLABLE_ALIGN) - 1);
+        constexpr size_t raw = sizeof(ArgDirection) * MaxSig + sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t);
+        return (raw + CALLABLE_ALIGN - 1) & ~(static_cast<size_t>(CALLABLE_ALIGN) - 1);
     }
 
 private:
@@ -184,8 +184,6 @@ template <int MaxSig>
 std::vector<uint8_t>
 make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size) {
     if (sig_count > MaxSig) throw std::invalid_argument("make_callable: sig_count exceeds MaxSig");
-    if (sig_count > 0 && sig == nullptr)
-        throw std::invalid_argument("make_callable: sig is required when sig_count > 0");
 
     using T = Callable<void, MaxSig, 0>;
     size_t aligned_header = T::binary_data_offset();
@@ -193,9 +191,8 @@ make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, ui
     std::vector<uint8_t> buf(total_size, 0);
 
     T *obj = reinterpret_cast<T *>(buf.data());
-    for (int32_t i = 0; i < sig_count; ++i) {
+    for (int32_t i = 0; i < sig_count; ++i)
         obj->signature_[i] = sig[i];
-    }
     obj->sig_count_ = sig_count;
     obj->binary_size_ = binary_size;
     obj->resolved_addr_ = 0;

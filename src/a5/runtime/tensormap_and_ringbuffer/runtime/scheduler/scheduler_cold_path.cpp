@@ -14,8 +14,6 @@
 #include <cstdio>
 
 #include "common/unified_log.h"
-#include "aicpu/dep_gen_collector_aicpu.h"
-#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -33,23 +31,18 @@
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
 
-// Returns true iff this call won the first-writer CAS for sched_error_code — the
-// caller may then write companion fields (e.g. the stall detail) knowing they
-// describe the same observation that owns the latched code.
-static bool latch_scheduler_error(PTO2SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code) {
+static void latch_scheduler_error(PTO2SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code) {
     if (header == nullptr || error_code == PTO2_ERROR_NONE) {
-        return false;
+        return;
     }
     // The first error code/thread pair wins; the bitmap cumulatively records all reporting threads.
     int32_t expected = PTO2_ERROR_NONE;
-    bool won = header->sched_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel);
-    if (won) {
+    if (header->sched_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel)) {
         header->sched_error_thread.store(thread_idx, std::memory_order_release);
     }
     if (thread_idx >= 0 && thread_idx < 32) {
         header->sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
     }
-    return won;
 }
 
 LoopAction SchedulerContext::handle_orchestrator_exit(
@@ -79,7 +72,7 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
         return LoopAction::BREAK_LOOP;
     }
 
-    bool orch_done = orchestrator_done_.load(std::memory_order_acquire);
+    bool orch_done = orchestrator_done_;
     if (!orch_done) return LoopAction::NONE;
 
     task_count = total_tasks_;
@@ -91,6 +84,21 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
         );
         return LoopAction::BREAK_LOOP;
     }
+    return LoopAction::NONE;
+}
+
+LoopAction SchedulerContext::handle_core_transition(bool &cores_released) {
+    if (!transition_requested_.load(std::memory_order_acquire)) return LoopAction::NONE;
+    if (!reassigned_.load(std::memory_order_acquire)) {
+        wait_reassign_.fetch_add(1, std::memory_order_release);
+        while (!reassigned_.load(std::memory_order_acquire)) {
+            if (completed_.load(std::memory_order_acquire)) {
+                return LoopAction::BREAK_LOOP;
+            }
+            SPIN_WAIT_HINT();
+        }
+    }
+    cores_released = true;
     return LoopAction::NONE;
 }
 
@@ -236,11 +244,7 @@ void SchedulerContext::log_stall_diagnostics(
             PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_states[r].ring;
             int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
             submitted_in_ring += ring_task_count;
-            // Scan only live task_ids [last_task_alive, current_task_index): slots
-            // wrap (slot = task_id % window), so starting at 0 re-reads each live
-            // slot once per earlier task_id and inflates the scan_* counts.
-            int32_t ring_task_start = ring.fc.last_task_alive.load(std::memory_order_relaxed);
-            for (int32_t si = ring_task_start; si < ring_task_count; si++) {
+            for (int32_t si = 0; si < ring_task_count; si++) {
                 PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
                 PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
                 int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
@@ -312,7 +316,7 @@ void SchedulerContext::log_stall_diagnostics(
 
     // CLUSTER lines: one per cluster this thread owns.
     // cluster_id = local_cluster_idx * active_sched_threads_ + thread_idx, matching the
-    // round-robin assignment in assign_cores_to_threads.
+    // round-robin assignment in assign_cores_to_threads / reassign_cores_for_all_threads.
     int32_t ast = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
     for (int32_t cli = 0; cli < tracker.get_cluster_count() && cli < STALL_DUMP_CORE_MAX; cli++) {
         int32_t offset = cli * 3;
@@ -363,62 +367,6 @@ void SchedulerContext::log_shutdown_stall_snapshot(
     }
 }
 
-SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() const {
-    StallClassification cls{};
-    cls.stuck_task_id = -1;
-    cls.stuck_core = -1;
-    int32_t cnt_running = 0, cnt_ready = 0, cnt_waiting = 0;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_states[r].ring;
-        int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
-        // Active task_ids live in [last_task_alive, current_task_index); slots wrap
-        // (slot = task_id % window), so scanning from 0 re-reads each live slot once
-        // per earlier task_id that mapped to it -- inflating the counts to O(history).
-        // Start at the tail so each live slot is visited exactly once (O(window)).
-        int32_t ring_task_start = ring.fc.last_task_alive.load(std::memory_order_relaxed);
-        for (int32_t si = ring_task_start; si < ring_task_count; si++) {
-            PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
-            PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
-            if (st >= PTO2_TASK_COMPLETED) continue;
-            // Same ground truth as log_stall_diagnostics: task_state stays PENDING
-            // until COMPLETED, so RUNNING is read from core ownership, not the slot.
-            int32_t run_core = -1;
-            for (int32_t cid = 0; cid < cores_total_num_; cid++) {
-                if (core_exec_states_[cid].running_slot_state == &slot_state) {
-                    run_core = cid;
-                    break;
-                }
-            }
-            if (run_core >= 0) {
-                if (cnt_running == 0) {
-                    // Snapshot the non-atomic task pointer once: it can be null on a
-                    // torn slot, and a concurrent writer may flip it mid-read.
-                    PTO2TaskDescriptor *task_ptr = slot_state.task;
-                    cls.stuck_task_id = (task_ptr != nullptr) ? static_cast<int64_t>(task_ptr->task_id.raw) : -1;
-                    cls.stuck_core = run_core;
-                }
-                cnt_running++;
-                continue;
-            }
-            int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
-            int32_t fi = slot_state.fanin_count;
-            if (rc >= fi) {
-                cnt_ready++;
-                continue;
-            }
-            cnt_waiting++;
-        }
-    }
-    cls.cnt_running = cnt_running;
-    cls.cnt_ready = cnt_ready;
-    cls.cnt_waiting = cnt_waiting;
-    cls.completed = completed_tasks_.load(std::memory_order_relaxed);
-    cls.total = total_tasks_;
-    cls.orch_done = orchestrator_done_ ? 1 : 0;
-    cls.detail = classify_stall_detail(cnt_running, cnt_ready, cnt_waiting, cls.orch_done);
-    return cls;
-}
-
 int32_t SchedulerContext::handle_timeout_exit(
     int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
     int32_t last_progress_count
@@ -427,28 +375,11 @@ int32_t SchedulerContext::handle_timeout_exit(
     uint64_t sched_start_ts
 #endif
 ) {
-    StallClassification cls = classify_stall_reason();
     LOG_ERROR(
-        "[STALL thread=%d idle_iterations=%d] TIMEOUT_EXIT after_idle_iterations=%d sub_class=%s "
-        "completed=%d/%d running=%d ready=%d waiting=%d orch_done=%d stuck_task_id=%" PRId64 " stuck_core=%d",
-        thread_idx, idle_iterations, idle_iterations, stall_detail_name(cls.detail), cls.completed, cls.total,
-        cls.cnt_running, cls.cnt_ready, cls.cnt_waiting, cls.orch_done, cls.stuck_task_id, cls.stuck_core
+        "[STALL thread=%d idle_iterations=%d] TIMEOUT_EXIT after_idle_iterations=%d", thread_idx, idle_iterations,
+        idle_iterations
     );
-    // Only the thread that wins the code-100 latch publishes the detail/locators,
-    // keeping the host-visible sub-class consistent with the latched code.
-    if (latch_scheduler_error(header, thread_idx, PTO2_ERROR_SCHEDULER_TIMEOUT) && header != nullptr) {
-        header->sched_stall_completed.store(cls.completed, std::memory_order_relaxed);
-        header->sched_stall_total.store(cls.total, std::memory_order_relaxed);
-        header->sched_stall_cnt_running.store(cls.cnt_running, std::memory_order_relaxed);
-        header->sched_stall_cnt_ready.store(cls.cnt_ready, std::memory_order_relaxed);
-        header->sched_stall_cnt_waiting.store(cls.cnt_waiting, std::memory_order_relaxed);
-        header->sched_stall_orch_done.store(cls.orch_done, std::memory_order_relaxed);
-        header->sched_stall_task_id.store(cls.stuck_task_id, std::memory_order_relaxed);
-        header->sched_stall_core.store(cls.stuck_core, std::memory_order_relaxed);
-        // detail published last (release) so a host reading a non-NONE detail
-        // sees the locators above already settled.
-        header->sched_stall_detail.store(cls.detail, std::memory_order_release);
-    }
+    latch_scheduler_error(header, thread_idx, PTO2_ERROR_SCHEDULER_TIMEOUT);
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
 #if PTO2_PROFILING
@@ -473,31 +404,19 @@ int32_t SchedulerContext::handle_timeout_exit(
     }
 #if PTO2_PROFILING
     uint64_t sched_timeout_ts = get_sys_cnt_aicpu();
-    aicpu_phase_set_window(
-        AicpuPhase::SchedWindow, static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts)
-    );
-#if PTO2_SCHED_PROFILING
     LOG_INFO_V9(
         "Thread %d: sched_start=%" PRIu64 " sched_end(timeout)=%" PRIu64 " sched_cost=%.3fus", thread_idx,
         static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts),
         cycles_to_us(sched_timeout_ts - sched_start_ts)
     );
 #endif
-#endif
     return -PTO2_ERROR_SCHEDULER_TIMEOUT;
 }
 
 #if PTO2_PROFILING
-void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unused]] int32_t cur_thread_completed) {
+void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed) {
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
     uint64_t sched_end_ts = get_sys_cnt_aicpu();
-    // Ride the sched window home to the host phase buffer (the host reduces
-    // across sched threads → the `Sched` [STRACE] marker). The verbose
-    // per-thread device-log line below is now opt-in deep-dive.
-    aicpu_phase_set_window(
-        AicpuPhase::SchedWindow, static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts)
-    );
-#if PTO2_SCHED_PROFILING
     LOG_INFO_V9(
         "Thread %d: sched_start=%" PRIu64 " sched_end=%" PRIu64 " sched_cost=%.3fus", thread_idx,
         static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts),
@@ -509,6 +428,7 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unuse
                            l2_swimlane.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
 
+#if PTO2_SCHED_PROFILING
     {
         PTO2SchedProfilingData sp = scheduler_get_profiling(thread_idx);
         uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle + sp.self_consumed_cycle;
@@ -628,11 +548,11 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unuse
             );
         }
     }
+#endif
     LOG_INFO_V9(
         "Thread %d: Scheduler summary: total_time=%.3fus, loops=%" PRIu64 ", tasks_scheduled=%d", thread_idx,
         cycles_to_us(sched_total), static_cast<uint64_t>(l2_swimlane.sched_loop_count), cur_thread_completed
     );
-#endif
 }
 #endif
 
@@ -676,8 +596,8 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 // Handshake with all AICore workers; discover core type and reg address.
 // =============================================================================
 int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
-    cores_total_num_ = runtime->dev.worker_count;
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
+    cores_total_num_ = runtime->worker_count;
 
     // Validate cores_total_num_ before using as array index
     if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
@@ -835,12 +755,82 @@ bool SchedulerContext::assign_cores_to_threads() {
 }
 
 // =============================================================================
+// Reassign all cores across all threads (sched + orchestrator) after orchestration.
+// =============================================================================
+void SchedulerContext::reassign_cores_for_all_threads() {
+    LOG_INFO_V0(
+        "Reassigning cores (cluster-aligned) for %d threads: %d AIC, %d AIV", aicpu_thread_num_, aic_count_, aiv_count_
+    );
+
+    // Collect running worker_ids from all current trackers
+    bool running_cores[RUNTIME_MAX_WORKER] = {};
+    for (int32_t i = 0; i < aicpu_thread_num_; i++) {
+        auto all_running = core_trackers_[i].get_all_running_cores();
+        int32_t bp;
+        while ((bp = all_running.pop_first()) >= 0) {
+            running_cores[core_trackers_[i].get_core_id_by_offset(bp)] = true;
+        }
+    }
+
+    // Count clusters per thread (round-robin across all threads)
+    int32_t cluster_count = aic_count_;
+    int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
+    for (int32_t ci = 0; ci < cluster_count; ci++) {
+        clusters_per_thread[ci % aicpu_thread_num_]++;
+    }
+
+    // Re-init all trackers and reset core counts
+    for (int32_t i = 0; i < aicpu_thread_num_; i++) {
+        core_trackers_[i].init(clusters_per_thread[i]);
+    }
+
+    // Assign clusters round-robin and restore running state
+    int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
+    for (int32_t ci = 0; ci < cluster_count; ci++) {
+        int32_t t = ci % aicpu_thread_num_;
+
+        int32_t aic_wid = aic_worker_ids_[ci];
+        int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
+        int32_t aiv1_wid = aiv_worker_ids_[2 * ci + 1];
+
+        int32_t cl_idx = cluster_idx_per_thread[t]++;
+        core_trackers_[t].set_cluster(cl_idx, aic_wid, aiv0_wid, aiv1_wid);
+
+        // init() marks all idle; toggle cores that were running and restore pending_occupied
+        if (running_cores[aic_wid]) {
+            core_trackers_[t].change_core_state(cl_idx * 3);
+            core_trackers_[t].set_pending_occupied(cl_idx * 3);
+        }
+        if (running_cores[aiv0_wid]) {
+            core_trackers_[t].change_core_state(cl_idx * 3 + 1);
+            core_trackers_[t].set_pending_occupied(cl_idx * 3 + 1);
+        }
+        if (running_cores[aiv1_wid]) {
+            core_trackers_[t].change_core_state(cl_idx * 3 + 2);
+            core_trackers_[t].set_pending_occupied(cl_idx * 3 + 2);
+        }
+    }
+
+    // Log final distribution
+    LOG_INFO_V0("Core reassignment complete:");
+    for (int32_t t = 0; t < aicpu_thread_num_; t++) {
+        int32_t aic_running = core_trackers_[t].get_running_count<CoreType::AIC>();
+        int32_t aiv_running = core_trackers_[t].get_running_count<CoreType::AIV>();
+        LOG_INFO_V0(
+            "  Thread %d: %d cores, %d clusters (AIC running=%d, AIV running=%d)", t, core_trackers_[t].core_num(),
+            core_trackers_[t].get_cluster_count(), aic_running, aiv_running
+        );
+    }
+    active_sched_threads_ = aicpu_thread_num_;
+}
+
+// =============================================================================
 // Emergency shutdown: broadcast exit signal to every handshake'd core and
 // deinit their AICore register blocks. Idempotent.
 // =============================================================================
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
     LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
     int32_t timeout_count = 0;
     for (int32_t i = 0; i < cores_total_num_; i++) {
         Handshake *hank = &all_handshakes[i];
@@ -861,8 +851,9 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
 // =============================================================================
 // Lifecycle: init / deinit
 // =============================================================================
-int32_t
-SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base) {
+int32_t SchedulerContext::init(
+    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base
+) {
     always_assert(runtime != nullptr);
 
     // Zero all per-core execution state before handshake
@@ -871,6 +862,7 @@ SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched
     // Wire thread/transition configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
     sched_thread_num_ = sched_thread_num;
+    orch_to_sched_ = orch_to_sched;
     regs_ = regs_base;
 
 #if PTO2_PROFILING
@@ -884,22 +876,25 @@ SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched
     // prior enabled launch's level can't leak into the phase-record gates in
     // scheduler_dispatch (`>= SCHED_PHASES`).
     if (is_l2_swimlane_enabled()) {
-        l2_swimlane_aicpu_init(runtime->dev.worker_count);
+        l2_swimlane_aicpu_init(runtime->worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+            // When orchestrator phases merge into scheduler threads
+            // (PTO2_ORCH_TO_SCHED=1), phase records flow through
+            // aicpu_thread_num_ pools — matches the same branch in
+            // dump_args_init (scheduler_dispatch.cpp).
             // Sched phase pool count = number of scheduler threads.
-            // This block runs before assign_cores_to_threads, so the
-            // active_sched_threads_ member isn't set yet — recompute the same
-            // normalization locally: sched_thread_num_ <= 0 is the "use all
-            // AICPU threads as scheduler threads" sentinel (see
-            // assign_cores_to_threads' active_sched_threads_). Without this
+            // sched_thread_num_ <= 0 is the "use all AICPU threads as
+            // scheduler threads" sentinel (see assign_cores_to_threads'
+            // active_sched_threads_ normalization). Without this
             // normalization here, init_phase would prime zero sched pools
             // and all sched_phase emits would silently drop.
-            const int sched_phase_threads = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
+            const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
+            const int sched_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : active_sched;
             // Orch phase is a single instance (PR #971 design), so the orch
-            // pool count is always 1.
+            // pool count is always 1 regardless of orch_to_sched mode.
             const int orch_phase_threads = 1;
-            l2_swimlane_aicpu_init_phase(runtime->dev.worker_count, sched_phase_threads, orch_phase_threads);
+            l2_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
         l2_swimlane_level_ = L2SwimlaneLevel::DISABLED;
@@ -915,30 +910,6 @@ SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched
     if (!assign_cores_to_threads()) {
         return -1;
     }
-
-    // Profiling-subsystem buffer/state init: single-threaded cold path, so the
-    // "do it once" guarantee is structural (no CAS needed). Runs after
-    // handshake_all_cores / assign_cores_to_threads because pmu_aicpu_init needs
-    // physical_core_ids_ / cores_total_num_. Mirrors the l2_swimlane_aicpu_init
-    // convention above; the per-thread *_set_orch_thread_idx setters stay on the
-    // orchestrator thread (see aicpu_executor.cpp).
-#if PTO2_PROFILING
-    if (is_dump_args_enabled()) {
-        dump_args_init(active_sched_threads_);
-    }
-    if (is_pmu_enabled()) {
-        pmu_aicpu_init(physical_core_ids_, cores_total_num_);
-        LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
-    }
-    // dep_gen is host-driven (SubmitTrace) — runtime-gated by the host flag —
-    // and compiles out with the other profiling subsystems at PTO2_PROFILING=0.
-    // init() only pops the initial buffer from instance 0's free_queue; the
-    // orchestrator thread still records its idx via
-    // dep_gen_aicpu_set_orch_thread_idx() before the first record_submit.
-    if (is_dep_gen_enabled()) {
-        dep_gen_aicpu_init();
-    }
-#endif
 
     // Initialize task counters. Task count comes from PTO2 shared memory.
     if (runtime->get_gm_sm_ptr()) {
@@ -962,7 +933,7 @@ SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched
     completed_tasks_.store(0, std::memory_order_release);
 
     // Device orchestration: the orchestrator thread flips this when the graph is built.
-    orchestrator_done_.store(false, std::memory_order_release);
+    orchestrator_done_ = false;
 
     // Clear per-core dispatch payloads
     memset(payload_per_core_, 0, sizeof(payload_per_core_));
@@ -983,7 +954,7 @@ SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched
         }
     }
 
-    func_id_to_addr_ = runtime->dev.func_id_to_addr_;
+    func_id_to_addr_ = runtime->func_id_to_addr_;
 
     return 0;
 }
@@ -996,16 +967,9 @@ void SchedulerContext::deinit() {
         core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
     }
 
-    // No per-core memset of payload_per_core_ / deferred_slab_per_core_ here
-    // (~300 KB across all cores). Both are fully re-initialized at dispatch
-    // before they can be read: dispatch_task sets deferred_slab->count = 0 /
-    // error_code = NONE and build_payload() overwrites every payload field
-    // (function addr, args[], contexts, not_ready) on the exact [core][buf_idx]
-    // about to run. The consumer side cannot reach a stale slot either: the
-    // drain only services a core's running_reg_task_id, and the loop above
-    // already reset every core_exec_states_[].running/pending_reg_task_id to
-    // AICPU_TASK_INVALID — so no FIN for an undispatched slot is processed, and
-    // the count-gated consumer never reads entries[] past the fresh count.
+    // Clear per-core dispatch payloads
+    memset(payload_per_core_, 0, sizeof(payload_per_core_));
+    memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_));
 
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
     // would otherwise leave dirty pending/elected/ack state for the next reuse.
@@ -1017,7 +981,14 @@ void SchedulerContext::deinit() {
     // Reset task counters and orchestrator state
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
-    orchestrator_done_.store(false, std::memory_order_release);
+    orchestrator_done_ = false;
+    init_claimed_.store(false, std::memory_order_release);
+    init_complete_.store(false, std::memory_order_release);
+
+    // Reset core transition state
+    transition_requested_.store(false, std::memory_order_release);
+    wait_reassign_.store(0, std::memory_order_release);
+    reassigned_.store(false, std::memory_order_release);
     completed_.store(false, std::memory_order_release);
 
     // Reset core discovery and assignment state
@@ -1026,6 +997,7 @@ void SchedulerContext::deinit() {
     cores_total_num_ = 0;
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
+    orch_to_sched_ = false;
     active_sched_threads_ = 0;
     for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
         core_trackers_[t] = CoreTracker{};
@@ -1037,28 +1009,15 @@ void SchedulerContext::deinit() {
     func_id_to_addr_ = nullptr;
 }
 
+void SchedulerContext::wait_init_complete() const {
+    while (!init_complete_.load(std::memory_order_acquire)) {
+        SPIN_WAIT_HINT();
+    }
+}
+
 void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
     rt_ = rt;
     sched_ = &rt->scheduler;
-}
-
-void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx) {
-    while (!orchestration_done() && !completed_.load(std::memory_order_acquire)) {
-        if (thread_idx == 0 && sched_ != nullptr) {
-            // Use the wiring subsystem's normal batch/backoff policy while
-            // waiting. This still honors orch_needs_drain/producer_blocked
-            // signals without force-draining an empty queue every spin.
-            int wired = sched_->drain_wiring_queue(/*force_drain=*/false);
-            if (wired > 0) {
-                continue;
-            }
-        }
-        if (sched_ != nullptr && sched_->sm_header != nullptr &&
-            check_idle_fatal_error(thread_idx, sched_->sm_header, runtime) == LoopAction::BREAK_LOOP) {
-            break;
-        }
-        SPIN_WAIT_HINT();
-    }
 }
 
 // =============================================================================
@@ -1067,7 +1026,7 @@ void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runt
 // and drives the orchestrator → scheduler core transition (or fatal shutdown).
 // =============================================================================
 void SchedulerContext::on_orchestration_done(
-    Runtime *runtime, PTO2Runtime *rt, [[maybe_unused]] int32_t thread_idx, int32_t total_tasks
+    Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
 #if PTO2_PROFILING
     if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
@@ -1086,7 +1045,7 @@ void SchedulerContext::on_orchestration_done(
         rt->scheduler.tasks_completed.fetch_add(inline_completed, std::memory_order_relaxed);
 #endif
     }
-    orchestrator_done_.store(true, std::memory_order_release);
+    orchestrator_done_ = true;
 
     // Check for fatal error from orchestration; if so, shut down immediately.
     int32_t orch_err = 0;
@@ -1099,9 +1058,32 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 
+    // Skip core transition on fatal error — cores already shut down above.
+    if (completed_.load(std::memory_order_acquire)) {
+        // Signal transition to unblock scheduler threads waiting at core transition
+        transition_requested_.store(true, std::memory_order_release);
+        reassigned_.store(true, std::memory_order_release);
+    } else if (orch_to_sched_) {
+        LOG_INFO_V0("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
+        transition_requested_.store(true, std::memory_order_release);
+
+        // Wait for scheduler threads to acknowledge transition request
+        while (wait_reassign_.load(std::memory_order_acquire) != sched_thread_num_) {
+            if (completed_.load(std::memory_order_acquire)) {
+                break;
+            }
+            SPIN_WAIT_HINT();
+        }
+        if (!completed_.load(std::memory_order_acquire)) {
+            reassign_cores_for_all_threads();
+            reassigned_.store(true, std::memory_order_release);
+        }
+    }
+
 #if PTO2_PROFILING
-    // Write the core-to-thread mapping so the profiling data reflects the
-    // scheduler threads' final core distribution.
+    // Write core-to-thread mapping AFTER reassignment so the profiling data
+    // reflects the final distribution (all active_sched_threads_, including
+    // former orchestrator threads when orch_to_sched_ is enabled).
     if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
         l2_swimlane_aicpu_init_core_assignments(cores_total_num_);
         for (int32_t t = 0; t < active_sched_threads_; t++) {

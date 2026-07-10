@@ -13,9 +13,7 @@ description: Testing guide and pre-commit testing strategy for PTO Runtime. Use 
 
 ## Running Tests
 
-**Important**: Always read `.github/workflows/ci.yml` first to extract the
-current `--pto-session-timeout` values. PTO-ISA reproducibility comes from the
-repo-root `pto_isa.pin`.
+**Important**: Always read `.github/workflows/ci.yml` first to extract the current `--pto-isa-commit` and `--pto-session-timeout` values. These ensure reproducible builds by pinning the PTO-ISA dependency to a known-good commit.
 
 ### Runtime rebuild decision
 
@@ -43,23 +41,25 @@ ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure
 # C++ unit tests (a2a3 hardware)
 ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$" --output-on-failure
 
-# All simulation scene tests (extract --pto-session-timeout from ci.yml)
+# All simulation scene tests (extract --pto-isa-commit, --pto-session-timeout from ci.yml)
 pytest examples tests/st --platform a2a3sim \
-    --pto-session-timeout <timeout>
+    --clone-protocol https --pto-isa-commit <commit> --pto-session-timeout <timeout>
 
-# All hardware scene tests (extract timeout from ci.yml; auto-detect idle devs)
+# All hardware scene tests (extract --pto-isa-commit, --pto-session-timeout from ci.yml, auto-detect idle devices)
 pytest examples tests/st --platform a2a3 --device <range> \
-    --pto-session-timeout <timeout>
+    --clone-protocol https --pto-isa-commit <commit> --pto-session-timeout <timeout>
 
 # Single runtime
-pytest examples tests/st --platform a2a3sim --runtime host_build_graph
+pytest examples tests/st --platform a2a3sim --runtime host_build_graph \
+    --clone-protocol https --pto-isa-commit <commit>
 
 # Single example (pytest, uses pre-built binaries)
-pytest examples/a2a3/host_build_graph/vector_example --platform a2a3sim
+pytest examples/a2a3/host_build_graph/vector_example --platform a2a3sim \
+    --clone-protocol https --pto-isa-commit <commit>
 
 # Single example (standalone; re-run `pip install --no-build-isolation -e .` first if runtime C++ changed)
 python examples/a2a3/host_build_graph/vector_example/test_vector_example.py \
-    -p a2a3sim
+    -p a2a3sim --clone-protocol https --pto-isa-commit <commit>
 ```
 
 ## Pre-Commit Testing Strategy
