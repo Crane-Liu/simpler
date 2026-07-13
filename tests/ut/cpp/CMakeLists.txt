@@ -575,6 +575,10 @@ add_a2a3_orchestrator_runtime_test(test_a2a3_tensor_dump a2a3/test_tensor_dump.c
 add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
 add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_collector.cpp)
 
+# replay_graph has a separate runtime object set so its single-shot ABI and
+# lifecycle invariants are tested without mixing headers from the ring runtime.
+add_subdirectory(a2a3/replay_graph)
+
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------
