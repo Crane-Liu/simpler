@@ -21,7 +21,7 @@
 #include "pto_ring_buffer.h"
 #include "pto_shared_memory.h"
 
-TEST(ReplayGraphCacheKey, TracksMetadataAndScalarsButNotBoundaryAddress) {
+TEST(ReplayGraphCacheKey, TracksStructureButNotDynamicBindings) {
     uint32_t shape[] = {2, 4};
     PTO2GraphBindings first;
     first.tensor_count = 1;
@@ -37,7 +37,12 @@ TEST(ReplayGraphCacheKey, TracksMetadataAndScalarsButNotBoundaryAddress) {
 
     PTO2GraphBindings different_scalar = first;
     different_scalar.scalars[0] = 8;
-    EXPECT_NE(key, rt_graph_make_key(namespace_hash, different_scalar));
+    EXPECT_EQ(key, rt_graph_make_key(namespace_hash, different_scalar));
+
+    PTO2GraphBindings different_offset = first;
+    different_offset.tensors[0].start_offset = 4;
+    different_offset.tensors[0].version = 3;
+    EXPECT_EQ(key, rt_graph_make_key(namespace_hash, different_offset));
 
     uint32_t different_shape[] = {4, 4};
     PTO2GraphBindings different_metadata = first;
@@ -236,4 +241,101 @@ TEST_F(ReplayGraphOrchestratorTest, ReplayRestoresFrozenTaskDag) {
     ASSERT_NE(fanout, nullptr);
     EXPECT_EQ(fanout->slot_state, &replayed_consumer);
     EXPECT_EQ(fanout->next, nullptr);
+}
+
+TEST_F(ReplayGraphOrchestratorTest, ReplayPatchesDynamicScalarBindings) {
+    orch.begin_scope();
+    PTO2GraphBindings bindings;
+    bindings.scalar_count = 1;
+    bindings.scalars[0] = 7;
+    constexpr uint64_t callable_hash = 0x98fd637ae901204bULL;
+    uint64_t graph_key = rt_graph_make_key(PTO2_GRAPH_KEY("ut_dynamic_scalar_v1"), bindings);
+
+    PTO2GraphScopeResult record = orch.graph_begin(graph_key, bindings, callable_hash);
+    ASSERT_TRUE(record.execute_block);
+    L0TaskArgs args;
+    args.add_graph_scalar(7, 0);
+    ASSERT_TRUE(orch.submit_dummy_task(args).task_id().is_valid());
+    PTO2GraphCacheStats stats;
+    orch.graph_end(&stats);
+    ASSERT_EQ(stats.recorded, 1);
+
+    bindings.scalars[0] = 19;
+    EXPECT_EQ(graph_key, rt_graph_make_key(PTO2_GRAPH_KEY("ut_dynamic_scalar_v1"), bindings));
+    PTO2GraphScopeResult replay = orch.graph_begin(graph_key, bindings, callable_hash);
+    ASSERT_FALSE(replay.execute_block);
+    ASSERT_FALSE(orch.fatal);
+
+    auto &replayed = sm_handle->header->get_slot_state_by_task_id(1);
+    ASSERT_EQ(replayed.payload->scalar_count, 1);
+    EXPECT_EQ(replayed.payload->scalars[0], 19);
+}
+
+TEST_F(ReplayGraphOrchestratorTest, ReplayPatchesDynamicBoundaryView) {
+    orch.begin_scope();
+    uint16_t storage[12]{};
+    uint32_t full_shape[] = {3, 4};
+    Tensor full = make_tensor_external(storage, full_shape, 2, DataType::FLOAT16);
+    uint32_t row_shape[] = {1, 4};
+    uint32_t row0_offset[] = {0, 0};
+    Tensor row0 = full.view(row_shape, row0_offset);
+
+    PTO2GraphBindings bindings;
+    rt_graph_bind_tensor(bindings, row0);
+    constexpr uint64_t callable_hash = 0x72dbe260691f4c35ULL;
+    uint64_t graph_key = rt_graph_make_key(PTO2_GRAPH_KEY("ut_dynamic_view_v1"), bindings);
+    PTO2GraphScopeResult record = orch.graph_begin(graph_key, bindings, callable_hash);
+    ASSERT_TRUE(record.execute_block);
+    L0TaskArgs args;
+    args.add_input(row0);
+    ASSERT_TRUE(orch.submit_dummy_task(args).task_id().is_valid());
+    PTO2GraphCacheStats stats;
+    orch.graph_end(&stats);
+    ASSERT_EQ(stats.recorded, 1);
+
+    uint32_t row1_offset[] = {1, 0};
+    Tensor row1 = full.view(row_shape, row1_offset);
+    bindings.tensors[0].copy(row1);
+    EXPECT_EQ(graph_key, rt_graph_make_key(PTO2_GRAPH_KEY("ut_dynamic_view_v1"), bindings));
+    PTO2GraphScopeResult replay = orch.graph_begin(graph_key, bindings, callable_hash);
+    ASSERT_FALSE(replay.execute_block);
+    ASSERT_FALSE(orch.fatal);
+
+    auto &replayed = sm_handle->header->get_slot_state_by_task_id(1);
+    ASSERT_EQ(replayed.payload->tensor_count, 1);
+    EXPECT_EQ(replayed.payload->tensors[0].start_offset, row1.start_offset);
+    EXPECT_EQ(replayed.payload->tensors[0].shapes[0], 1);
+    EXPECT_EQ(replayed.payload->tensors[0].shapes[1], 4);
+}
+
+TEST_F(ReplayGraphOrchestratorTest, ReplayReconnectsBoundaryDependencies) {
+    orch.begin_scope();
+    uint16_t storage[4]{};
+    uint32_t shape[] = {4};
+    Tensor boundary = make_tensor_external(storage, shape, 1, DataType::FLOAT16);
+    PTO2GraphBindings bindings;
+    rt_graph_bind_tensor(bindings, boundary);
+    constexpr uint64_t callable_hash = 0xa4620738d8c04f91ULL;
+    uint64_t graph_key = rt_graph_make_key(PTO2_GRAPH_KEY("ut_boundary_dep_v1"), bindings);
+
+    PTO2GraphScopeResult record = orch.graph_begin(graph_key, bindings, callable_hash);
+    ASSERT_TRUE(record.execute_block);
+    L0TaskArgs args;
+    args.add_inout(boundary);
+    TaskOutputTensors recorded = orch.submit_dummy_task(args);
+    ASSERT_TRUE(recorded.task_id().is_valid());
+    PTO2GraphCacheStats stats;
+    orch.graph_end(&stats);
+    ASSERT_EQ(stats.recorded, 1);
+
+    PTO2GraphScopeResult replay = orch.graph_begin(graph_key, bindings, callable_hash);
+    ASSERT_FALSE(replay.execute_block);
+    ASSERT_FALSE(orch.fatal);
+
+    auto &recorded_slot = sm_handle->header->get_slot_state_by_task_id(recorded.task_id().local());
+    auto &replayed_slot = sm_handle->header->get_slot_state_by_task_id(1);
+    EXPECT_EQ(replayed_slot.fanin_count, 2);
+    PTO2DepListEntry *fanout = recorded_slot.fanout_head.load();
+    ASSERT_NE(fanout, nullptr);
+    EXPECT_EQ(fanout->slot_state, &replayed_slot);
 }
