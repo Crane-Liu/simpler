@@ -63,6 +63,7 @@ struct CallableArtifacts {
     std::vector<ArgDirection> signature;
     void *host_dlopen_handle{nullptr};  // hbg only
     void *host_orch_func_ptr{nullptr};  // hbg only
+    void (*host_orch_func_ptr_deleter)(void *){nullptr};
     const void *orch_so_data{nullptr};  // trb only
     size_t orch_so_size{0};             // trb only
     std::string func_name;              // trb only (orch entry symbol)

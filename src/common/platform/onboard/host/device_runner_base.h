@@ -316,6 +316,7 @@ public:
      */
     int record_host_orch_callable(
         int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+        void (*host_orch_func_ptr_deleter)(void *),
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
@@ -779,6 +780,7 @@ protected:
         // hbg path (host already dlopen'd the orch SO)
         void *host_dlopen_handle{nullptr};
         void *host_orch_func_ptr{nullptr};
+        void (*host_orch_func_ptr_deleter)(void *){nullptr};
     };
     struct OrchSoBuffer {
         void *dev_addr{nullptr};

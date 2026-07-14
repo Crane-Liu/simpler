@@ -441,9 +441,132 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if SIMPLER_ORCH_PROFILING
         int32_t pto2_submitted_tasks = -1;
 #endif
-        // Orchestrator thread: load + run the device orchestration SO. The braces
-        // scope the per-callable dlopen / SO-table locals to this block.
-        {
+        if (runtime->host_orch_enabled()) {
+#if SIMPLER_DFX
+            orch_cycle_start = get_sys_cnt_aicpu();
+#endif
+            void *sm_ptr = runtime->get_gm_sm_ptr();
+            const bool async_host_orch = runtime->host_orch_task_count() < 0;
+            auto *pending_header = static_cast<PTO2SharedMemoryHeader *>(sm_ptr);
+            if (async_host_orch) {
+                const uint64_t publish_wait_start = get_sys_cnt_aicpu();
+                while (pending_header->host_graph_publish_epoch.load(std::memory_order_acquire) == 0) {
+                    if (pending_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                        LOG_ERROR("Thread %d: HostGraph failed before first publication", thread_idx);
+                        runtime_init_ready_.store(true, std::memory_order_release);
+                        return -1;
+                    }
+                    if (get_sys_cnt_aicpu() - publish_wait_start > SCHEDULER_TIMEOUT_CYCLES) {
+                        LOG_ERROR("Thread %d: timed out waiting for first HostGraph publication", thread_idx);
+                        pending_header->orch_error_code.store(PTO2_ERROR_FLOW_CONTROL_DEADLOCK,
+                                                               std::memory_order_release);
+                        runtime_init_ready_.store(true, std::memory_order_release);
+                        return -1;
+                    }
+                    SPIN_WAIT_HINT();
+                }
+            }
+            uint64_t sm_size = 0;
+            {
+                AicpuPhaseScope arena_wire(AicpuPhase::ArenaWire);
+                void *prebuilt_arena = runtime->get_prebuilt_arena_base();
+                size_t off_runtime = runtime->get_prebuilt_runtime_offset();
+                if (prebuilt_arena == nullptr) {
+                    LOG_ERROR("Thread %d: Host O prebuilt_arena_base is null", thread_idx);
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+                runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
+                rt = reinterpret_cast<PTO2Runtime *>(static_cast<char *>(prebuilt_arena) + off_runtime);
+                runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+                sm_size = PTO2SharedMemoryHandle::calculate_size(rt->prebuilt_layout.sizing.task_window_size);
+            }
+            {
+                AicpuPhaseScope sm_reset(AicpuPhase::SmReset);
+                if (!rt->sm_handle->attach_populated(
+                        sm_ptr, sm_size, rt->prebuilt_layout.sizing.task_window_size
+                    )) {
+                    LOG_ERROR("Thread %d: Host O attach_populated failed", thread_idx);
+                    rt = nullptr;
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+                rt->aicore_mailbox->tail.store(
+                    rt->aicore_mailbox->head.load(std::memory_order_acquire), std::memory_order_release
+                );
+                runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
+                rt->graph_cache_enabled = false;
+                sched_ctx_.bind_runtime(rt);
+            }
+            runtime_init_ready_.store(true, std::memory_order_release);
+            if (async_host_orch) {
+                int32_t released_epoch = 0;
+                while (true) {
+                    PTO2SharedMemoryHeader *header = rt->orchestrator.sm_header;
+                    int32_t publish_epoch = header->host_graph_publish_epoch.load(std::memory_order_acquire);
+                    const uint64_t publish_wait_start = get_sys_cnt_aicpu();
+                    while (publish_epoch <= released_epoch) {
+                        if (header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE ||
+                            header->sched_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                            LOG_ERROR("Thread %d: HostGraph failed while waiting for epoch %d", thread_idx,
+                                      released_epoch + 1);
+                            return -1;
+                        }
+                        if (get_sys_cnt_aicpu() - publish_wait_start > SCHEDULER_TIMEOUT_CYCLES) {
+                            LOG_ERROR("Thread %d: timed out waiting for HostGraph epoch %d", thread_idx,
+                                      released_epoch + 1);
+                            header->orch_error_code.store(PTO2_ERROR_FLOW_CONTROL_DEADLOCK,
+                                                          std::memory_order_release);
+                            return -1;
+                        }
+                        SPIN_WAIT_HINT();
+                        publish_epoch = header->host_graph_publish_epoch.load(std::memory_order_acquire);
+                    }
+
+                    const int32_t task_begin = header->host_graph_task_begin.load(std::memory_order_acquire);
+                    const int32_t task_end = header->host_graph_task_end.load(std::memory_order_acquire);
+                    const int32_t final_publish = header->host_graph_final.load(std::memory_order_acquire);
+                    const int32_t expected_begin =
+                        rt->graph_pipeline.published_task_count.load(std::memory_order_acquire);
+                    if (task_begin != expected_begin || task_end < task_begin) {
+                        LOG_ERROR(
+                            "Thread %d: HostGraph epoch=%d has invalid range [%d,%d), expected begin=%d", thread_idx,
+                            publish_epoch, task_begin, task_end, expected_begin
+                        );
+                        header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+                        return -1;
+                    }
+
+                    const int32_t sealed_buffer = rt->graph_pipeline.active_buffer;
+                    if (final_publish != 0) rt->graph_pipeline.all_done.store(1, std::memory_order_release);
+                    rt_graph_boundary(rt);
+                    released_epoch = publish_epoch;
+                    header->device_graph_release_epoch.store(released_epoch, std::memory_order_release);
+
+                    PTO2ReplayGraphBufferControl &buffer = rt->graph_pipeline.buffers[sealed_buffer];
+                    if (buffer.exec_done.load(std::memory_order_acquire) != 0) {
+                        header->device_graph_complete_epoch.store(released_epoch, std::memory_order_release);
+                    }
+                    LOG_INFO_V0(
+                        "Thread %d: HostGraph released epoch=%d buffer=%d tasks=[%d,%d) final=%d", thread_idx,
+                        released_epoch, sealed_buffer, task_begin, task_end, final_publish
+                    );
+
+                    if (final_publish != 0) {
+                        sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, task_end);
+                        break;
+                    }
+                }
+                LOG_INFO_V0("Thread %d: async Host O scheduler boot complete", thread_idx);
+            } else {
+                sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, runtime->host_orch_task_count());
+                LOG_INFO_V0(
+                    "Thread %d: Host O scheduler boot complete (%d tasks)", thread_idx,
+                    runtime->host_orch_task_count()
+                );
+            }
+        } else {
+            // Device O consumes the orchestration SO loaded by register_callable.
             // Per-callable_id dispatch: the orch SO state lives in
             // `orch_so_table_[callable_id]`, loaded once by the
             // register_callable entry. The run path only consumes it — it never

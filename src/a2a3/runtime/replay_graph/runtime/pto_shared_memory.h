@@ -121,6 +121,15 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<int32_t> sched_stall_orch_done;    // orchestrator_done flag at timeout (0/1)
     std::atomic<int64_t> sched_stall_task_id;      // S1: stuck task_id (-1 if N/A)
     std::atomic<int32_t> sched_stall_core;         // S1: stuck core id (-1 if N/A)
+
+    // Host-O publishes task ranges by storing the epoch last. Device S
+    // acknowledges both release and completion before Host O reuses a slot.
+    std::atomic<int32_t> host_graph_publish_epoch;
+    std::atomic<int32_t> host_graph_task_begin;
+    std::atomic<int32_t> host_graph_task_end;
+    std::atomic<int32_t> host_graph_final;
+    std::atomic<int32_t> device_graph_release_epoch;
+    std::atomic<int32_t> device_graph_complete_epoch;
 };
 
 static_assert(
@@ -167,6 +176,10 @@ struct PTO2SharedMemoryHandle {
     // init_header. Returns false when `sm_size` is too small for the requested
     // `task_window_size`.
     bool init(void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size);
+
+    // Rebind pointers to a graph image populated by Host O without resetting
+    // its counters, task slots, or dependency state.
+    bool attach_populated(void *sm_base, uint64_t sm_size, uint64_t task_window_size);
 
     void destroy();
     void print_layout();

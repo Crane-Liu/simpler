@@ -951,6 +951,11 @@ struct PTO2SchedulerState {
             const int32_t completed = buffer.completed_count.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (completed >= buffer.task_count) {
                 buffer.exec_done.store(1, std::memory_order_release);
+                if (sm_header != nullptr) {
+                    sm_header->device_graph_complete_epoch.store(
+                        static_cast<int32_t>(buffer.graph_epoch + 1), std::memory_order_release
+                    );
+                }
                 if (!pto2_try_release_graph_buffer(buffer)) {
                     buffer.state.store(PTO2ReplayGraphBufferState::DONE, std::memory_order_release);
                 }

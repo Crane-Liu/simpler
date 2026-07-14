@@ -44,6 +44,8 @@ Runtime::Runtime() {
     dev.active_callable_id_ = -1;
     dev.graph_cache_enabled_ = false;
     dev.active_callable_hash_ = 0;
+    dev.host_orch_enabled_ = false;
+    dev.host_orch_task_count_ = 0;
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
         dev.func_id_to_addr_[i] = 0;
     }
@@ -77,6 +79,23 @@ void Runtime::set_graph_cache_config(bool enabled, uint64_t callable_hash) {
 bool Runtime::graph_cache_enabled() const { return dev.graph_cache_enabled_; }
 
 uint64_t Runtime::active_callable_hash() const { return dev.active_callable_hash_; }
+
+void Runtime::set_host_orch_result(int32_t task_count) {
+    dev.host_orch_enabled_ = true;
+    dev.host_orch_task_count_ = task_count;
+}
+
+bool Runtime::host_orch_enabled() const { return dev.host_orch_enabled_; }
+
+int32_t Runtime::host_orch_task_count() const { return dev.host_orch_task_count_; }
+
+void Runtime::set_host_orch_job(void *job) { host_orch_job_ = job; }
+
+void *Runtime::take_host_orch_job() {
+    void *job = host_orch_job_;
+    host_orch_job_ = nullptr;
+    return job;
+}
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;

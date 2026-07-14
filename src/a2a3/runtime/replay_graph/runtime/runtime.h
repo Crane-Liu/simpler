@@ -121,6 +121,7 @@ struct TensorLease {
     // keep the safe default of copying back.
     bool needs_copy_back = true;
     TensorReleaseKind release_kind = TensorReleaseKind::Free;
+    bool host_mapped = false;
 };
 
 /**
@@ -198,6 +199,11 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Graph record/replay is scoped to this callable's orchestration content.
     bool graph_cache_enabled_;
     uint64_t active_callable_hash_;
+
+    // Host orchestration publishes graph ranges asynchronously while the AICPU
+    // attaches each image and runs scheduler-only.
+    bool host_orch_enabled_;
+    int32_t host_orch_task_count_;
 };
 
 // =============================================================================
@@ -281,6 +287,11 @@ public:
     void set_graph_cache_config(bool enabled, uint64_t callable_hash);
     bool graph_cache_enabled() const;
     uint64_t active_callable_hash() const;
+    void set_host_orch_result(int32_t task_count);
+    bool host_orch_enabled() const;
+    int32_t host_orch_task_count() const;
+    void set_host_orch_job(void *job);
+    void *take_host_orch_job();
 
     uint64_t get_function_bin_addr(int func_id) const;
     /**
@@ -309,6 +320,7 @@ public:
     // runtime_maker.cpp from orch_args at bind time, then iterated in
     // validate_runtime_impl. Host-only (after `dev`): never uploaded.
     std::vector<TensorLease> tensor_leases_;
+    void *host_orch_job_{nullptr};
 };
 
 // `dev` must be the first member so the narrowed H2D copy starts at offset 0.

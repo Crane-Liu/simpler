@@ -338,6 +338,8 @@ struct HostOrchEntryPoints {
     OrchestrationBindFunc bind{nullptr};
 };
 
+void destroy_host_orch_entry_points(void *ptr) { delete static_cast<HostOrchEntryPoints *>(ptr); }
+
 // Run the orchestrator on the host. `rt` was built with its scheduler half
 // pointing at the device SM; here we re-point ONLY the orchestrator half at a
 // host SM mirror, run the orchestration entry against it, latch the submitted
@@ -659,6 +661,7 @@ register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const
         eps->bind = reinterpret_cast<OrchestrationBindFunc>(bind_sym);
         out->host_dlopen_handle = handle;
         out->host_orch_func_ptr = eps;
+        out->host_orch_func_ptr_deleter = destroy_host_orch_entry_points;
         LOG_INFO_V0("host-orch: loaded orchestration entry '%s' on host", orch_func_name);
     }
     LOG_INFO_V0("Orchestration SO: %zu bytes staged", orch_so_size);

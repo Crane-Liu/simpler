@@ -478,6 +478,7 @@ int SimDeviceRunnerBase::record_device_orch_callable(
 
 int SimDeviceRunnerBase::record_host_orch_callable(
     int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+    void (*host_orch_func_ptr_deleter)(void *),
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
@@ -498,6 +499,7 @@ int SimDeviceRunnerBase::record_host_orch_callable(
     CallableState state;
     state.host_dlopen_handle = host_dlopen_handle;
     state.host_orch_func_ptr = host_orch_func_ptr;
+    state.host_orch_func_ptr_deleter = host_orch_func_ptr_deleter;
     state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
@@ -516,7 +518,9 @@ int SimDeviceRunnerBase::unregister_callable(int32_t callable_id) {
     aicpu_seen_callable_ids_.erase(callable_id);
 
     if (state.host_dlopen_handle != nullptr) {
-        // hbg: dlclose the host handle; no orch SO refcount to decrement.
+        if (state.host_orch_func_ptr_deleter != nullptr) {
+            state.host_orch_func_ptr_deleter(state.host_orch_func_ptr);
+        }
         dlclose(state.host_dlopen_handle);
         return 0;
     }
@@ -730,6 +734,9 @@ void SimDeviceRunnerBase::release_callable_state() {
     // pytest sessions.
     for (auto &kv : callables_) {
         if (kv.second.host_dlopen_handle != nullptr) {
+            if (kv.second.host_orch_func_ptr_deleter != nullptr) {
+                kv.second.host_orch_func_ptr_deleter(kv.second.host_orch_func_ptr);
+            }
             dlclose(kv.second.host_dlopen_handle);
         }
     }

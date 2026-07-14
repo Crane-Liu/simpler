@@ -52,6 +52,8 @@ extern "C" {
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
 int validate_runtime_impl(Runtime *runtime, const HostApi *api);
+void configure_runtime_before_bind_impl(Runtime *runtime, const CallConfig *config, uint64_t callable_hash)
+    __attribute__((weak));
 
 /* ===========================================================================
  * Per-thread DeviceRunner binding
@@ -63,6 +65,23 @@ static void create_runner_key() { pthread_key_create(&g_runner_key, nullptr); }
 
 static SimDeviceRunnerBase *current_runner() {
     return static_cast<SimDeviceRunnerBase *>(pthread_getspecific(g_runner_key));
+}
+
+static void *capture_thread_context() { return current_runner(); }
+
+static int bind_thread_context(void *context) {
+    auto *runner = static_cast<SimDeviceRunnerBase *>(context);
+    if (runner == nullptr) return -1;
+    pthread_once(&g_runner_key_once, create_runner_key);
+    pthread_setspecific(g_runner_key, runner);
+    int rc = runner->attach_current_thread(runner->device_id());
+    if (rc != 0) pthread_setspecific(g_runner_key, nullptr);
+    return rc;
+}
+
+static void unbind_thread_context() {
+    pto_cpu_sim_bind_device(-1);
+    pthread_setspecific(g_runner_key, nullptr);
 }
 
 /* ===========================================================================
@@ -219,6 +238,9 @@ extern "C" int prewarm_config_impl(
 );
 
 static const HostApi g_host_api = {
+    .capture_thread_context = capture_thread_context,
+    .bind_thread_context = bind_thread_context,
+    .unbind_thread_context = unbind_thread_context,
     .device_malloc = device_malloc,
     .device_free = device_free,
     .copy_to_device = copy_to_device,
@@ -396,6 +418,11 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
                 dlclose(artifacts.host_dlopen_handle);
             }
         });
+        auto host_orch_ptr_guard = RAIIScopeGuard([&artifacts]() {
+            if (artifacts.host_orch_func_ptr_deleter != nullptr && artifacts.host_orch_func_ptr != nullptr) {
+                artifacts.host_orch_func_ptr_deleter(artifacts.host_orch_func_ptr);
+            }
+        });
 
         std::vector<std::pair<int, uint64_t>> kernel_addrs;
         kernel_addrs.reserve(artifacts.kernel_addrs.size());
@@ -406,11 +433,12 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
         bool needs_aicpu_register = false;
         if (artifacts.host_dlopen_handle != nullptr) {
             rc = runner->record_host_orch_callable(
-                callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
-                std::move(artifacts.signature)
+                callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr,
+                artifacts.host_orch_func_ptr_deleter, std::move(kernel_addrs), std::move(artifacts.signature)
             );
             if (rc == 0) {
                 host_dlopen_guard.dismiss();
+                host_orch_ptr_guard.dismiss();
             }
         } else {
             rc = runner->record_device_orch_callable(
@@ -514,6 +542,9 @@ int simpler_run(
         auto runtime_guard = RAIIScopeGuard([r]() {
             r->~Runtime();
         });
+        if (configure_runtime_before_bind_impl != nullptr) {
+            configure_runtime_before_bind_impl(r, config, runner->callable_hash(callable_id));
+        }
 
         // Platform device-memory hooks. host_api is a platform capability, not
         // runtime state — the shared g_host_api table (built once at load time)

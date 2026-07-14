@@ -43,6 +43,17 @@ bool PTO2SharedMemoryHandle::init(
     return true;
 }
 
+bool PTO2SharedMemoryHandle::attach_populated(
+    void *sm_base_arg, uint64_t sm_size_arg, uint64_t task_window_size
+) {
+    if (!sm_base_arg || sm_size_arg < calculate_size(task_window_size)) return false;
+    sm_base = sm_base_arg;
+    sm_size = sm_size_arg;
+    is_owner = false;
+    setup_pointers(task_window_size);
+    return true;
+}
+
 PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create_and_init_default(DeviceArena &arena) {
     const uint64_t buffer_size = calculate_size(PTO2_TASK_WINDOW_SIZE);
     const size_t off_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
@@ -87,6 +98,12 @@ void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t hea
     header->sched_stall_orch_done.store(0, std::memory_order_relaxed);
     header->sched_stall_task_id.store(-1, std::memory_order_relaxed);
     header->sched_stall_core.store(-1, std::memory_order_relaxed);
+    header->host_graph_publish_epoch.store(0, std::memory_order_relaxed);
+    header->host_graph_task_begin.store(0, std::memory_order_relaxed);
+    header->host_graph_task_end.store(0, std::memory_order_relaxed);
+    header->host_graph_final.store(0, std::memory_order_relaxed);
+    header->device_graph_release_epoch.store(0, std::memory_order_relaxed);
+    header->device_graph_complete_epoch.store(0, std::memory_order_relaxed);
 
     // Reset the full slot window before the first graph. Reused graph arenas
     // reset individual slots again during task preparation.

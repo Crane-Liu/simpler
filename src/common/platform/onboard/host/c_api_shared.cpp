@@ -57,6 +57,8 @@ extern "C" {
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
 int validate_runtime_impl(Runtime *runtime, const HostApi *api);
+void configure_runtime_before_bind_impl(Runtime *runtime, const CallConfig *config, uint64_t callable_hash)
+    __attribute__((weak));
 
 /* ===========================================================================
  * Per-thread DeviceRunnerBase binding (set by simpler_register_callable / simpler_run)
@@ -67,6 +69,20 @@ static pthread_once_t g_runner_key_once = PTHREAD_ONCE_INIT;
 static void create_runner_key() { pthread_key_create(&g_runner_key, nullptr); }
 
 static DeviceRunnerBase *current_runner() { return static_cast<DeviceRunnerBase *>(pthread_getspecific(g_runner_key)); }
+
+static void *capture_thread_context() { return current_runner(); }
+
+static int bind_thread_context(void *context) {
+    auto *runner = static_cast<DeviceRunnerBase *>(context);
+    if (runner == nullptr) return -1;
+    pthread_once(&g_runner_key_once, create_runner_key);
+    pthread_setspecific(g_runner_key, runner);
+    int rc = runner->attach_current_thread(runner->device_id());
+    if (rc != 0) pthread_setspecific(g_runner_key, nullptr);
+    return rc;
+}
+
+static void unbind_thread_context() { pthread_setspecific(g_runner_key, nullptr); }
 
 /* ===========================================================================
  * Internal device-memory functions (wired into a HostApi and passed to the
@@ -221,6 +237,9 @@ extern "C" int prewarm_config_impl(
 // time rather than reassembling the pointer table on each simpler_run. Passed by
 // address into bind_callable_to_runtime_impl / validate_runtime_impl.
 static const HostApi g_host_api = {
+    .capture_thread_context = capture_thread_context,
+    .bind_thread_context = bind_thread_context,
+    .unbind_thread_context = unbind_thread_context,
     .device_malloc = device_malloc,
     .device_free = device_free,
     .copy_to_device = copy_to_device,
@@ -432,6 +451,11 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
                 dlclose(artifacts.host_dlopen_handle);
             }
         });
+        auto host_orch_ptr_guard = RAIIScopeGuard([&artifacts]() {
+            if (artifacts.host_orch_func_ptr_deleter != nullptr && artifacts.host_orch_func_ptr != nullptr) {
+                artifacts.host_orch_func_ptr_deleter(artifacts.host_orch_func_ptr);
+            }
+        });
 
         // Re-pack ChildKernelAddr -> std::pair to match the existing
         // record_device_orch_callable* signature. The named struct only crosses
@@ -448,11 +472,12 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
         bool needs_aicpu_register = false;
         if (artifacts.host_dlopen_handle != nullptr) {
             rc = runner->record_host_orch_callable(
-                callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
-                std::move(artifacts.signature)
+                callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr,
+                artifacts.host_orch_func_ptr_deleter, std::move(kernel_addrs), std::move(artifacts.signature)
             );
             if (rc != 0) return rc;
             host_dlopen_guard.dismiss();
+            host_orch_ptr_guard.dismiss();
         } else {
             rc = runner->record_device_orch_callable(
                 callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
@@ -564,6 +589,9 @@ int simpler_run(
         auto runtime_guard = RAIIScopeGuard([r]() {
             r->~Runtime();
         });
+        if (configure_runtime_before_bind_impl != nullptr) {
+            configure_runtime_before_bind_impl(r, config, runner->callable_hash(callable_id));
+        }
         // Platform device-memory hooks. host_api is a platform capability, not
         // runtime state — the shared g_host_api table (built once at load time)
         // is passed explicitly into the runtime impls rather than stored on

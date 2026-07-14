@@ -28,6 +28,11 @@
  * the field set stays defined in exactly one place.
  */
 struct HostApi {
+    // Host-side async runtime work must inherit both the runner TLS and the
+    // backend's per-thread device binding before using any callback below.
+    void *(*capture_thread_context)();
+    int (*bind_thread_context)(void *context);
+    void (*unbind_thread_context)();
     void *(*device_malloc)(size_t size);
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
