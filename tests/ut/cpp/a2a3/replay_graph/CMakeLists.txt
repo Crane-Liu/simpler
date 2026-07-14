@@ -19,7 +19,7 @@ add_library(a2a3_replay_graph_rt_objs OBJECT
     ${REPLAY_GRAPH_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
     ${REPLAY_GRAPH_RUNTIME_DIR}/pto_orchestrator.cpp
     ${SRC_ROOT}/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
-    ${SRC_ROOT}/common/platform/shared/aicpu/tensor_dump_aicpu.cpp
+    ${SRC_ROOT}/common/platform/shared/aicpu/args_dump_aicpu.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
 target_include_directories(a2a3_replay_graph_rt_objs PUBLIC

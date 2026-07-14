@@ -10,14 +10,14 @@
  */
 
 #include "aicpu/scope_stats_collector_aicpu.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 
 // These collectors only record device-side diagnostics. Host orchestration
 // keeps their symbols local and disabled while sharing the orchestration core.
 __attribute__((weak, visibility("hidden"))) bool is_dump_args_enabled() { return false; }
 
 __attribute__((weak, visibility("hidden"))) void
-set_dump_args_task_mask(uint64_t, TensorDumpArgMask, TensorDumpArgMask) {}
+set_dump_args_task_mask(uint64_t, ArgsDumpArgMask, ArgsDumpArgMask) {}
 
 __attribute__((weak, visibility("hidden"))) void
 set_dump_args_task_scalar_dtypes(uint64_t, uint32_t, const uint8_t *) {}
