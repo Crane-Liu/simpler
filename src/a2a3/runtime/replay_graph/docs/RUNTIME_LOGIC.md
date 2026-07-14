@@ -2,22 +2,19 @@
 
 ## 1. Execution Contract
 
-`replay_graph` is a single-shot, two-phase runtime:
+`replay_graph` pipelines device orchestration and scheduling at explicit graph
+boundaries:
 
-1. One AICPU orchestrator executes the orchestration function to completion.
-2. Every task and dependency edge is materialized in a single graph arena.
-3. The orchestrator release-stores `orchestrator_done`.
-4. Scheduler threads acquire the barrier, seed the frozen graph's initially
-   ready tasks, and begin dispatch.
+1. One AICPU orchestrator builds graph N in the active graph arena.
+2. `rt_graph_boundary()` publishes graph N and releases its task publish gates.
+3. Scheduler threads execute graph N while the orchestrator builds graph N+1
+   in the other arena.
+4. The orchestrator reuses an arena only after its tasks have completed and the
+   following graph has finished adding cross-graph dependency edges.
 
-The scheduler never overlaps graph construction. A replay therefore has one
-ring identity (`ring_id == 0`) but no ring behavior: task slots, heap bytes,
-dependency entries, and TensorMap entries are allocated monotonically and are
-not reclaimed or reused until the next replay.
-
-This removes online wiring, wrap handling, watermarks, lifecycle retirement,
-and the synchronization they required. In exchange, configured capacities
-must hold the complete graph.
+The final `rt_orchestration_done()` call publishes any remaining tasks and
+marks the task stream complete. Scheduler threads start polling immediately
+after runtime initialization; there is no whole-orchestration dispatch barrier.
 
 ## 2. Lifecycle
 
@@ -27,180 +24,196 @@ Task state is monotonic:
 PENDING -> COMPLETED
 ```
 
-There is no `CONSUMED` state. Completion does not release producers, retire
-TensorMap entries, advance a tail, or reset a slot. Scopes preserve nesting,
-manual-dependency, DFX, and profiling semantics; they do not own resource
-lifetimes.
+There is no `CONSUMED` state. Graph-level arena controls provide the reuse
+contract instead:
 
-The pooled runtime arena may be reused by a later invocation. The AICPU resets
-shared-memory slots, bump allocators, ready-queue run state, and TensorMap epoch
-state before the next orchestration begins. This between-replay reset is not
-in-replay reclamation.
+```text
+FREE -> BUILDING -> RUNNING -> DONE -> FREE
+```
+
+`exec_done` means every task in the graph completed. `dep_closed` means the
+following graph can no longer append consumers to this graph's producers. Both
+conditions must hold before the physical task and heap arena is reused.
+
+Scopes preserve nesting, manual-dependency, DFX, and profiling semantics. A
+scope does not publish a graph and does not own an arena; only
+`rt_graph_boundary()` changes graph ownership.
 
 ## 3. Memory Ownership
 
 ### Shared memory
 
-`PTO2SharedMemoryHeader` owns the whole-graph communication image:
+`PTO2SharedMemoryHeader` contains:
 
-- `fc.task_count`: number of submitted tasks, frozen before scheduling
-- `task_descriptors[]`, `task_payloads[]`, `slot_states[]`
-- `orchestrator_done`: release/acquire phase barrier
-- graph output metadata and fatal/stall diagnostics
+- the monotonic logical task count;
+- `task_descriptors[]`, `task_payloads[]`, and `slot_states[]`;
+- `task_slot_map[]`, which maps a logical task id to a physical arena slot;
+- final orchestration, output, fatal-error, and stall state.
 
-Task id and slot are identical for the lifetime of a replay. There is no modulo
-slot mapping.
+Logical task ids remain dense and monotonic. Physical slots come from one of
+two half-window arenas, so task id and slot are not generally identical.
 
 ### Orchestrator arena
 
-The orchestrator owns all graph-construction storage:
+The orchestrator owns:
 
-- `PTO2TaskAllocator`: task id and heap bump pointers
-- `PTO2DepListPool`: every frozen producer-to-consumer fanout edge
-- `fanin_seen_epoch[]`: per-submit producer deduplication
-- `initial_ready[]`: tasks whose exact `fanin_count` is zero
-- `PTO2TensorMap`: automatic tensor dependency discovery
+- `PTO2TaskAllocator`, with two task-slot and heap bump arenas;
+- `PTO2DepListPool`, which holds fanout edges for the full invocation;
+- `fanin_seen_epoch[]`, used for per-submit producer deduplication;
+- `PTO2TensorMap`, used for automatic tensor dependency discovery;
+- graph-cache templates and record state.
+
+The dependency pool and TensorMap remain monotonic for the invocation. Only
+task slots and output heap bytes use graph-level ping-pong reuse.
 
 ### Scheduler arena
 
-The scheduler owns only execution-time structures such as ready queues,
-early-dispatch queues, async wait state, and profiling counters. It does not
-own dependency storage and cannot mutate graph topology.
+The scheduler owns ready queues, early-dispatch queues, async wait state, and
+profiling counters. It updates graph completion counters after the completed
+task's fanout walk is finished, so an arena cannot be reused while a scheduler
+still reads one of its slots.
 
 ## 4. Allocation
 
-`PTO2TaskAllocator` is a pure bump allocator. Each successful allocation:
+`PTO2TaskAllocator` divides the configured task window and heap equally between
+two graph arenas. Each successful allocation:
 
-1. reserves the next task id and same-numbered slot;
-2. aligns output storage to `PTO2_ALIGN_SIZE`;
-3. advances the heap top;
-4. release-publishes the new task count.
+1. reserves the next logical task id;
+2. reserves the next physical slot in the active arena;
+3. writes the logical-id-to-slot mapping;
+4. aligns and reserves output storage in the active heap arena;
+5. release-publishes the new logical task count.
 
-It never spins, wraps, observes scheduler progress, or moves a tail. Task-window
-or heap exhaustion is a fatal sizing error. `PTO2DepListPool` and TensorMap use
-the same whole-graph capacity contract.
+One graph must fit in one half of the task window and heap. Dependency-pool and
+TensorMap capacities must hold the complete orchestration invocation.
 
-The effective capacities come from RuntimeEnv slot 0, `PTO2_RING_*` environment
-variables, or compile-time defaults. The legacy names remain for command-line
-compatibility; comma-separated per-ring values are invalid for this runtime.
+## 5. Submit And Concurrent Wiring
 
-## 5. Submit And Wiring
+Every non-inline task starts with one synthetic publish dependency:
 
-`submit_task` performs graph construction inline:
-
-1. Allocate and bind the task descriptor, payload, slot state, and output
-   storage.
-2. Start a fresh `fanin_seen_epoch` for producer deduplication.
-3. For each explicit dependency, validate that it names an earlier ring-0 task
-   and call `append_fanin_or_fail`.
-4. Query TensorMap for creator and overlapping modifier dependencies and call
-   the same append helper for each result.
-5. For each unique pending producer, prepend one consumer entry to the
-   producer's frozen `fanout_head` and increment the consumer's exact
-   `fanin_count`.
-6. Initialize task payload and scheduling metadata.
-7. Insert outputs and inout modifiers into TensorMap.
-8. If `fanin_count == 0`, append the slot to `initial_ready[]`.
-
-There is no wiring queue, fanin storage in the payload, fanin builder, fanout
-lock, or `+1` sentinel. A synchronously completed hidden allocation producer
-does not contribute to `fanin_count` and does not receive a fanout edge.
-
-Explicit and TensorMap-derived references to the same producer are deduplicated
-by slot for that submit. Dependency pool use is therefore exactly the number of
-unique pending producer-to-consumer edges.
-
-## 6. Graph Freeze Barrier
-
-At orchestration completion, `mark_done()` logs final capacity use and performs:
-
-```cpp
-orchestrator_done.store(1, std::memory_order_release);
+```text
+fanin_count = 1
+fanin_refcount = 0
 ```
 
-Scheduler threads wait with an acquire load. One scheduler then publishes all
-`initial_ready[]` slots into routed ready queues. The once-guard is reset between
-replays. After the acquire, scheduler workers see immutable fanout lists, exact
-fanin counts, initialized payloads, and the final task count.
+`submit_task` then discovers explicit and TensorMap dependencies. For each
+unique pending producer, it:
 
-This ordering is why fanout writes need no lock and why wiring needs no
-sentinel. Any future design that overlaps orchestration and scheduling must
-restore an equivalent graph-publication synchronization protocol.
+1. increments the consumer's `fanin_count` before publishing the edge;
+2. pushes the consumer onto the producer's atomic `fanout_head` stack;
+3. treats the dependency as already satisfied if completion closed the stack
+   before the compare-and-swap succeeded.
+
+Publishing the count before the edge prevents a concurrent producer completion
+from making an incompletely built consumer ready. A producer completion
+atomically exchanges `fanout_head` with a CLOSED sentinel. An orchestrator
+append therefore either joins the list before closure or observes completion
+and omits the runtime edge.
+
+Graph recording captures the logical dependency before the completion check.
+The cached topology therefore does not depend on whether a prior-graph producer
+happened to finish while the next graph was being recorded.
+
+## 6. Graph Boundary
+
+`rt_graph_boundary()` performs the publication protocol:
+
+1. seals the active graph's logical task range;
+2. counts inline-completed allocation tasks;
+3. publishes the range and graph completion state;
+4. releases each pending task's synthetic publish dependency;
+5. closes dependency wiring for the graph in the next arena;
+6. waits until that arena has both `exec_done` and `dep_closed`;
+7. resets the reusable task and heap bumps and starts building there.
+
+The boundary release is the graph-freeze point. A task can receive completed
+producer notifications while it is being built, but it cannot enter a ready
+queue until its publish dependency is released.
 
 ## 7. Scheduling And Completion
 
-For a normal completion, the scheduler:
+Scheduler threads poll ready queues while orchestration is active. For a normal
+completion, the scheduler:
 
 1. marks the producer `COMPLETED`;
-2. traverses its immutable `fanout_head`;
-3. atomically increments each consumer's `fanin_refcount`;
+2. atomically closes and snapshots its fanout stack;
+3. increments each consumer's `fanin_refcount`;
 4. routes a consumer exactly once when
-   `fanin_refcount == fanin_count`.
+   `fanin_refcount == fanin_count`;
+5. updates the producer graph's completion count after the fanout walk.
 
-The scheduler exits based on completed task count, including synchronously
-completed hidden allocation tasks accounted by the orchestrator. It does not
-wait for a consumer lifecycle or drain a reclaim queue.
+Dummy and deferred-completion tasks use the same final completion hook, so they
+participate in arena reuse accounting without special cases.
 
-Dummy tasks have no active AICore mask. They enter the dummy ready queue and
-complete inline, propagating dependencies without launching a kernel.
+The scheduler exits only after final orchestration completion and the total
+completed task count reaches the final logical task count.
 
-## 8. Early Dispatch
+## 8. Graph Record And Replay
 
-Latest-main early-dispatch and sync-start scheduling are retained, but they run
-only after the graph-freeze barrier.
+`PTO2_GRAPH_SCOPE(key, bindings)` records a task-DAG template on a cache miss.
+On a hit, the runtime skips the orchestration block and materializes task
+descriptors, payload values, outputs, and fanout edges directly in the active
+graph arena.
 
-`dispatch_fanin` is not seeded by `submit_task`. It starts at zero and is
-advanced by scheduler propagation when a producer's launch payload is fully
-published. A consumer becomes an early-dispatch candidate when
-`dispatch_fanin == slot_state.fanin_count`. This counter is an execution-time
-launch-readiness signal; `fanin_refcount` remains the completion-readiness
-signal.
+Replayed tasks receive the same synthetic publish dependency as normally
+submitted tasks. Replay does not seed a separate initial-ready list;
+`rt_graph_boundary()` releases the restored DAG after all slots and edges are
+materialized.
 
-The graph itself remains immutable while these counters and queue states evolve.
+The V1 cache is process-local and supports boundary-tensor write graphs. Cache
+keys include the runtime schema, callable content hash, user namespace, tensor
+metadata, and bound scalar values.
 
-## 9. TensorMap
+## 9. Early Dispatch
 
-TensorMap stores producer metadata for automatic RAW/WAW dependency discovery.
-Entries remain valid for the entire replay. Lookup does not test a retirement
-watermark, and no per-task TensorMap chain or cleanup cursor exists.
+The publish dependency also participates in `dispatch_fanin`. Boundary
+publication accounts for that dependency before releasing completion fanin.
+Internal producer launches can then advance `dispatch_fanin` to the task's
+final `fanin_count` and retain the existing early-dispatch behavior.
 
-Bucket epochs allow the pooled TensorMap allocation to be reset cheaply between
-replays. Within one graph, capacity must accommodate all live entries. Pool
-exhaustion is fatal rather than a request to reclaim completed tasks.
+A cross-graph producer may publish before or during the boundary operation. In
+that race, early staging is opportunistic; completion readiness remains exact
+because it uses the atomic fanout-close protocol and `fanin_refcount`.
 
-## 10. Scalar Data Access
+## 10. TensorMap And Data Access
+
+TensorMap entries remain valid for the invocation and are reset by epoch between
+runtime invocations. Newer producer entries shadow prior graph entries for the
+same tensor region.
+
+An entry stores a logical producer task id. Resolving that id through
+`task_slot_map` is valid only while the slot's task descriptor still carries the
+same logical id. A mismatch means the producer's arena has already completed
+and been reused, so the dependency is already satisfied and must be skipped.
+This snapshot check prevents an old TensorMap entry or cached external fanin
+from being attached to the unrelated task that now occupies the physical slot.
 
 `get_tensor_data` and `set_tensor_data` can wait for producer completion, but
-the single-shot lifecycle cannot wait for consumer retirement. Consequently,
-`set_tensor_data` provides WAW protection only, not WAR protection.
-
-Because scheduler dispatch begins after orchestration finishes, orchestration
-must not synchronously read data produced by a task submitted in the same
-replay. Such dynamic data-dependent orchestration belongs to an overlapping
-runtime, not this two-phase model.
+there is no consumer-retirement state. `set_tensor_data` therefore provides WAW
+protection, not WAR protection.
 
 ## 11. Capacity Failures
 
-The following indicate an undersized complete-graph arena and fail fast:
+The following fail fast:
 
-- task window overflow;
-- heap overflow;
-- dependency pool overflow;
-- TensorMap pool overflow;
-- initial-ready handoff overflow.
+- one graph exceeds half of the task window;
+- one graph exceeds half of the output heap;
+- the invocation exceeds the dependency pool;
+- the invocation exceeds TensorMap capacity;
+- a graph-cache template exceeds its fixed record/export capacities.
 
-Sizing should include all hidden allocation tasks, output buffers, unique
-dependency edges, and TensorMap producer entries generated by the orchestration.
+Graph-cache capacity failure falls back to normal orchestration when no runtime
+state has been partially materialized. Runtime arena exhaustion is fatal.
 
 ## 12. Invariants
 
 - `ring_id == 0` for every task.
-- `slot == task_id.local()` and a slot is initialized once per replay.
-- Orchestration finishes before any scheduler dispatch.
-- Only the orchestrator writes graph topology.
-- Scheduler workers only read fanout topology after the acquire barrier.
-- `fanin_count` is the exact number of unique pending producers, with no
-  sentinel.
-- `fanin_count == 0` is the only initial-ready criterion.
-- No task, heap byte, dependency entry, or TensorMap entry is reclaimed within
-  a replay.
+- Logical task ids are dense; `task_slot_map` resolves physical slots.
+- A task has one publish dependency plus its unique pending producers.
+- A graph is dispatchable only after `rt_graph_boundary()` releases its publish
+  dependencies.
+- Fanout append and completion-close are atomic and cannot lose an edge.
+- A resolved dependency slot is used only when its task-id snapshot matches the
+  requested logical producer id.
+- A physical arena is reused only when `exec_done && dep_closed`.
+- Dependency-pool and TensorMap storage are not reclaimed within an invocation.

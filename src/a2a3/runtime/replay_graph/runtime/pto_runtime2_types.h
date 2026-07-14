@@ -59,7 +59,46 @@
 // Configuration Constants
 // =============================================================================
 
-// Task management. replay_graph fills one task window exactly once.
+// Two physical arenas let O build graph N+1 while S executes graph N.
+inline constexpr int32_t PTO2_REPLAY_GRAPH_BUFFER_COUNT = 2;
+
+enum class PTO2ReplayGraphBufferState : int32_t {
+    FREE = 0,
+    BUILDING = 1,
+    RUNNING = 2,
+    DONE = 3,
+};
+
+struct PTO2ReplayGraphBufferControl {
+    std::atomic<PTO2ReplayGraphBufferState> state;
+    std::atomic<int32_t> exec_done;
+    std::atomic<int32_t> dep_closed;
+    std::atomic<int32_t> completed_count;
+    int32_t buffer_id;
+    uint64_t graph_epoch;
+    int32_t task_begin;
+    int32_t task_count;
+};
+
+struct PTO2ReplayGraphPipelineState {
+    std::atomic<int32_t> all_done;
+    std::atomic<int32_t> published_task_count;
+    int32_t active_buffer;
+    int32_t graph_count;
+    uint64_t current_graph_epoch;
+    PTO2ReplayGraphBufferControl buffers[PTO2_REPLAY_GRAPH_BUFFER_COUNT];
+};
+
+inline bool pto2_try_release_graph_buffer(PTO2ReplayGraphBufferControl &buffer) {
+    if (buffer.exec_done.load(std::memory_order_acquire) == 0 ||
+        buffer.dep_closed.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
+    buffer.state.store(PTO2ReplayGraphBufferState::FREE, std::memory_order_release);
+    return true;
+}
+
+// Task management. Each graph must fit in one half of the task window.
 #define PTO2_TASK_WINDOW_SIZE 16384
 
 // Memory pools. Each pool must hold the complete replay graph.
@@ -70,7 +109,7 @@
 
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH 64  // Maximum nesting depth
-// Every task may be initially ready, so the handoff array is window-sized.
+// Maximum logical tasks retained by diagnostics and completion accounting.
 #define PTO2_SCOPE_TASKS_CAP PTO2_TASK_WINDOW_SIZE
 
 // Ready queue
@@ -146,6 +185,12 @@ struct PTO2DepListEntry {
     PTO2TaskSlotState *slot_state;  // Consumer slot state (direct pointer)
     PTO2DepListEntry *next;         // next entry
 };
+
+inline PTO2DepListEntry *pto2_fanout_closed_sentinel() {
+    return reinterpret_cast<PTO2DepListEntry *>(static_cast<uintptr_t>(1));
+}
+
+inline bool pto2_is_fanout_closed(PTO2DepListEntry *ptr) { return ptr == pto2_fanout_closed_sentinel(); }
 
 // =============================================================================
 // Task Descriptor
@@ -367,8 +412,9 @@ static_assert(
  * structure (32 bytes = half a cache line). Accessing any field of a task's
  * slot state brings all related fields into the same cache line.
  *
- * fanout_head is written only by the single orchestrator thread and frozen
- * before scheduler threads pass the orchestrator_done acquire barrier.
+ * fanout_head is an atomic intrusive stack. Completion closes it with a
+ * sentinel, so a concurrent orchestrator append either joins the list before
+ * completion or observes that the producer is already complete.
  */
 
 enum PTO2ReadyState : uint8_t {
@@ -385,7 +431,7 @@ enum PTO2DeferredCompletionFlag : uint8_t {
 };
 
 struct alignas(64) PTO2TaskSlotState {
-    PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
+    std::atomic<PTO2DepListEntry *> fanout_head;  // nullptr = empty, CLOSED = producer completed
 
     // Task state (completion and ready checks)
     std::atomic<PTO2TaskState> task_state;  // PENDING/COMPLETED

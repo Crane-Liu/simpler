@@ -104,10 +104,6 @@ public:
     // mode where rt is created by the orchestrator thread after init().
     void bind_runtime(PTO2Runtime *rt);
 
-    // Serial orch->sched mode pre-dispatch wait. No AICore dispatch happens
-    // before orchestrator_done_.
-    void wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx);
-
     // =========================================================================
     // State queries / external synchronization points
     // =========================================================================
@@ -156,9 +152,8 @@ private:
     // --- Task-execution tracking ---
     std::atomic<int32_t> completed_tasks_{0};
     int32_t total_tasks_{0};
-    // Device orchestration: set by last orchestrator when graph is built; schedulers poll it.
+    // Device orchestration: set after the final graph has been published.
     std::atomic<bool> orchestrator_done_{false};
-    std::atomic<bool> initial_ready_seeded_{false};
     std::atomic<bool> completed_{false};
     uint64_t *func_id_to_addr_{nullptr};
 
@@ -410,7 +405,6 @@ private:
         uint64_t dispatch_ts, uint64_t finish_ts
 #endif
     );
-
     static void promote_pending_to_running(CoreExecState &core);
     static void clear_running_slot(CoreExecState &core);
 

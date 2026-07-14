@@ -15,7 +15,7 @@
  *
  * Memory Layout:
  *   +---------------------------+
- *   | SharedMemoryHeader        |  (whole-graph flow control + sync)
+ *   | SharedMemoryHeader        |  (task publication + final completion)
  *   +---------------------------+
  *   | TaskDescriptor[]          |
  *   | TaskPayload[]             |
@@ -42,7 +42,7 @@
 struct PTO2SharedMemoryHandle;
 
 struct alignas(64) PTO2FlowControl {
-    // Frozen to the complete graph size before schedulers leave the phase barrier.
+    // Monotonic logical task count published as graph construction advances.
     alignas(64) std::atomic<int32_t> task_count;
 
     void init() { task_count.store(0, std::memory_order_relaxed); }
@@ -54,7 +54,7 @@ static_assert(sizeof(PTO2FlowControl) == 64, "PTO2FlowControl must be exactly on
 /**
  * Shared memory header structure
  *
- * Contains the single-shot graph layout and orchestration/scheduler handoff.
+ * Contains logical task publication state and orchestration/scheduler handoff.
  */
 struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     PTO2FlowControl fc;
@@ -67,17 +67,25 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
+    int32_t *task_slot_map;
 
-    int32_t get_slot_by_task_id(int32_t task_id) { return task_id; }
+    int32_t get_slot_by_task_id(int32_t task_id) {
+        int32_t map_slot = task_id & task_window_mask;
+        return task_slot_map ? task_slot_map[map_slot] : map_slot;
+    }
     PTO2TaskDescriptor &get_task_by_slot(int32_t slot) { return task_descriptors[slot]; }
-    PTO2TaskDescriptor &get_task_by_task_id(int32_t task_id) { return task_descriptors[task_id]; }
+    PTO2TaskDescriptor &get_task_by_task_id(int32_t task_id) { return task_descriptors[get_slot_by_task_id(task_id)]; }
     PTO2TaskPayload &get_payload_by_slot(int32_t slot) { return task_payloads[slot]; }
-    PTO2TaskPayload &get_payload_by_task_id(int32_t task_id) { return task_payloads[task_id]; }
+    PTO2TaskPayload &get_payload_by_task_id(int32_t task_id) { return task_payloads[get_slot_by_task_id(task_id)]; }
     PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
-    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t task_id) { return slot_states[task_id]; }
+    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t task_id) { return slot_states[get_slot_by_task_id(task_id)]; }
+    PTO2TaskSlotState *find_live_slot_state(PTO2TaskId task_id) {
+        PTO2TaskSlotState &slot = get_slot_state_by_task_id(static_cast<int32_t>(task_id.local()));
+        return slot.task != nullptr && slot.task->task_id == task_id ? &slot : nullptr;
+    }
 
     // === GLOBAL FIELDS ===
-    alignas(64) std::atomic<int32_t> orchestrator_done;  // release/acquire graph-freeze barrier
+    alignas(64) std::atomic<int32_t> orchestrator_done;  // final task-stream completion
 
     // Total shared memory size (for validation)
     uint64_t total_size;
@@ -201,6 +209,7 @@ struct PTO2SegmentOffsets {
     uint64_t descriptors;
     uint64_t payloads;
     uint64_t slot_states;
+    uint64_t task_slot_map;
     uint64_t end;
 };
 
@@ -213,6 +222,8 @@ inline PTO2SegmentOffsets segment_offsets(uint64_t task_window_size) noexcept {
     off += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
     result.slot_states = off;
     off += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+    result.task_slot_map = off;
+    off += PTO2_ALIGN_UP(task_window_size * sizeof(int32_t), PTO2_ALIGN_SIZE);
     result.end = off;
     return result;
 }
@@ -226,6 +237,12 @@ inline PTO2TaskDescriptor *task_descriptors_addr(void *sm_dev_base, uint64_t tas
 inline PTO2TaskSlotState *slot_states_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
     return reinterpret_cast<PTO2TaskSlotState *>(
         static_cast<char *>(sm_dev_base) + segment_offsets(task_window_size).slot_states
+    );
+}
+
+inline int32_t *task_slot_map_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
+    return reinterpret_cast<int32_t *>(
+        static_cast<char *>(sm_dev_base) + segment_offsets(task_window_size).task_slot_map
     );
 }
 

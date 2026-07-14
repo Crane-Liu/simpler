@@ -167,6 +167,38 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
             args.add_inout(ext_Y);
             rt_submit_aic_task(FUNC_COPY_FIRST, args);
         }
+    } else if (case_id == 5) {
+        PTO2GraphBindings bindings;
+        bindings.tensor_count = 3;
+        bindings.scalar_count = 1;
+        bindings.tensors[0].copy(ext_X);
+        bindings.tensors[1].copy(ext_Y);
+        bindings.tensors[2].copy(ext_W);
+        bindings.scalars[0] = case_id;
+        PTO2_GRAPH_SCOPE(rt_graph_make_key(PTO2_GRAPH_KEY("dummy_task_record_replay_v1"), bindings), bindings) {
+            L0TaskArgs producer_args;
+            producer_args.add_inout(ext_X);
+            rt_submit_aic_task(FUNC_WRITE_CONST, producer_args);
+
+            L0TaskArgs barrier_args;
+            barrier_args.add_inout(ext_X);
+            rt_submit_dummy_task(barrier_args);
+
+            L0TaskArgs consumer_args;
+            consumer_args.add_input(ext_X);
+            consumer_args.add_inout(ext_Y);
+            rt_submit_aic_task(FUNC_COPY_FIRST, consumer_args);
+        }
+    } else if (case_id == 6) {
+        L0TaskArgs producer_args;
+        producer_args.add_inout(ext_X);
+        rt_submit_aic_task(FUNC_WRITE_CONST, producer_args);
+        rt_graph_boundary();
+
+        L0TaskArgs consumer_args;
+        consumer_args.add_input(ext_X);
+        consumer_args.add_inout(ext_Y);
+        rt_submit_aic_task(FUNC_COPY_FIRST, consumer_args);
     } else {
         rt_report_fatal(PTO2_ERROR_INVALID_ARGS, "unsupported case_id=%llu", static_cast<unsigned long long>(case_id));
     }

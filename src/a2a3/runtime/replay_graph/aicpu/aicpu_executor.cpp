@@ -115,7 +115,6 @@ struct OrchSoEntry {
 
 struct AicpuExecutor {
     int32_t sched_thread_num_;
-    bool serial_orch_sched_{false};
 
     // ===== Thread management state =====
     std::atomic<int32_t> thread_idx_{0};
@@ -241,7 +240,6 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         // The 0 → 1 fixup already applied above; derive scheduler count from it.
         aicpu_thread_num_ = nthreads;
         sched_thread_num_ = nthreads - 1;
-        serial_orch_sched_ = runtime->dev.serial_orch_sched;
 
         hs_arrived_.store(0, std::memory_order_relaxed);
         if (sched_ctx_.pre_handshake_init(runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs()) != 0) {
@@ -561,8 +559,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 );
             }
 
-            // Reset SM state between replays. No resource is reclaimed while a
-            // frozen graph is executing.
+            // Reset SM state between runtime invocations. In-run arena reuse is
+            // controlled by graph completion and dependency-closure state.
             {
                 AicpuPhaseScope sm_reset(AicpuPhase::SmReset);
                 memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
@@ -598,6 +596,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 // Fill ops / core counts (host can't resolve s_runtime_ops's
                 // device address nor know the SchedulerContext's core fan-out).
                 runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
+                rt->graph_cache_enabled = runtime->graph_cache_enabled();
+                rt->active_callable_hash = runtime->active_callable_hash();
+                rt->graph_cache_stats = PTO2GraphCacheStats{};
 #if SIMPLER_DFX
                 rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
                 {
@@ -648,6 +649,16 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt_scope_begin(rt);
             (*p_func)(orch_args_cached_);
             rt_scope_end(rt);
+
+            if (rt->graph_cache_enabled) {
+                LOG_INFO_V0(
+                    "[GraphCache] stats recorded=%llu missed=%llu replayed=%llu overflow=%llu",
+                    static_cast<unsigned long long>(rt->graph_cache_stats.recorded),
+                    static_cast<unsigned long long>(rt->graph_cache_stats.missed),
+                    static_cast<unsigned long long>(rt->graph_cache_stats.replayed),
+                    static_cast<unsigned long long>(rt->graph_cache_stats.overflow)
+                );
+            }
 
 #if SIMPLER_DFX
             // Flush the (potentially partially-filled) DepGenBuffer so the host
@@ -774,7 +785,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
         } else {
             sched_ctx_.bind_runtime(rt);
-            sched_ctx_.wait_for_orchestration_done_before_dispatch(runtime, thread_idx);
             int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
@@ -836,7 +846,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
-    serial_orch_sched_ = false;
 
     orch_args_cached_.reset();
     // orch_so_table_ entries are intentionally preserved across deinit: they

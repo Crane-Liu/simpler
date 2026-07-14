@@ -20,6 +20,56 @@
 
 #include "pto_orchestration_api.h"
 
+static inline void qwen3_graph_add_tensor(PTO2GraphBindings &bindings, const Tensor &tensor) {
+    if (bindings.tensor_count >= PTO2_GRAPH_MAX_BOUNDARY_TENSORS) {
+        bindings.overflow = true;
+        return;
+    }
+    bindings.tensors[bindings.tensor_count++].copy(tensor);
+}
+
+static inline void qwen3_graph_add_scalar(PTO2GraphBindings &bindings, uint64_t scalar) {
+    if (bindings.scalar_count >= PTO2_GRAPH_MAX_BOUNDARY_SCALARS) {
+        bindings.overflow = true;
+        return;
+    }
+    bindings.scalars[bindings.scalar_count++] = scalar;
+}
+
+static PTO2GraphBindings make_qwen3_layer_graph_bindings(
+    const Tensor &cur, const Tensor &next_hidden, const Tensor &ext_input_rms_weight, const Tensor &ext_wq,
+    const Tensor &ext_wk, const Tensor &ext_wv, const Tensor &ext_q_norm_weight, const Tensor &ext_k_norm_weight,
+    const Tensor &ext_seq_lens, const Tensor &ext_block_table, const Tensor &ext_slot_mapping,
+    const Tensor &ext_rope_cos, const Tensor &ext_rope_sin, const Tensor &ext_k_cache, const Tensor &ext_v_cache,
+    const Tensor &ext_wo, const Tensor &ext_w_gate, const Tensor &ext_w_up, const Tensor &ext_w_down,
+    const Tensor &ext_post_rms_weight, const Tensor &ext_out, int64_t layer_index
+) {
+    PTO2GraphBindings bindings;
+    qwen3_graph_add_tensor(bindings, cur);
+    qwen3_graph_add_tensor(bindings, next_hidden);
+    qwen3_graph_add_tensor(bindings, ext_input_rms_weight);
+    qwen3_graph_add_tensor(bindings, ext_wq);
+    qwen3_graph_add_tensor(bindings, ext_wk);
+    qwen3_graph_add_tensor(bindings, ext_wv);
+    qwen3_graph_add_tensor(bindings, ext_q_norm_weight);
+    qwen3_graph_add_tensor(bindings, ext_k_norm_weight);
+    qwen3_graph_add_tensor(bindings, ext_seq_lens);
+    qwen3_graph_add_tensor(bindings, ext_block_table);
+    qwen3_graph_add_tensor(bindings, ext_slot_mapping);
+    qwen3_graph_add_tensor(bindings, ext_rope_cos);
+    qwen3_graph_add_tensor(bindings, ext_rope_sin);
+    qwen3_graph_add_tensor(bindings, ext_k_cache);
+    qwen3_graph_add_tensor(bindings, ext_v_cache);
+    qwen3_graph_add_tensor(bindings, ext_wo);
+    qwen3_graph_add_tensor(bindings, ext_w_gate);
+    qwen3_graph_add_tensor(bindings, ext_w_up);
+    qwen3_graph_add_tensor(bindings, ext_w_down);
+    qwen3_graph_add_tensor(bindings, ext_post_rms_weight);
+    qwen3_graph_add_tensor(bindings, ext_out);
+    qwen3_graph_add_scalar(bindings, static_cast<uint64_t>(layer_index));
+    return bindings;
+}
+
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
@@ -69,9 +119,20 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         }
         Tensor cur__rv_v7 = cur;
         for (int64_t i = 0; i < 3; i += 1) {
-            PTO2_SCOPE() {
-                uint32_t next_hidden_ci_shapes[2] = {16, 5120};
-                TensorCreateInfo next_hidden_ci(next_hidden_ci_shapes, 2, DataType::BFLOAT16);
+            uint32_t next_hidden_ci_shapes[2] = {16, 5120};
+            TensorCreateInfo next_hidden_ci(next_hidden_ci_shapes, 2, DataType::BFLOAT16);
+            TaskOutputTensors next_hidden_alloc = alloc_tensors(next_hidden_ci);
+            const Tensor &next_hidden = next_hidden_alloc.get_ref(0);
+            PTO2GraphBindings layer_graph_bindings = make_qwen3_layer_graph_bindings(
+                cur__rv_v7, next_hidden, ext_input_rms_weight, ext_wq, ext_wk, ext_wv, ext_q_norm_weight,
+                ext_k_norm_weight, ext_seq_lens, ext_block_table, ext_slot_mapping, ext_rope_cos, ext_rope_sin,
+                ext_k_cache, ext_v_cache, ext_wo, ext_w_gate, ext_w_up, ext_w_down, ext_post_rms_weight, ext_out, i
+            );
+            PTO2_GRAPH_SCOPE(
+                rt_graph_make_key(PTO2_GRAPH_KEY("qwen3_decode_3layer_layer_v1"), layer_graph_bindings),
+                layer_graph_bindings
+            ) {
+                PTO2_SCOPE() {
                 uint32_t normed_states_inline146_ci_shapes[2] = {16, 5120};
                 TensorCreateInfo normed_states_inline146_ci(normed_states_inline146_ci_shapes, 2, DataType::BFLOAT16);
                 uint32_t out_partial_inline312_ci_shapes[2] = {16, 5120};
@@ -103,28 +164,27 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 uint32_t k_proj_norm_inline155_ci_shapes[2] = {16, 1024};
                 TensorCreateInfo k_proj_norm_inline155_ci(k_proj_norm_inline155_ci_shapes, 2, DataType::FLOAT32);
                 TaskOutputTensors alloc_1 = alloc_tensors(
-                    next_hidden_ci, normed_states_inline146_ci, out_partial_inline312_ci, inv_rms_states_inline160_ci,
+                    normed_states_inline146_ci, out_partial_inline312_ci, inv_rms_states_inline160_ci,
                     q_proj_inline129_ci, k_proj_inline128_ci, v_proj_inline152_ci, all_q_padded_inline168_ci,
                     attn_out_inline157_ci, all_oi_tmp_inline145_ci, all_cur_mi_inline174_ci, all_cur_li_inline190_ci,
                     fa_work_table_inline126_ci, fa_total_inline183_ci, q_proj_norm_inline197_ci,
                     k_proj_norm_inline155_ci
                 );
-                const Tensor &next_hidden = alloc_1.get_ref(0);
-                const Tensor &normed_states_inline146 = alloc_1.get_ref(1);
-                const Tensor &out_partial_inline312 = alloc_1.get_ref(2);
-                const Tensor &inv_rms_states_inline160 = alloc_1.get_ref(3);
-                const Tensor &q_proj_inline129 = alloc_1.get_ref(4);
-                const Tensor &k_proj_inline128 = alloc_1.get_ref(5);
-                const Tensor &v_proj_inline152 = alloc_1.get_ref(6);
-                const Tensor &all_q_padded_inline168 = alloc_1.get_ref(7);
-                const Tensor &attn_out_inline157 = alloc_1.get_ref(8);
-                const Tensor &all_oi_tmp_inline145 = alloc_1.get_ref(9);
-                const Tensor &all_cur_mi_inline174 = alloc_1.get_ref(10);
-                const Tensor &all_cur_li_inline190 = alloc_1.get_ref(11);
-                const Tensor &fa_work_table_inline126 = alloc_1.get_ref(12);
-                const Tensor &fa_total_inline183 = alloc_1.get_ref(13);
-                const Tensor &q_proj_norm_inline197 = alloc_1.get_ref(14);
-                const Tensor &k_proj_norm_inline155 = alloc_1.get_ref(15);
+                const Tensor &normed_states_inline146 = alloc_1.get_ref(0);
+                const Tensor &out_partial_inline312 = alloc_1.get_ref(1);
+                const Tensor &inv_rms_states_inline160 = alloc_1.get_ref(2);
+                const Tensor &q_proj_inline129 = alloc_1.get_ref(3);
+                const Tensor &k_proj_inline128 = alloc_1.get_ref(4);
+                const Tensor &v_proj_inline152 = alloc_1.get_ref(5);
+                const Tensor &all_q_padded_inline168 = alloc_1.get_ref(6);
+                const Tensor &attn_out_inline157 = alloc_1.get_ref(7);
+                const Tensor &all_oi_tmp_inline145 = alloc_1.get_ref(8);
+                const Tensor &all_cur_mi_inline174 = alloc_1.get_ref(9);
+                const Tensor &all_cur_li_inline190 = alloc_1.get_ref(10);
+                const Tensor &fa_work_table_inline126 = alloc_1.get_ref(11);
+                const Tensor &fa_total_inline183 = alloc_1.get_ref(12);
+                const Tensor &q_proj_norm_inline197 = alloc_1.get_ref(13);
+                const Tensor &k_proj_norm_inline155 = alloc_1.get_ref(14);
                 uint32_t q_inv_states_inline99_ci_shapes[2] = {640, 1};
                 TensorCreateInfo q_inv_states_inline99_ci(q_inv_states_inline99_ci_shapes, 2, DataType::FLOAT32);
                 uint32_t k_inv_states_inline90_ci_shapes[2] = {128, 1};
@@ -1116,20 +1176,23 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                         TaskOutputTensors task_32_outs = rt_submit_aiv_task(33, params_t32);
                     }
                 }
-                rt_graph_boundary();
-                Tensor cur__ssa_v8 = next_hidden;
-                cur__rv_v7 = cur__ssa_v8;
+                if (i == 2) {
+                    for (int64_t ob0 = 0; ob0 < 16; ob0 += 16) {
+                        PTO2_SCOPE() {
+                            // Task 33: copy_out
+                            L0TaskArgs params_t33;
+                            params_t33.add_output(ext_out);
+                            params_t33.add_input(next_hidden);
+                            params_t33.add_scalar(ob0);
+                            rt_submit_aiv_task(34, params_t33);
+                        }
+                    }
+                }
             }
-        }
-        for (int64_t ob0 = 0; ob0 < 16; ob0 += 16) {
-            PTO2_SCOPE() {
-                // Task 33: copy_out
-                L0TaskArgs params_t33;
-                params_t33.add_output(ext_out);
-                params_t33.add_input(cur__rv_v7);
-                params_t33.add_scalar(ob0);
-                rt_submit_aiv_task(34, params_t33);
             }
+            rt_graph_boundary();
+            Tensor cur__ssa_v8 = next_hidden;
+            cur__rv_v7 = cur__ssa_v8;
         }
     }
 }

@@ -56,7 +56,7 @@ Thread 3: PTO2 total submitted tasks = 16704
 | **lookup+dep** | `g_orch_lookup_cycle` | TensorMap lookup for inputs/inouts + building fanin/fanout dependency edges |
 | **tensormap_ins** | `g_orch_insert_cycle` | Inserting output/inout tensors into the TensorMap |
 | **param_copy** | `g_orch_args_cycle` | Copying param descriptors + tensor descriptor copies into task-owned storage |
-| **fanin+ready** | `g_orch_fanin_cycle` | Appending frozen fanout edges and recording zero-fanin tasks in `initial_ready` |
+| **fanin+ready** | `g_orch_fanin_cycle` | Appending dependency edges and finalizing publish-gated fanin state |
 | **avg/task** | `total / submit_count` | Average orchestrator time per task submission |
 
 ### Interpreting the Numbers
@@ -102,7 +102,7 @@ The scheduler loop runs four phases each iteration. Each phase's time is accumul
 
 | Phase | What it does | Inline stats |
 | ----- | ------------ | ------------ |
-| **complete** | Polls handshake on each managed core; when all subtasks complete, `on_task_complete` marks the task completed and traverses its frozen fanout list | `fanout`: edges traversed for consumer notification |
+| **complete** | Polls handshake on each managed core; when all subtasks complete, `on_task_complete` closes and traverses the task's fanout list | `fanout`: edges traversed for consumer notification |
 | **scan** | Updates the perf profiling header with latest scheduler state | — |
 | **dispatch** | For each idle core, pops a task from the shape-based ready queue via `get_ready_task(shape)`, builds the dispatch payload, and writes the task to the core's handshake register | `pop`: `hit` = successful pops (task dispatched), `miss` = empty queue pops, `hit_rate` = hit/(hit+miss) |
 | **idle** | Scheduler loop iteration where no progress was made (no completions, no dispatches) | — |
@@ -110,7 +110,7 @@ The scheduler loop runs four phases each iteration. Each phase's time is accumul
 **Interpreting phase percentages:**
 
 - **dispatch** is typically the largest (~55-60%) because it includes lock-free ready-queue pops, payload construction, and cache flush (`dc cvac` + `dsb sy`).
-- **complete** traverses the frozen fanout list, increments consumer
+- **complete** closes and traverses the fanout list, increments consumer
   `fanin_refcount`, and conditionally pushes newly ready tasks. Producer
   release, consumed transitions, and ring-pointer advancement do not exist in
   the single-shot model.

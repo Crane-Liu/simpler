@@ -37,6 +37,7 @@
 #include "pto_runtime2_types.h"  // PTO2_ERROR_*
 #include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
 #include "pto_types.h"           // Arg, TaskOutputTensors, TensorArgType
+#include "pto_graph_cache.h"     // graph scope bindings / hash helpers
 #include "task_args.h"           // ChipStorageTaskArgs, Tensor
 #include "tensor.h"              // Tensor, TensorCreateInfo
 
@@ -86,11 +87,14 @@ typedef struct PTO2RuntimeOps {
     );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
+    PTO2GraphScopeResult (*graph_begin)(PTO2Runtime *rt, uint64_t graph_key, const PTO2GraphBindings &bindings);
+    void (*graph_end)(PTO2Runtime *rt);
 
     // Stash the call-site of the next PTO2ScopeGuard so the [ScopeStats]
     // collector can log it. Always present to keep ops-table layout stable
     // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
+    void (*graph_boundary)(PTO2Runtime *rt);
 } PTO2RuntimeOps;
 
 /**
@@ -203,6 +207,22 @@ static inline TaskOutputTensors rt_submit_dummy_task(const L0TaskArgs &args) {
     return rt->ops->submit_dummy_task(rt, args);
 }
 
+static inline PTO2GraphScopeResult rt_graph_begin(uint64_t graph_key, const PTO2GraphBindings &bindings) {
+    PTO2Runtime *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->graph_begin == nullptr) {
+        return PTO2GraphScopeResult{};
+    }
+    return rt->ops->graph_begin(rt, graph_key, bindings);
+}
+
+static inline void rt_graph_end() {
+    PTO2Runtime *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->graph_end == nullptr) {
+        return;
+    }
+    rt->ops->graph_end(rt);
+}
+
 static inline void rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
     PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
@@ -223,6 +243,12 @@ static inline void rt_scope_end() {
 static inline void rt_orchestration_done() {
     PTO2Runtime *rt = current_runtime();
     rt->ops->orchestration_done(rt);
+}
+
+static inline void rt_graph_boundary() {
+    PTO2Runtime *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->graph_boundary == nullptr) return;
+    rt->ops->graph_boundary(rt);
 }
 
 static inline bool rt_is_fatal() {
@@ -342,6 +368,55 @@ private:
     PTO2Runtime *rt_;
 };
 
+template <size_t MaxT, size_t MaxS>
+static inline PTO2GraphBindings rt_graph_bindings(const Arg<MaxT, MaxS> &args) {
+    PTO2GraphBindings bindings;
+    bindings.tensor_count = static_cast<uint32_t>(args.tensor_count());
+    bindings.scalar_count = static_cast<uint32_t>(args.scalar_count());
+    if (bindings.tensor_count > PTO2_GRAPH_MAX_BOUNDARY_TENSORS ||
+        bindings.scalar_count > PTO2_GRAPH_MAX_BOUNDARY_SCALARS) {
+        bindings.overflow = true;
+        if (bindings.tensor_count > PTO2_GRAPH_MAX_BOUNDARY_TENSORS) {
+            bindings.tensor_count = PTO2_GRAPH_MAX_BOUNDARY_TENSORS;
+        }
+        if (bindings.scalar_count > PTO2_GRAPH_MAX_BOUNDARY_SCALARS) {
+            bindings.scalar_count = PTO2_GRAPH_MAX_BOUNDARY_SCALARS;
+        }
+    }
+    for (uint32_t i = 0; i < bindings.tensor_count; ++i) {
+        bindings.tensors[i].copy(args.tensor(static_cast<int32_t>(i)).ref());
+    }
+    for (uint32_t i = 0; i < bindings.scalar_count; ++i) {
+        bindings.scalars[i] = args.scalar(static_cast<int32_t>(i));
+    }
+    return bindings;
+}
+
+static inline PTO2GraphBindings rt_graph_bindings(const PTO2GraphBindings &bindings) { return bindings; }
+
+template <typename Bindings>
+static inline uint64_t rt_graph_make_key(uint64_t namespace_hash, const Bindings &bindings) {
+    PTO2GraphBindings copied = rt_graph_bindings(bindings);
+    return rt_graph_make_key(namespace_hash, copied);
+}
+
+class PTO2GraphScopeGuard {
+public:
+    PTO2GraphScopeGuard(uint64_t graph_key, const PTO2GraphBindings &bindings) {
+        result_ = rt_graph_begin(graph_key, bindings);
+    }
+    ~PTO2GraphScopeGuard() {
+        if (result_.recording) {
+            rt_graph_end();
+        }
+    }
+
+    bool should_run() const { return result_.execute_block; }
+
+private:
+    PTO2GraphScopeResult result_{};
+};
+
 #define _PTO2_CONCATENATE_IMPL(x, y) x##y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)
 
@@ -354,6 +429,11 @@ private:
  *   }
  */
 #define PTO2_SCOPE(...) if (PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__){__VA_ARGS__}; true)
+
+#define PTO2_GRAPH_SCOPE_IMPL(name, graph_key, bindings) \
+    if (PTO2GraphScopeGuard name{(graph_key), rt_graph_bindings(bindings)}; name.should_run())
+#define PTO2_GRAPH_SCOPE(graph_key, bindings) \
+    PTO2_GRAPH_SCOPE_IMPL(_PTO2_CONCATENATE(graph_scope_guard_, __COUNTER__), graph_key, bindings)
 
 // =============================================================================
 // Orchestration Config

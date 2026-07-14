@@ -37,12 +37,13 @@ Runtime::Runtime() {
     memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;
-    dev.serial_orch_sched = false;
     dev.gm_sm_ptr_ = nullptr;
     dev.orch_args_storage_.clear();
     dev.prebuilt_arena_base_ = nullptr;
     dev.prebuilt_runtime_offset_ = 0;
     dev.active_callable_id_ = -1;
+    dev.graph_cache_enabled_ = false;
+    dev.active_callable_hash_ = 0;
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
         dev.func_id_to_addr_[i] = 0;
     }
@@ -67,6 +68,15 @@ size_t Runtime::get_prebuilt_runtime_offset() const { return dev.prebuilt_runtim
 void Runtime::set_active_callable_id(int32_t callable_id) { dev.active_callable_id_ = callable_id; }
 
 int32_t Runtime::get_active_callable_id() const { return dev.active_callable_id_; }
+
+void Runtime::set_graph_cache_config(bool enabled, uint64_t callable_hash) {
+    dev.graph_cache_enabled_ = enabled;
+    dev.active_callable_hash_ = callable_hash;
+}
+
+bool Runtime::graph_cache_enabled() const { return dev.graph_cache_enabled_; }
+
+uint64_t Runtime::active_callable_hash() const { return dev.active_callable_hash_; }
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;

@@ -28,6 +28,7 @@ void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
     header->task_descriptors = reinterpret_cast<PTO2TaskDescriptor *>(base + offsets.descriptors);
     header->task_payloads = reinterpret_cast<PTO2TaskPayload *>(base + offsets.payloads);
     header->slot_states = reinterpret_cast<PTO2TaskSlotState *>(base + offsets.slot_states);
+    header->task_slot_map = reinterpret_cast<int32_t *>(base + offsets.task_slot_map);
 }
 
 bool PTO2SharedMemoryHandle::init(
@@ -87,11 +88,11 @@ void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t hea
     header->sched_stall_task_id.store(-1, std::memory_order_relaxed);
     header->sched_stall_core.store(-1, std::memory_order_relaxed);
 
-    // A slot is used once per run. Reset the full scheduling state before the
-    // orchestrator starts building the next frozen graph.
+    // Reset the full slot window before the first graph. Reused graph arenas
+    // reset individual slots again during task preparation.
     for (uint64_t i = 0; i < task_window_size; i++) {
         PTO2TaskSlotState &slot = header->slot_states[i];
-        slot.fanout_head = nullptr;
+        slot.fanout_head.store(nullptr, std::memory_order_relaxed);
         slot.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
         slot.fanin_refcount.store(0, std::memory_order_relaxed);
         slot.fanin_count = 0;
@@ -105,6 +106,7 @@ void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t hea
         slot.total_required_subtasks = 0;
         slot.logical_block_num = 1;
         slot.next_block_idx.store(0, std::memory_order_relaxed);
+        header->task_slot_map[i] = static_cast<int32_t>(i);
     }
 }
 

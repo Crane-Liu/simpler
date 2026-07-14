@@ -16,37 +16,66 @@
 #include <vector>
 
 #include "utils/device_arena.h"
+#include "pto_graph_cache.h"
 #include "pto_orchestrator.h"
 #include "pto_ring_buffer.h"
 #include "pto_shared_memory.h"
 
+TEST(ReplayGraphCacheKey, TracksMetadataAndScalarsButNotBoundaryAddress) {
+    uint32_t shape[] = {2, 4};
+    PTO2GraphBindings first;
+    first.tensor_count = 1;
+    first.scalar_count = 1;
+    first.tensors[0] = make_tensor_external(reinterpret_cast<void *>(0x1000), shape, 2, DataType::FLOAT16);
+    first.scalars[0] = 7;
+
+    PTO2GraphBindings relocated = first;
+    relocated.tensors[0].buffer.addr = 0x2000;
+    uint64_t namespace_hash = PTO2_GRAPH_KEY("ut_graph_cache_key_v1");
+    uint64_t key = rt_graph_make_key(namespace_hash, first);
+    EXPECT_EQ(key, rt_graph_make_key(namespace_hash, relocated));
+
+    PTO2GraphBindings different_scalar = first;
+    different_scalar.scalars[0] = 8;
+    EXPECT_NE(key, rt_graph_make_key(namespace_hash, different_scalar));
+
+    uint32_t different_shape[] = {4, 4};
+    PTO2GraphBindings different_metadata = first;
+    different_metadata.tensors[0] =
+        make_tensor_external(reinterpret_cast<void *>(0x1000), different_shape, 2, DataType::FLOAT16);
+    EXPECT_NE(key, rt_graph_make_key(namespace_hash, different_metadata));
+    EXPECT_NE(key, rt_graph_make_key(PTO2_GRAPH_KEY("ut_graph_cache_key_v2"), first));
+}
+
 TEST(ReplayGraphAllocator, HeapOverflowIsFatalWithoutWrap) {
-    alignas(64) uint8_t heap[128]{};
+    alignas(64) uint8_t heap[256]{};
+    int32_t task_slot_map[8]{};
     std::atomic<int32_t> task_count{0};
     std::atomic<int32_t> error{PTO2_ERROR_NONE};
     PTO2TaskAllocator allocator;
-    allocator.init(8, &task_count, heap, sizeof(heap), &error);
+    allocator.init(8, &task_count, task_slot_map, heap, sizeof(heap), &error);
 
     auto first = allocator.alloc(128);
     ASSERT_FALSE(first.failed());
     EXPECT_EQ(first.slot, first.task_id);
-    EXPECT_EQ(allocator.heap_top(), sizeof(heap));
+    EXPECT_EQ(allocator.heap_top(), sizeof(heap) / 2);
 
     auto overflow = allocator.alloc(64);
     EXPECT_TRUE(overflow.failed());
     EXPECT_EQ(error.load(), PTO2_ERROR_HEAP_RING_DEADLOCK);
-    EXPECT_EQ(allocator.heap_top(), sizeof(heap));
+    EXPECT_EQ(allocator.heap_top(), sizeof(heap) / 2);
     EXPECT_EQ(task_count.load(), 1);
 }
 
-TEST(ReplayGraphAllocator, TaskWindowIsNeverReused) {
+TEST(ReplayGraphAllocator, MapsDenseTaskIdsAcrossPingPongArenas) {
     alignas(64) uint8_t heap[64]{};
+    int32_t task_slot_map[4]{};
     std::atomic<int32_t> task_count{0};
     std::atomic<int32_t> error{PTO2_ERROR_NONE};
     PTO2TaskAllocator allocator;
-    allocator.init(4, &task_count, heap, sizeof(heap), &error);
+    allocator.init(4, &task_count, task_slot_map, heap, sizeof(heap), &error);
 
-    for (int32_t expected = 0; expected < 3; expected++) {
+    for (int32_t expected = 0; expected < 2; expected++) {
         auto result = allocator.alloc(0);
         ASSERT_FALSE(result.failed());
         EXPECT_EQ(result.task_id, expected);
@@ -54,7 +83,20 @@ TEST(ReplayGraphAllocator, TaskWindowIsNeverReused) {
     }
     EXPECT_TRUE(allocator.alloc(0).failed());
     EXPECT_EQ(error.load(), PTO2_ERROR_FLOW_CONTROL_DEADLOCK);
-    EXPECT_EQ(task_count.load(), 3);
+    EXPECT_EQ(task_count.load(), 2);
+
+    error.store(PTO2_ERROR_NONE);
+    allocator.begin_buffer(1);
+    auto third = allocator.alloc(0);
+    auto fourth = allocator.alloc(0);
+    ASSERT_FALSE(third.failed());
+    ASSERT_FALSE(fourth.failed());
+    EXPECT_EQ(third.task_id, 2);
+    EXPECT_EQ(third.slot, 2);
+    EXPECT_EQ(fourth.task_id, 3);
+    EXPECT_EQ(fourth.slot, 3);
+    EXPECT_EQ(task_slot_map[2], 2);
+    EXPECT_EQ(task_slot_map[3], 3);
 }
 
 TEST(ReplayGraphDepPool, CapacityMustHoldTheCompleteGraph) {
@@ -115,13 +157,12 @@ protected:
     }
 };
 
-TEST_F(ReplayGraphOrchestratorTest, SubmitBuildsExactFrozenFaninWithoutSentinel) {
+TEST_F(ReplayGraphOrchestratorTest, SubmitBuildsFaninWithPublishGate) {
     orch.begin_scope();
 
     L0TaskArgs producer_args;
     TaskOutputTensors producer = orch.submit_dummy_task(producer_args);
     ASSERT_TRUE(producer.task_id().is_valid());
-    EXPECT_EQ(orch.initial_ready_count, 1);
 
     PTO2TaskId duplicate_deps[] = {producer.task_id(), producer.task_id()};
     L0TaskArgs consumer_args;
@@ -131,11 +172,68 @@ TEST_F(ReplayGraphOrchestratorTest, SubmitBuildsExactFrozenFaninWithoutSentinel)
 
     auto &producer_slot = sm_handle->header->get_slot_state_by_task_id(producer.task_id().local());
     auto &consumer_slot = sm_handle->header->get_slot_state_by_task_id(consumer.task_id().local());
-    EXPECT_EQ(producer_slot.fanin_count, 0);
-    EXPECT_EQ(consumer_slot.fanin_count, 1);
+    EXPECT_EQ(producer_slot.fanin_count, 1);
+    EXPECT_EQ(consumer_slot.fanin_count, 2);
     EXPECT_EQ(consumer_slot.fanin_refcount.load(), 0);
-    EXPECT_EQ(orch.initial_ready_count, 1);
-    ASSERT_NE(producer_slot.fanout_head, nullptr);
-    EXPECT_EQ(producer_slot.fanout_head->slot_state, &consumer_slot);
-    EXPECT_EQ(producer_slot.fanout_head->next, nullptr);
+    PTO2DepListEntry *fanout = producer_slot.fanout_head.load();
+    ASSERT_NE(fanout, nullptr);
+    EXPECT_EQ(fanout->slot_state, &consumer_slot);
+    EXPECT_EQ(fanout->next, nullptr);
+}
+
+TEST_F(ReplayGraphOrchestratorTest, LiveTaskLookupRejectsReusedPhysicalSlot) {
+    constexpr int32_t logical_task_id = 0;
+    constexpr int32_t reused_task_id = static_cast<int32_t>(kTaskWindow);
+    auto &task = sm_handle->header->get_task_by_slot(0);
+    auto &slot = sm_handle->header->get_slot_state_by_slot(0);
+    slot.task = &task;
+    sm_handle->header->task_slot_map[logical_task_id] = 0;
+
+    task.task_id = PTO2TaskId::make(0, logical_task_id);
+    EXPECT_EQ(sm_handle->header->find_live_slot_state(task.task_id), &slot);
+
+    task.task_id = PTO2TaskId::make(0, reused_task_id);
+    EXPECT_EQ(sm_handle->header->find_live_slot_state(PTO2TaskId::make(0, logical_task_id)), nullptr);
+}
+
+TEST_F(ReplayGraphOrchestratorTest, ReplayRestoresFrozenTaskDag) {
+    orch.begin_scope();
+    PTO2GraphBindings bindings;
+    uint64_t graph_key = rt_graph_make_key(PTO2_GRAPH_KEY("ut_frozen_task_dag_v1"), bindings);
+    constexpr uint64_t callable_hash = 0x8d5e52b41f62d9a3ULL;
+
+    PTO2GraphScopeResult record = orch.graph_begin(graph_key, bindings, callable_hash);
+    ASSERT_TRUE(record.execute_block);
+    ASSERT_TRUE(record.recording);
+
+    L0TaskArgs producer_args;
+    TaskOutputTensors producer = orch.submit_dummy_task(producer_args);
+    ASSERT_TRUE(producer.task_id().is_valid());
+    PTO2TaskId dependency[] = {producer.task_id()};
+    L0TaskArgs consumer_args;
+    consumer_args.set_dependencies(dependency, 1);
+    TaskOutputTensors consumer = orch.submit_dummy_task(consumer_args);
+    ASSERT_TRUE(consumer.task_id().is_valid());
+
+    PTO2GraphCacheStats stats;
+    orch.graph_end(&stats);
+    EXPECT_EQ(stats.recorded, 1);
+    ASSERT_EQ(orch.task_allocator.active_count(), 2);
+
+    PTO2GraphScopeResult replay = orch.graph_begin(graph_key, bindings, callable_hash);
+    EXPECT_FALSE(replay.execute_block);
+    EXPECT_FALSE(replay.recording);
+    ASSERT_FALSE(orch.fatal);
+    ASSERT_EQ(orch.task_allocator.active_count(), 4);
+
+    auto &replayed_producer = sm_handle->header->get_slot_state_by_task_id(2);
+    auto &replayed_consumer = sm_handle->header->get_slot_state_by_task_id(3);
+    EXPECT_EQ(replayed_producer.task->task_id.local(), 2);
+    EXPECT_EQ(replayed_consumer.task->task_id.local(), 3);
+    EXPECT_EQ(replayed_producer.fanin_count, 1);
+    EXPECT_EQ(replayed_consumer.fanin_count, 2);
+    PTO2DepListEntry *fanout = replayed_producer.fanout_head.load();
+    ASSERT_NE(fanout, nullptr);
+    EXPECT_EQ(fanout->slot_state, &replayed_consumer);
+    EXPECT_EQ(fanout->next, nullptr);
 }
