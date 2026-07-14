@@ -969,7 +969,6 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
 
     // Device orchestration: the orchestrator thread flips this when the graph is built.
     orchestrator_done_.store(false, std::memory_order_release);
-    initial_ready_seeded_.store(false, std::memory_order_release);
 
     // prepare_subtask_to_core fully writes a per-core payload / deferred-slab slot
     // before the AICore is told to read it: build_payload sets
@@ -1063,7 +1062,6 @@ void SchedulerContext::deinit() {
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
     orchestrator_done_.store(false, std::memory_order_release);
-    initial_ready_seeded_.store(false, std::memory_order_release);
     completed_.store(false, std::memory_order_release);
 
     // Reset core discovery and assignment state
@@ -1086,16 +1084,6 @@ void SchedulerContext::deinit() {
 void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
     rt_ = rt;
     sched_ = &rt->scheduler;
-}
-
-void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx) {
-    while (!orchestration_done() && !completed_.load(std::memory_order_acquire)) {
-        if (sched_ != nullptr && sched_->sm_header != nullptr &&
-            check_idle_fatal_error(thread_idx, sched_->sm_header, runtime) == LoopAction::BREAK_LOOP) {
-            break;
-        }
-        SPIN_WAIT_HINT();
-    }
 }
 
 // =============================================================================

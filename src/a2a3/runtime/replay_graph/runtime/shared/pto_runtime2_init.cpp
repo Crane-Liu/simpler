@@ -11,8 +11,8 @@
 /**
  * Host/AICPU shared runtime-arena layout, initialization, and pointer wiring.
  *
- * replay_graph keeps one arena for the complete frozen graph. The host can
- * prebuild the arena image; the AICPU rewires it and resets it between runs.
+ * The host prebuilds the runtime image. The AICPU rewires it, resets it between
+ * invocations, and uses two task/heap arenas for graph-level pipelining.
  */
 
 #include <stdlib.h>
@@ -26,6 +26,32 @@
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
 #include "scheduler/pto_scheduler.h"
+
+namespace {
+
+void reset_graph_pipeline(PTO2Runtime *rt) {
+    PTO2ReplayGraphPipelineState &pipeline = rt->graph_pipeline;
+    pipeline.all_done.store(0, std::memory_order_relaxed);
+    pipeline.published_task_count.store(0, std::memory_order_relaxed);
+    pipeline.active_buffer = 0;
+    pipeline.graph_count = 0;
+    pipeline.current_graph_epoch = 0;
+    for (int32_t i = 0; i < PTO2_REPLAY_GRAPH_BUFFER_COUNT; i++) {
+        PTO2ReplayGraphBufferControl &buffer = pipeline.buffers[i];
+        buffer.state.store(
+            i == 0 ? PTO2ReplayGraphBufferState::BUILDING : PTO2ReplayGraphBufferState::FREE, std::memory_order_relaxed
+        );
+        buffer.exec_done.store(i == 0 ? 0 : 1, std::memory_order_relaxed);
+        buffer.dep_closed.store(i == 0 ? 0 : 1, std::memory_order_relaxed);
+        buffer.completed_count.store(0, std::memory_order_relaxed);
+        buffer.buffer_id = i;
+        buffer.graph_epoch = 0;
+        buffer.task_begin = 0;
+        buffer.task_count = 0;
+    }
+}
+
+}  // namespace
 
 // =============================================================================
 // Ready queue
@@ -76,6 +102,7 @@ bool PTO2SchedulerState::init_data_from_layout(
     const PTO2SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base
 ) {
     sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
+    graph_pipeline = nullptr;
 #if SIMPLER_SCHED_PROFILING
     tasks_completed.store(0, std::memory_order_relaxed);
 #endif
@@ -107,6 +134,7 @@ bool PTO2SchedulerState::init_data_from_layout(
 
 void PTO2SchedulerState::reset_for_reuse(const PTO2SchedulerLayout &layout, void *sm_dev_base) {
     sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
+    graph_pipeline = nullptr;
 #if SIMPLER_SCHED_PROFILING
     tasks_completed.store(0, std::memory_order_relaxed);
 #endif
@@ -133,6 +161,7 @@ void PTO2SchedulerState::wire_arena_pointers(const PTO2SchedulerLayout &layout, 
 
 void PTO2SchedulerState::destroy() {
     sm_header = nullptr;
+    graph_pipeline = nullptr;
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&ready_queues[i]);
         ready_queue_destroy(&ready_sync_queues[i]);
@@ -151,15 +180,11 @@ PTO2OrchestratorState::reserve_layout(DeviceArena &arena, int32_t task_window_si
     always_assert(task_window_size > 0);
     PTO2OrchestratorLayout layout{};
     layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
-    layout.initial_ready_cap = task_window_size;
     layout.dep_pool_capacity = dep_pool_capacity;
     layout.off_dep_pool_entries =
         arena.reserve(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2DepListEntry), PTO2_ALIGN_SIZE);
     layout.off_fanin_seen_epoch =
         arena.reserve(static_cast<size_t>(task_window_size) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
-    layout.off_initial_ready = arena.reserve(
-        static_cast<size_t>(task_window_size) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *)
-    );
     layout.tensor_map = PTO2TensorMap::reserve_layout_default(arena);
     return layout;
 }
@@ -176,8 +201,8 @@ bool PTO2OrchestratorState::init_data_from_layout(
 
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
     task_allocator.init(
-        static_cast<int32_t>(task_window_size), pto2_sm_layout::task_count_addr(sm_dev_base), gm_heap, heap_size,
-        orch_err
+        static_cast<int32_t>(task_window_size), pto2_sm_layout::task_count_addr(sm_dev_base),
+        pto2_sm_layout::task_slot_map_addr(sm_dev_base, task_window_size), gm_heap, heap_size, orch_err
     );
 
     auto *dep_entries = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
@@ -193,8 +218,6 @@ bool PTO2OrchestratorState::init_data_from_layout(
     scope_stack_top = -1;
     scope_stack_capacity = layout.scope_stack_capacity;
     manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
-    initial_ready_count = 0;
-    initial_ready_capacity = layout.initial_ready_cap;
     return true;
 }
 
@@ -210,8 +233,8 @@ bool PTO2OrchestratorState::reset_for_reuse(
 
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
     task_allocator.init(
-        static_cast<int32_t>(task_window_size), pto2_sm_layout::task_count_addr(sm_dev_base), gm_heap, heap_size,
-        orch_err
+        static_cast<int32_t>(task_window_size), pto2_sm_layout::task_count_addr(sm_dev_base),
+        pto2_sm_layout::task_slot_map_addr(sm_dev_base, task_window_size), gm_heap, heap_size, orch_err
     );
     dep_pool.init(dep_pool.base, layout.dep_pool_capacity, orch_err);
 
@@ -226,8 +249,6 @@ bool PTO2OrchestratorState::reset_for_reuse(
     scope_stack_top = -1;
     scope_stack_capacity = layout.scope_stack_capacity;
     manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
-    initial_ready_count = 0;
-    initial_ready_capacity = layout.initial_ready_cap;
     total_cluster_count = 0;
     total_aiv_count = 0;
 #if SIMPLER_DFX
@@ -243,7 +264,6 @@ void PTO2OrchestratorState::wire_arena_pointers(
 ) {
     dep_pool.base = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
     fanin_seen_epoch = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch));
-    initial_ready = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_initial_ready));
     tensor_map.wire_arena_pointers(layout.tensor_map, arena);
     scheduler = scheduler_arg;
 }
@@ -252,7 +272,6 @@ void PTO2OrchestratorState::destroy() {
     tensor_map.destroy();
     dep_pool.base = nullptr;
     fanin_seen_epoch = nullptr;
-    initial_ready = nullptr;
     scheduler = nullptr;
 }
 
@@ -297,6 +316,10 @@ PTO2Runtime *runtime_init_data_from_layout(
     rt->gm_heap = gm_heap_dev_base;
     rt->gm_heap_size = heap_size;
     rt->gm_heap_owned = false;
+    rt->graph_cache_enabled = false;
+    rt->active_callable_hash = 0;
+    rt->graph_cache_stats = PTO2GraphCacheStats{};
+    reset_graph_pipeline(rt);
     if (!rt->orchestrator.init_data_from_layout(
             layout.offsets.orch, arena, sm_dev_base, gm_heap_dev_base, heap_size, layout.sizing.task_window_size
         ) ||
@@ -321,6 +344,8 @@ bool runtime_reset_for_reuse(DeviceArena &arena, const PTO2RuntimeArenaLayout &l
     if (rt == nullptr) return false;
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
     rt->total_cycles = 0;
+    rt->graph_cache_stats = PTO2GraphCacheStats{};
+    reset_graph_pipeline(rt);
     rt->gm_heap_size = layout.sizing.heap_size;
     rt->gm_heap_owned = false;
     if (!rt->orchestrator.reset_for_reuse(

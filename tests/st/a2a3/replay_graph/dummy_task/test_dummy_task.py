@@ -100,6 +100,23 @@ class TestDummyTask(SceneTestCase):
             "config": {"aicpu_thread_num": 2, "block_dim": 1},
             "params": {"case": 4},
         },
+        {
+            "name": "GraphCacheRecordReplay",
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {
+                "aicpu_thread_num": 2,
+                "block_dim": 1,
+                "enable_graph_cache": True,
+                "rounds": 2,
+            },
+            "params": {"case": 5},
+        },
+        {
+            "name": "GraphBoundaryPipeline",
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 2, "block_dim": 1},
+            "params": {"case": 6},
+        },
     ]
 
     def generate_args(self, params):

@@ -876,16 +876,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         static_cast<uint64_t>(header->task_window_size)
     );
 
-    while (!orchestration_done() && !is_completed()) {
-        SPIN_WAIT_HINT();
-    }
-    if (!initial_ready_seeded_.exchange(true, std::memory_order_acq_rel)) {
-        PTO2OrchestratorState &orch = rt_->orchestrator;
-        for (int32_t i = 0; i < orch.initial_ready_count; i++) {
-            sched_->push_ready_routed(orch.initial_ready[i]);
-        }
-    }
-
     LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
     int32_t cur_thread_completed = 0;
     // Non-zero once a scheduler-hang timeout latches; returned in place of the

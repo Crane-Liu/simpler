@@ -34,12 +34,15 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
 #include "pto_shared_memory.h"
 #include "pto_ring_buffer.h"
 #include "pto_tensormap.h"
+#include "pto_graph_cache.h"
 #include "scheduler/pto_scheduler.h"
 #include "pto_orchestrator.h"
 #include "aicore_completion_mailbox.h"
@@ -89,10 +92,13 @@ struct PTO2RuntimeOps {
     );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
+    PTO2GraphScopeResult (*graph_begin)(PTO2Runtime *rt, uint64_t graph_key, const PTO2GraphBindings &bindings);
+    void (*graph_end)(PTO2Runtime *rt);
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
     // collector. Always present in the struct to keep ops-table layout stable
     // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
+    void (*graph_boundary)(PTO2Runtime *rt);
 };
 
 /**
@@ -165,6 +171,10 @@ struct PTO2Runtime {
 
     // Statistics
     int64_t total_cycles;
+    bool graph_cache_enabled;
+    uint64_t active_callable_hash;
+    PTO2GraphCacheStats graph_cache_stats;
+    PTO2ReplayGraphPipelineState graph_pipeline;
 
     // Prebuilt-arena fast path metadata. Carries every offset
     // wire_arena_pointers needs at AICPU boot so the AICPU can reconstruct
@@ -218,7 +228,7 @@ PTO2Runtime *runtime_init_data_from_layout(
 
 /**
  * Phase 3 — wire every arena-internal pointer field (rt->sm_handle,
- * rt->aicore_mailbox, orchestrator.{dep_pool, initial_ready, scheduler,
+ * rt->aicore_mailbox, orchestrator.{dep_pool, scheduler,
  * tensor_map.*}, and scheduler ready queues)
  * so each holds arena.base() + offset. Idempotent — runs on
  * both host (writing host-mirror addresses) and AICPU (writing device
@@ -256,8 +266,8 @@ void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode);
 /**
  * Begin a new scope
  *
- * Scopes retain dependency and profiling semantics only. The single-shot
- * replay owns every task and buffer until the complete graph finishes.
+ * Scopes retain dependency and profiling semantics only. Graph publication
+ * and arena ownership are controlled by rt_graph_boundary().
  */
 void rt_scope_begin(PTO2Runtime *rt);
 
@@ -274,6 +284,12 @@ void rt_scope_end(PTO2Runtime *rt);
  * Signals that no more tasks will be submitted.
  */
 void rt_orchestration_done(PTO2Runtime *rt);
+
+/**
+ * Publish the current graph to the scheduler and switch to the next reusable
+ * graph arena.
+ */
+void rt_graph_boundary(PTO2Runtime *rt);
 
 /**
  * Enter fatal state explicitly from orchestration.

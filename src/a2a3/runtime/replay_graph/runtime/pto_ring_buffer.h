@@ -17,65 +17,104 @@
 #include "common/unified_log.h"
 #include "pto_runtime2_types.h"
 
-// Historical filename: replay_graph allocates linearly and never wraps.
+// Historical filename: replay_graph uses two graph-level bump arenas.
 class PTO2TaskAllocator {
 public:
     void init(
-        int32_t window_size, std::atomic<int32_t> *task_count_ptr, void *heap_base, uint64_t heap_size,
-        std::atomic<int32_t> *error_code_ptr, int32_t initial_task_id = 0
+        int32_t window_size, std::atomic<int32_t> *task_count_ptr, int32_t *task_slot_map, void *heap_base,
+        uint64_t heap_size, std::atomic<int32_t> *error_code_ptr, int32_t initial_task_id = 0
     ) {
         window_size_ = window_size;
+        task_window_mask_ = window_size - 1;
+        slot_arena_size_ = window_size / PTO2_REPLAY_GRAPH_BUFFER_COUNT;
         task_count_ptr_ = task_count_ptr;
+        task_slot_map_ = task_slot_map;
         heap_base_ = heap_base;
         heap_size_ = heap_size;
+        heap_arena_size_ = heap_size / PTO2_REPLAY_GRAPH_BUFFER_COUNT;
         error_code_ptr_ = error_code_ptr;
-        task_count_ = initial_task_id;
-        heap_top_ = 0;
+        next_task_id_ = initial_task_id;
+        active_buffer_ = 0;
+        for (int32_t i = 0; i < PTO2_REPLAY_GRAPH_BUFFER_COUNT; i++) {
+            buffers_[i].slot_base = i * slot_arena_size_;
+            buffers_[i].slot_top = 0;
+            buffers_[i].heap_base = static_cast<char *>(heap_base_) + static_cast<uint64_t>(i) * heap_arena_size_;
+            buffers_[i].heap_top = 0;
+        }
+    }
+
+    void begin_buffer(int32_t buffer_id) {
+        if (buffer_id < 0 || buffer_id >= PTO2_REPLAY_GRAPH_BUFFER_COUNT) {
+            report_invalid_buffer(buffer_id);
+            return;
+        }
+        active_buffer_ = buffer_id;
+        buffers_[buffer_id].slot_top = 0;
+        buffers_[buffer_id].heap_top = 0;
     }
 
     PTO2TaskAllocResult alloc(int32_t output_size) {
         uint64_t aligned = output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
-        if (task_count_ + 1 >= window_size_) {
+        BufferArena &arena = buffers_[active_buffer_];
+        if (arena.slot_top >= slot_arena_size_) {
             report_task_overflow();
             return {-1, -1, nullptr, nullptr};
         }
-        if (heap_top_ + aligned > heap_size_) {
+        if (arena.heap_top + aligned > heap_arena_size_) {
             report_heap_overflow(output_size);
             return {-1, -1, nullptr, nullptr};
         }
 
-        void *base = static_cast<char *>(heap_base_) + heap_top_;
-        heap_top_ += aligned;
-        int32_t task_id = task_count_++;
-        task_count_ptr_->store(task_count_, std::memory_order_release);
-        return {task_id, task_id, base, static_cast<char *>(base) + aligned};
+        void *base = static_cast<char *>(arena.heap_base) + arena.heap_top;
+        arena.heap_top += aligned;
+        int32_t task_id = next_task_id_++;
+        int32_t slot = arena.slot_base + arena.slot_top++;
+        task_slot_map_[task_id & task_window_mask_] = slot;
+        task_count_ptr_->store(next_task_id_, std::memory_order_release);
+        return {task_id, slot, base, static_cast<char *>(base) + aligned};
     }
 
-    int32_t active_count() const { return task_count_; }
-    int32_t task_tail() const { return 0; }
-    int32_t task_head() const { return task_count_; }
+    int32_t active_count() const { return next_task_id_; }
+    int32_t task_tail() const { return buffers_[active_buffer_].slot_base; }
+    int32_t task_head() const { return buffers_[active_buffer_].slot_base + buffers_[active_buffer_].slot_top; }
+    int32_t task_available() const { return slot_arena_size_ - buffers_[active_buffer_].slot_top; }
     int32_t window_size() const { return window_size_; }
-    uint64_t heap_available() const { return heap_size_ - heap_top_; }
-    uint64_t heap_top() const { return heap_top_; }
+    uint64_t heap_available() const { return heap_arena_size_ - buffers_[active_buffer_].heap_top; }
+    uint64_t heap_top() const { return buffers_[active_buffer_].heap_top; }
     uint64_t heap_tail() const { return 0; }
-    uint64_t heap_capacity() const { return heap_size_; }
-    uint64_t heap_used_bytes() const { return heap_top_; }
+    uint64_t heap_capacity() const { return heap_arena_size_; }
+    uint64_t heap_used_bytes() const { return buffers_[active_buffer_].heap_top; }
 
 private:
+    struct BufferArena {
+        int32_t slot_base{0};
+        int32_t slot_top{0};
+        void *heap_base{nullptr};
+        uint64_t heap_top{0};
+    };
+
     int32_t window_size_{0};
+    int32_t task_window_mask_{0};
+    int32_t slot_arena_size_{0};
     std::atomic<int32_t> *task_count_ptr_{nullptr};
+    int32_t *task_slot_map_{nullptr};
     void *heap_base_{nullptr};
     uint64_t heap_size_{0};
+    uint64_t heap_arena_size_{0};
     std::atomic<int32_t> *error_code_ptr_{nullptr};
-    int32_t task_count_{0};
-    uint64_t heap_top_{0};
+    int32_t next_task_id_{0};
+    int32_t active_buffer_{0};
+    BufferArena buffers_[PTO2_REPLAY_GRAPH_BUFFER_COUNT];
 
     void report_task_overflow() {
         LOG_ERROR("========================================");
         LOG_ERROR("FATAL: Replay Graph Task Window Overflow!");
         LOG_ERROR("========================================");
-        LOG_ERROR("Whole graph needs more task slots: current=%d, capacity=%d.", task_count_, window_size_ - 1);
-        LOG_ERROR("Increase PTO2_RING_TASK_WINDOW to a power of two larger than the complete graph.");
+        LOG_ERROR(
+            "Graph exceeds task arena: buffer=%d, current=%d, capacity=%d.", active_buffer_,
+            buffers_[active_buffer_].slot_top, slot_arena_size_
+        );
+        LOG_ERROR("Increase PTO2_RING_TASK_WINDOW so one half holds the largest graph.");
         LOG_ERROR("========================================");
         if (error_code_ptr_) {
             error_code_ptr_->store(PTO2_ERROR_FLOW_CONTROL_DEADLOCK, std::memory_order_release);
@@ -87,13 +126,20 @@ private:
         LOG_ERROR("FATAL: Replay Graph Heap Overflow!");
         LOG_ERROR("========================================");
         LOG_ERROR(
-            "Whole graph output storage exceeds heap: top=%" PRIu64 ", size=%" PRIu64 ", requested=%d.", heap_top_,
-            heap_size_, requested
+            "Graph exceeds heap arena: buffer=%d, top=%" PRIu64 ", size=%" PRIu64 ", requested=%d.", active_buffer_,
+            buffers_[active_buffer_].heap_top, heap_arena_size_, requested
         );
-        LOG_ERROR("Increase PTO2_RING_HEAP to hold all graph outputs.");
+        LOG_ERROR("Increase PTO2_RING_HEAP so one half holds the largest graph outputs.");
         LOG_ERROR("========================================");
         if (error_code_ptr_) {
             error_code_ptr_->store(PTO2_ERROR_HEAP_RING_DEADLOCK, std::memory_order_release);
+        }
+    }
+
+    void report_invalid_buffer(int32_t buffer_id) {
+        LOG_ERROR("FATAL: invalid replay graph buffer id=%d", buffer_id);
+        if (error_code_ptr_) {
+            error_code_ptr_->store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
         }
     }
 };

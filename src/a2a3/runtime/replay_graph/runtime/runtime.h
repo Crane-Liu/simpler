@@ -181,10 +181,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
-    // replay_graph always waits until orchestration has frozen the complete
-    // dependency graph before scheduler workers dispatch.
-    bool serial_orch_sched;
-
     void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
@@ -198,6 +194,10 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Per-callable_id dispatch. AICPU dispatches via
     // `orch_so_table_[active_callable_id_]`.
     int32_t active_callable_id_;
+
+    // Graph record/replay is scoped to this callable's orchestration content.
+    bool graph_cache_enabled_;
+    uint64_t active_callable_hash_;
 };
 
 // =============================================================================
@@ -278,6 +278,9 @@ public:
     // register time (RegisterCallableArgs), not through Runtime.
     void set_active_callable_id(int32_t callable_id);
     int32_t get_active_callable_id() const;
+    void set_graph_cache_config(bool enabled, uint64_t callable_hash);
+    bool graph_cache_enabled() const;
+    uint64_t active_callable_hash() const;
 
     uint64_t get_function_bin_addr(int func_id) const;
     /**

@@ -33,6 +33,7 @@
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
+#include "pto_graph_cache.h"
 #include "scheduler/pto_scheduler.h"
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
@@ -40,16 +41,14 @@
 
 /**
  * Layout descriptor produced by PTO2OrchestratorState::reserve_layout(). Holds
- * arena offsets for the whole-graph dependency pool, initial-ready handoff,
- * fanin dedup table, and nested TensorMap layout.
+ * arena offsets for the dependency pool, fanin dedup table, and nested
+ * TensorMap layout.
  */
 struct PTO2OrchestratorLayout {
     size_t off_fanin_seen_epoch;
     size_t off_dep_pool_entries;
-    size_t off_initial_ready;
     PTO2TensorMapLayout tensor_map;
     int32_t dep_pool_capacity;
-    int32_t initial_ready_cap;
     uint64_t scope_stack_capacity;
 };
 
@@ -87,10 +86,6 @@ struct PTO2OrchestratorState {
     // and publishes ready tasks through it before scheduler workers dispatch.
     PTO2SchedulerState *scheduler;
 
-    PTO2TaskSlotState **initial_ready;
-    int32_t initial_ready_count{0};
-    int32_t initial_ready_capacity{0};
-
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
@@ -123,17 +118,6 @@ struct PTO2OrchestratorState {
 
     bool in_manual_scope() const { return scope_stack_top >= manual_begin_depth; }
 
-    void push_initial_ready(PTO2TaskSlotState *slot) {
-        if (initial_ready_count >= initial_ready_capacity) {
-            report_fatal(
-                PTO2_ERROR_DEP_POOL_OVERFLOW, __FUNCTION__, "initial_ready overflow (count=%d cap=%d)",
-                initial_ready_count, initial_ready_capacity
-            );
-            return;
-        }
-        initial_ready[initial_ready_count++] = slot;
-    }
-
     // === Cold-path API (defined in pto_orchestrator.cpp) ===
 
     static PTO2OrchestratorLayout
@@ -165,6 +149,8 @@ struct PTO2OrchestratorState {
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args);
     TaskOutputTensors submit_dummy_task(const L0TaskArgs &args);
     TaskOutputTensors alloc_tensors(const L0TaskArgs &args);
+    PTO2GraphScopeResult graph_begin(uint64_t graph_key, const PTO2GraphBindings &bindings, uint64_t callable_hash);
+    void graph_end(PTO2GraphCacheStats *stats);
     void mark_done();
 };
 

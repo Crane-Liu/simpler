@@ -36,7 +36,7 @@ Legacy per-task submit (`kernel_id + worker_type`) cannot express atomic co-disp
 
 Design must preserve the current main runtime architecture:
 
-1. Executor threading split (orchestrator thread vs scheduler threads); the orchestrator thread exits after the task graph is built while scheduler threads dispatch to completion.
+1. Executor threading split (orchestrator thread vs scheduler threads); graph boundaries let scheduler threads execute a published graph while the orchestrator builds the next graph.
 2. Shared-memory hot/cold split (`PTO2TaskDescriptor` hot + `PTO2TaskPayload` cold).
 
 ## 5. Terminology
@@ -162,7 +162,7 @@ This project-defined flattened numbering is kept unchanged.
 
 1. Validate submit arguments.
 2. Allocate mixed-task ID and initialize descriptor/payload/slot_state once.
-3. Lookup producers via TensorMap; append each unique pending producer's frozen fanout edge and increment exact `fanin_count`.
+3. Lookup producers via TensorMap; atomically append each unique pending producer edge and increment publish-gated `fanin_count`.
 4. Wire fanout edges on the orchestrator side and publish ready tasks to the scheduler queues.
 5. Dispatch all active lanes atomically when resources allow.
 6. Aggregate completion and release downstream once.

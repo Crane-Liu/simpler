@@ -10,8 +10,8 @@
 # All paths are relative to this file's directory (src/a2a3/runtime/replay_graph/)
 #
 # This is a device-orchestration runtime where:
-# - The orchestrator builds and freezes the complete graph on device
-# - Scheduler threads begin dispatch only after the graph-freeze barrier
+# - The orchestrator publishes device-built graphs at explicit boundaries
+# - Scheduler threads execute a published graph while the next graph is built
 # - AICore executes tasks via an aligned PTO2DispatchPayload + pre-built dispatch_args
 #
 # The "orchestration" directory contains source files compiled into both

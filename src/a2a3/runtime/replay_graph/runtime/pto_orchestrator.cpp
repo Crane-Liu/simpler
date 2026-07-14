@@ -215,26 +215,230 @@ static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
     return next;
 }
 
+namespace {
+
+constexpr int32_t PTO2_GRAPH_TEMPLATE_CAP = 16;
+constexpr int32_t PTO2_GRAPH_MAX_TASKS = 1024;
+constexpr int32_t PTO2_GRAPH_MAX_FANIN_PER_TASK = 128;
+
+enum class PTO2GraphTensorSource : uint8_t {
+    BOUNDARY = 0,
+    INTERNAL = 1,
+    OWN_OUTPUT = 2,
+};
+
+enum class PTO2GraphFaninSource : uint8_t {
+    INTERNAL = 0,
+    EXTERNAL_LOCAL_DELTA = 1,
+};
+
+struct PTO2GraphTensorPatch {
+    PTO2GraphTensorSource source{PTO2GraphTensorSource::BOUNDARY};
+    uint16_t source_index{0};
+    uint64_t packed_offset{0};
+};
+
+struct PTO2GraphFaninRef {
+    PTO2GraphFaninSource source{PTO2GraphFaninSource::INTERNAL};
+    int32_t value{0};
+};
+
+struct PTO2GraphTaskTemplate {
+    int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT]{INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID};
+    ActiveMask active_mask{};
+    int16_t logical_block_num{1};
+    int16_t total_required_subtasks{0};
+    bool completed_inline{false};
+    bool allow_early_resolve{false};
+    int32_t tensor_count{0};
+    int32_t scalar_count{0};
+    int32_t total_output_size{0};
+    uint64_t record_packed_base{0};
+    Tensor tensors[MAX_TENSOR_ARGS];
+    PTO2GraphTensorPatch tensor_patch[MAX_TENSOR_ARGS];
+    uint64_t scalars[MAX_SCALAR_ARGS];
+    int32_t fanin_count{0};
+    PTO2GraphFaninRef fanins[PTO2_GRAPH_MAX_FANIN_PER_TASK];
+};
+
+struct PTO2GraphTemplate {
+    bool in_use{false};
+    uint64_t full_key{0};
+    int32_t task_count{0};
+    PTO2GraphTaskTemplate tasks[PTO2_GRAPH_MAX_TASKS];
+};
+
+struct PTO2GraphRecordingState {
+    bool active{false};
+    bool unsupported{false};
+    int32_t unsupported_reason{0};
+    int32_t unsupported_task_index{-1};
+    int32_t unsupported_tensor_index{-1};
+    uint64_t full_key{0};
+    int32_t start_local_task_id{0};
+    int32_t current_task_index{-1};
+    int32_t current_fanin_count{0};
+    PTO2GraphFaninRef current_fanins[PTO2_GRAPH_MAX_FANIN_PER_TASK];
+    PTO2GraphBindings bindings;
+    PTO2GraphTemplate temp;
+};
+
+// The AICPU runtime DSO stays loaded for the DeviceRunner lifetime, so this
+// cache survives repeated simpler_run calls in the same process.
+PTO2GraphTemplate g_graph_templates[PTO2_GRAPH_TEMPLATE_CAP];
+int32_t g_graph_next_replace = 0;
+PTO2GraphRecordingState g_graph_recording;
+
+enum PTO2GraphUnsupportedReason : int32_t {
+    PTO2_GRAPH_UNSUPPORTED_NONE = 0,
+    PTO2_GRAPH_UNSUPPORTED_TASK_WINDOW = 1,
+    PTO2_GRAPH_UNSUPPORTED_NULL_PRODUCER = 2,
+    PTO2_GRAPH_UNSUPPORTED_EXTERNAL_PRODUCER = 3,
+    PTO2_GRAPH_UNSUPPORTED_FANIN_OVERFLOW = 4,
+    PTO2_GRAPH_UNSUPPORTED_RECORD_TASK_ORDER = 5,
+    PTO2_GRAPH_UNSUPPORTED_RECORD_TASK_NULL = 6,
+    PTO2_GRAPH_UNSUPPORTED_ARG_OVERFLOW = 7,
+    PTO2_GRAPH_UNSUPPORTED_TENSOR_SOURCE = 8,
+    PTO2_GRAPH_UNSUPPORTED_NESTED_SCOPE = 9,
+};
+
+void graph_mark_unsupported(PTO2GraphUnsupportedReason reason, int32_t task_index = -1, int32_t tensor_index = -1) {
+    if (!g_graph_recording.unsupported) {
+        g_graph_recording.unsupported_reason = static_cast<int32_t>(reason);
+        g_graph_recording.unsupported_task_index = task_index;
+        g_graph_recording.unsupported_tensor_index = tensor_index;
+    }
+    g_graph_recording.unsupported = true;
+}
+
+void reset_graph_template_header(PTO2GraphTemplate *templ) {
+    templ->in_use = false;
+    templ->full_key = 0;
+    templ->task_count = 0;
+}
+
+void reset_graph_recording() {
+    g_graph_recording.active = false;
+    g_graph_recording.unsupported = false;
+    g_graph_recording.unsupported_reason = PTO2_GRAPH_UNSUPPORTED_NONE;
+    g_graph_recording.unsupported_task_index = -1;
+    g_graph_recording.unsupported_tensor_index = -1;
+    g_graph_recording.full_key = 0;
+    g_graph_recording.start_local_task_id = 0;
+    g_graph_recording.current_task_index = -1;
+    g_graph_recording.current_fanin_count = 0;
+    g_graph_recording.bindings = PTO2GraphBindings{};
+    reset_graph_template_header(&g_graph_recording.temp);
+}
+
+uint64_t graph_full_key(uint64_t callable_hash, uint64_t graph_key) {
+    uint64_t h = 1469598103934665603ULL;
+    h = pto2_graph_hash_bytes(h, &PTO2_GRAPH_CACHE_SCHEMA_VERSION, sizeof(PTO2_GRAPH_CACHE_SCHEMA_VERSION));
+    h = pto2_graph_hash_bytes(h, &callable_hash, sizeof(callable_hash));
+    return pto2_graph_hash_bytes(h, &graph_key, sizeof(graph_key));
+}
+
+PTO2GraphTemplate *find_graph_template(uint64_t full_key) {
+    for (int32_t i = 0; i < PTO2_GRAPH_TEMPLATE_CAP; ++i) {
+        if (g_graph_templates[i].in_use && g_graph_templates[i].full_key == full_key) {
+            return &g_graph_templates[i];
+        }
+    }
+    return nullptr;
+}
+
+void store_graph_template(const PTO2GraphTemplate &templ) {
+    int32_t target = -1;
+    for (int32_t i = 0; i < PTO2_GRAPH_TEMPLATE_CAP; ++i) {
+        if (!g_graph_templates[i].in_use) {
+            target = i;
+            break;
+        }
+    }
+    if (target < 0) {
+        target = g_graph_next_replace;
+        g_graph_next_replace = (g_graph_next_replace + 1) % PTO2_GRAPH_TEMPLATE_CAP;
+    }
+    g_graph_templates[target] = templ;
+    g_graph_templates[target].in_use = true;
+}
+
+void graph_record_begin_task(PTO2TaskId task_id) {
+    if (!g_graph_recording.active || g_graph_recording.unsupported) return;
+    int32_t idx = static_cast<int32_t>(task_id.local()) - g_graph_recording.start_local_task_id;
+    if (idx < 0 || idx >= PTO2_GRAPH_MAX_TASKS || idx != g_graph_recording.temp.task_count) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_TASK_WINDOW, idx);
+        return;
+    }
+    g_graph_recording.current_task_index = idx;
+    g_graph_recording.current_fanin_count = 0;
+}
+
+void graph_record_note_fanin(PTO2TaskSlotState *producer) {
+    if (!g_graph_recording.active || g_graph_recording.unsupported) return;
+    if (producer == nullptr || producer->task == nullptr) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_NULL_PRODUCER, g_graph_recording.current_task_index);
+        return;
+    }
+    int32_t producer_local = static_cast<int32_t>(producer->task->task_id.local());
+    int32_t producer_index = producer_local - g_graph_recording.start_local_task_id;
+    if (producer_index >= g_graph_recording.current_task_index) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_EXTERNAL_PRODUCER, g_graph_recording.current_task_index);
+        return;
+    }
+    if (g_graph_recording.current_fanin_count >= PTO2_GRAPH_MAX_FANIN_PER_TASK) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_FANIN_OVERFLOW, g_graph_recording.current_task_index);
+        return;
+    }
+    PTO2GraphFaninRef &fanin = g_graph_recording.current_fanins[g_graph_recording.current_fanin_count++];
+    if (producer_index >= 0) {
+        fanin.source = PTO2GraphFaninSource::INTERNAL;
+        fanin.value = producer_index;
+    } else {
+        fanin.source = PTO2GraphFaninSource::EXTERNAL_LOCAL_DELTA;
+        fanin.value = producer_local - g_graph_recording.start_local_task_id;
+    }
+}
+
+}  // namespace
+
 static bool append_fanin_or_fail(
     PTO2OrchestratorState *orch, PTO2TaskSlotState *consumer, int32_t prod_slot, PTO2TaskSlotState *producer,
     uint32_t seen_epoch
 ) {
-    if (producer->task_state.load(std::memory_order_acquire) == PTO2_TASK_COMPLETED) {
-        return true;
-    }
+    if (producer == nullptr) return true;
     if (orch->fanin_seen_epoch[prod_slot] == seen_epoch) {
         return true;
     }
     orch->fanin_seen_epoch[prod_slot] = seen_epoch;
 
-    PTO2DepListEntry *head = orch->dep_pool.prepend(producer->fanout_head, consumer);
-    if (head == nullptr) {
+    graph_record_note_fanin(producer);
+
+    PTO2DepListEntry *head = producer->fanout_head.load(std::memory_order_acquire);
+    if (producer->task_state.load(std::memory_order_acquire) >= PTO2_TASK_COMPLETED || pto2_is_fanout_closed(head)) {
+        return true;
+    }
+
+    PTO2DepListEntry *entry = orch->dep_pool.alloc();
+    if (entry == nullptr) {
         orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
         return false;
     }
-    producer->fanout_head = head;
+    entry->slot_state = consumer;
     consumer->fanin_count++;
-    return true;
+    while (true) {
+        if (producer->task_state.load(std::memory_order_acquire) >= PTO2_TASK_COMPLETED ||
+            pto2_is_fanout_closed(head)) {
+            consumer->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
+            return true;
+        }
+        entry->next = head;
+        if (producer->fanout_head.compare_exchange_weak(
+                head, entry, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            return true;
+        }
+    }
 }
 
 struct PTO2PreparedTask {
@@ -244,6 +448,275 @@ struct PTO2PreparedTask {
     PTO2TaskPayload *payload = nullptr;
     PTO2TaskSlotState *slot_state = nullptr;
 };
+
+namespace {
+
+static bool prepare_graph_task(PTO2OrchestratorState *orch, const PTO2GraphTaskTemplate &templ, PTO2PreparedTask *out) {
+    out->alloc_result = orch->task_allocator.alloc(templ.total_output_size);
+    if (out->alloc_result.failed()) {
+        orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
+        return false;
+    }
+
+    out->task_id = PTO2TaskId::make(0, static_cast<uint32_t>(out->alloc_result.task_id));
+    out->slot_state = &orch->sm_header->get_slot_state_by_slot(out->alloc_result.slot);
+    out->task = &orch->sm_header->task_descriptors[out->alloc_result.slot];
+    out->payload = &orch->sm_header->task_payloads[out->alloc_result.slot];
+    out->payload->prefetch(templ.tensor_count, templ.scalar_count);
+    out->slot_state->bind_buffers(out->payload, out->task);
+    out->slot_state->fanout_head.store(nullptr, std::memory_order_relaxed);
+    out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+    out->slot_state->fanin_refcount.store(0, std::memory_order_relaxed);
+    out->slot_state->fanin_count = 1;
+    out->slot_state->active_mask = templ.active_mask;
+    out->slot_state->bind_ring(0);
+    out->slot_state->set_allow_early_resolve(templ.allow_early_resolve);
+    out->slot_state->ready_state.store(PTO2_READY_UNCLAIMED, std::memory_order_relaxed);
+    out->slot_state->completed_subtasks.store(0, std::memory_order_relaxed);
+    out->slot_state->total_required_subtasks = templ.total_required_subtasks;
+    out->slot_state->logical_block_num = templ.logical_block_num;
+    out->slot_state->next_block_idx.store(0, std::memory_order_relaxed);
+    return true;
+}
+
+static bool graph_tensor_from_boundary(const Tensor &tensor, const PTO2GraphBindings &bindings, uint16_t *out_index) {
+    for (uint32_t i = 0; i < bindings.tensor_count; ++i) {
+        const Tensor &boundary = bindings.tensors[i];
+        if (tensor.buffer.addr == boundary.buffer.addr && tensor.buffer.size == boundary.buffer.size) {
+            *out_index = static_cast<uint16_t>(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+graph_classify_tensor(PTO2GraphTaskTemplate *task, int32_t tensor_index, const Tensor &tensor, int32_t task_index) {
+    PTO2GraphTensorPatch &patch = task->tensor_patch[tensor_index];
+    uint16_t boundary_index = 0;
+    if (graph_tensor_from_boundary(tensor, g_graph_recording.bindings, &boundary_index)) {
+        patch.source = PTO2GraphTensorSource::BOUNDARY;
+        patch.source_index = boundary_index;
+        patch.packed_offset = 0;
+        return true;
+    }
+
+    uint64_t tensor_addr = tensor.buffer.addr;
+    for (int32_t producer_index = task_index; producer_index >= 0; --producer_index) {
+        const PTO2GraphTaskTemplate &producer =
+            (producer_index == task_index) ? *task : g_graph_recording.temp.tasks[producer_index];
+        if (producer.record_packed_base == 0 || producer.total_output_size <= 0) continue;
+        uint64_t producer_begin = producer.record_packed_base;
+        uint64_t producer_end = producer_begin + static_cast<uint64_t>(producer.total_output_size);
+        if (tensor_addr < producer_begin || tensor_addr >= producer_end) continue;
+        patch.source =
+            producer_index == task_index ? PTO2GraphTensorSource::OWN_OUTPUT : PTO2GraphTensorSource::INTERNAL;
+        patch.source_index = static_cast<uint16_t>(producer_index);
+        patch.packed_offset = tensor_addr - producer_begin;
+        return true;
+    }
+    return false;
+}
+
+static void graph_record_task(const PTO2PreparedTask &prepared, bool completed_inline) {
+    if (!g_graph_recording.active || g_graph_recording.unsupported) return;
+    int32_t task_index = static_cast<int32_t>(prepared.task_id.local()) - g_graph_recording.start_local_task_id;
+    if (task_index < 0 || task_index >= PTO2_GRAPH_MAX_TASKS || task_index != g_graph_recording.temp.task_count) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_RECORD_TASK_ORDER, task_index);
+        return;
+    }
+    if (prepared.task == nullptr || prepared.payload == nullptr || prepared.slot_state == nullptr) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_RECORD_TASK_NULL, task_index);
+        return;
+    }
+
+    PTO2GraphTaskTemplate &task = g_graph_recording.temp.tasks[task_index];
+    task = PTO2GraphTaskTemplate{};
+    for (int i = 0; i < PTO2_SUBTASK_SLOT_COUNT; ++i)
+        task.kernel_id[i] = prepared.task->kernel_id[i];
+    task.active_mask = prepared.slot_state->active_mask;
+    task.logical_block_num = prepared.slot_state->logical_block_num;
+    task.total_required_subtasks = prepared.slot_state->total_required_subtasks;
+    task.completed_inline = completed_inline;
+    task.allow_early_resolve = prepared.slot_state->allow_early_resolve;
+    task.tensor_count = prepared.payload->tensor_count;
+    task.scalar_count = prepared.payload->scalar_count;
+    task.total_output_size = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(prepared.task->packed_buffer_end) -
+        reinterpret_cast<uintptr_t>(prepared.task->packed_buffer_base)
+    );
+    task.record_packed_base = reinterpret_cast<uint64_t>(prepared.task->packed_buffer_base);
+    if (task.tensor_count < 0 || task.tensor_count > MAX_TENSOR_ARGS || task.scalar_count < 0 ||
+        task.scalar_count > MAX_SCALAR_ARGS) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_ARG_OVERFLOW, task_index);
+        return;
+    }
+
+    for (int32_t i = 0; i < task.tensor_count; ++i) {
+        task.tensors[i].copy(prepared.payload->tensors[i]);
+        if (!graph_classify_tensor(&task, i, task.tensors[i], task_index)) {
+            graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_TENSOR_SOURCE, task_index, i);
+            return;
+        }
+    }
+    memcpy(task.scalars, prepared.payload->scalars, sizeof(uint64_t) * static_cast<size_t>(task.scalar_count));
+    task.fanin_count = g_graph_recording.current_fanin_count;
+    for (int32_t i = 0; i < task.fanin_count; ++i)
+        task.fanins[i] = g_graph_recording.current_fanins[i];
+
+    g_graph_recording.temp.task_count++;
+    g_graph_recording.current_task_index = -1;
+}
+
+static void graph_reset_payload(PTO2TaskPayload *payload) {
+    payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_NONE, std::memory_order_relaxed);
+    for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; ++w) {
+        payload->staged_core_mask[w].store(0, std::memory_order_relaxed);
+    }
+    payload->dispatch_fanin.store(0, std::memory_order_relaxed);
+    payload->dispatch_propagated.store(0, std::memory_order_relaxed);
+    payload->published_block_count.store(0, std::memory_order_relaxed);
+    payload->early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
+    payload->running_slot_count.store(0, std::memory_order_relaxed);
+    payload->early_sync_drain_state.store(PTO2_EARLY_SYNC_DRAIN_NONE, std::memory_order_relaxed);
+}
+
+static bool graph_template_preflight(
+    PTO2OrchestratorState *orch, const PTO2GraphTemplate &templ, const PTO2GraphBindings &bindings
+) {
+    if (templ.task_count <= 0 || templ.task_count > PTO2_GRAPH_MAX_TASKS) return false;
+    uint64_t required_heap = 0;
+    int32_t required_edges = 0;
+    for (int32_t i = 0; i < templ.task_count; ++i) {
+        const PTO2GraphTaskTemplate &task = templ.tasks[i];
+        if (task.tensor_count < 0 || task.tensor_count > MAX_TENSOR_ARGS || task.scalar_count < 0 ||
+            task.scalar_count > MAX_SCALAR_ARGS || task.fanin_count < 0 ||
+            task.fanin_count > PTO2_GRAPH_MAX_FANIN_PER_TASK || task.total_output_size < 0) {
+            return false;
+        }
+        required_heap += PTO2_ALIGN_UP(static_cast<uint64_t>(task.total_output_size), PTO2_ALIGN_SIZE);
+        required_edges += task.fanin_count;
+        for (int32_t j = 0; j < task.tensor_count; ++j) {
+            const PTO2GraphTensorPatch &patch = task.tensor_patch[j];
+            if (patch.source == PTO2GraphTensorSource::BOUNDARY && patch.source_index >= bindings.tensor_count) {
+                return false;
+            }
+            if (patch.source == PTO2GraphTensorSource::INTERNAL && patch.source_index >= i) return false;
+        }
+        for (int32_t e = 0; e < task.fanin_count; ++e) {
+            const PTO2GraphFaninRef &fanin = task.fanins[e];
+            if (fanin.source == PTO2GraphFaninSource::INTERNAL && (fanin.value < 0 || fanin.value >= i)) {
+                return false;
+            }
+        }
+    }
+    if (templ.task_count > orch->task_allocator.task_available()) return false;
+    if (required_heap > orch->task_allocator.heap_available()) return false;
+    if (required_edges > orch->dep_pool.available()) return false;
+    return true;
+}
+
+static bool graph_replay_template(
+    PTO2OrchestratorState *orch, const PTO2GraphTemplate &templ, const PTO2GraphBindings &bindings,
+    uint64_t *orch_record_task_id
+) {
+    if (orch_record_task_id != nullptr) *orch_record_task_id = PTO2TaskId::invalid().raw;
+    if (!graph_template_preflight(orch, templ, bindings)) return false;
+
+    const int32_t replay_start_local_task_id = orch->task_allocator.active_count();
+    PTO2PreparedTask prepared[PTO2_GRAPH_MAX_TASKS];
+    for (int32_t i = 0; i < templ.task_count; ++i) {
+        prepared[i] = PTO2PreparedTask{};
+        if (!prepare_graph_task(orch, templ.tasks[i], &prepared[i])) return false;
+    }
+
+    for (int32_t i = 0; i < templ.task_count; ++i) {
+        const PTO2GraphTaskTemplate &src = templ.tasks[i];
+        PTO2PreparedTask &dst = prepared[i];
+        PTO2TaskDescriptor &task = *dst.task;
+        PTO2TaskPayload &payload = *dst.payload;
+        PTO2TaskSlotState &slot = *dst.slot_state;
+
+        if (orch_record_task_id != nullptr && !PTO2TaskId{*orch_record_task_id}.is_valid() && !src.completed_inline) {
+            *orch_record_task_id = dst.task_id.raw;
+        }
+        task.task_id = dst.task_id;
+        for (int k = 0; k < PTO2_SUBTASK_SLOT_COUNT; ++k)
+            task.kernel_id[k] = src.kernel_id[k];
+        task.packed_buffer_base = dst.alloc_result.packed_base;
+        task.packed_buffer_end = dst.alloc_result.packed_end;
+
+        payload.tensor_count = src.tensor_count;
+        payload.scalar_count = src.scalar_count;
+        for (int32_t j = 0; j < src.tensor_count; ++j) {
+            Tensor tensor;
+            tensor.copy(src.tensors[j]);
+            const PTO2GraphTensorPatch &patch = src.tensor_patch[j];
+            if (patch.source == PTO2GraphTensorSource::BOUNDARY) {
+                const Tensor &boundary = bindings.tensors[patch.source_index];
+                tensor.buffer = boundary.buffer;
+                tensor.owner_task_id = boundary.owner_task_id;
+            } else {
+                int32_t producer_index =
+                    patch.source == PTO2GraphTensorSource::OWN_OUTPUT ? i : static_cast<int32_t>(patch.source_index);
+                PTO2PreparedTask &producer = prepared[producer_index];
+                tensor.buffer.addr =
+                    reinterpret_cast<uint64_t>(producer.task->packed_buffer_base) + patch.packed_offset;
+                tensor.owner_task_id = producer.task_id;
+            }
+            payload.tensors[j].copy(tensor);
+        }
+        memcpy(payload.scalars, src.scalars, sizeof(uint64_t) * static_cast<size_t>(src.scalar_count));
+        graph_reset_payload(&payload);
+
+        if (src.completed_inline) {
+            slot.mark_completed();
+            orch->inline_completed_tasks++;
+        }
+    }
+
+    for (int32_t i = 0; i < templ.task_count; ++i) {
+        const PTO2GraphTaskTemplate &consumer_template = templ.tasks[i];
+        PTO2TaskSlotState *consumer = prepared[i].slot_state;
+        if (consumer_template.completed_inline) continue;
+        uint32_t seen_epoch = next_fanin_seen_epoch(orch);
+        for (int32_t e = 0; e < consumer_template.fanin_count; ++e) {
+            const PTO2GraphFaninRef &fanin = consumer_template.fanins[e];
+            int32_t producer_slot = -1;
+            PTO2TaskSlotState *producer = nullptr;
+            if (fanin.source == PTO2GraphFaninSource::INTERNAL) {
+                producer_slot = prepared[fanin.value].alloc_result.slot;
+                producer = prepared[fanin.value].slot_state;
+            } else if (fanin.source == PTO2GraphFaninSource::EXTERNAL_LOCAL_DELTA) {
+                int32_t producer_local = replay_start_local_task_id + fanin.value;
+                if (producer_local < 0 || producer_local >= replay_start_local_task_id + i) {
+                    orch->report_fatal(
+                        PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "graph replay external fanin index overflow"
+                    );
+                    return false;
+                }
+                producer_slot = orch->sm_header->get_slot_by_task_id(producer_local);
+                producer =
+                    orch->sm_header->find_live_slot_state(PTO2TaskId::make(0, static_cast<uint32_t>(producer_local)));
+                if (producer == nullptr) continue;
+            } else {
+                orch->report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "graph replay unknown fanin source");
+                return false;
+            }
+            if (!append_fanin_or_fail(orch, consumer, producer_slot, producer, seen_epoch)) return false;
+        }
+    }
+
+    if (orch_record_task_id != nullptr && !PTO2TaskId{*orch_record_task_id}.is_valid()) {
+        *orch_record_task_id = prepared[0].task_id.raw;
+    }
+#if SIMPLER_DFX
+    orch->tasks_submitted += templ.task_count;
+#endif
+    return true;
+}
+
+}  // namespace
 
 static PTO2OutputLayout calculate_output_layout(const L0TaskArgs &args) {
     PTO2OutputLayout layout;
@@ -278,7 +751,15 @@ static bool prepare_task(
     out->payload->prefetch(args.tensor_count(), args.scalar_count());
 
     out->slot_state->bind_buffers(out->payload, out->task);
+    graph_reset_payload(out->payload);
+    out->slot_state->fanout_head.store(nullptr, std::memory_order_relaxed);
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+    out->slot_state->fanin_refcount.store(0, std::memory_order_relaxed);
+    out->slot_state->fanin_count = 1;
+    out->slot_state->bind_ring(0);
+    out->slot_state->ready_state.store(PTO2_READY_UNCLAIMED, std::memory_order_relaxed);
+    out->slot_state->completed_subtasks.store(0, std::memory_order_relaxed);
+    out->slot_state->next_block_idx.store(0, std::memory_order_relaxed);
     int16_t block_num = args.launch_spec.block_num();
     out->slot_state->total_required_subtasks =
         static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
@@ -329,8 +810,8 @@ void PTO2OrchestratorState::end_scope() {
     }
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
 
-    // Snapshot whole-graph bump positions at the scope boundary. Closing a
-    // scope never tears down tasks or storage in replay_graph.
+    // Snapshot the active graph-arena bump positions at the scope boundary.
+    // Closing a scope never publishes or reclaims an arena.
 #if SIMPLER_DFX
     // Gate via is_scope_stats_enabled() (see begin_scope). One collector call
     // emits the end-boundary record and tears down bookkeeping.
@@ -359,7 +840,7 @@ static bool ensure_tensormap_capacity(PTO2OrchestratorState *orch, int32_t neede
     if (tm.free_entries() >= needed) return true;
     orch->report_fatal(
         PTO2_ERROR_TENSORMAP_OVERFLOW, __FUNCTION__,
-        "whole graph exceeds TensorMap pool (used=%d needed=%d capacity=%d)", tm.current_used(), needed,
+        "orchestration exceeds TensorMap pool (used=%d needed=%d capacity=%d)", tm.current_used(), needed,
         tm.pool_capacity()
     );
     return false;
@@ -385,6 +866,7 @@ static TaskOutputTensors submit_task_common(
     PTO2TaskDescriptor &task = *prepared.task;
     PTO2TaskPayload &payload = *prepared.payload;
     result.set_task_id(task_id);
+    graph_record_begin_task(task_id);
 
     // dep_gen capture point: snapshot the orch submit_task inputs while the
     // tensormap is still in its pre-lookup state for this task. Replay reads
@@ -455,8 +937,10 @@ static TaskOutputTensors submit_task_common(
             orch->report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "dependency must name an earlier task");
             return result;
         }
-        PTO2TaskSlotState *producer = &orch->sm_header->get_slot_state_by_task_id(dep_local_task_id);
-        if (!append_fanin_or_fail(orch, &cur_slot_state, dep_local_task_id, producer, seen_epoch)) {
+        int32_t dep_slot = orch->sm_header->get_slot_by_task_id(dep_local_task_id);
+        PTO2TaskSlotState *producer = orch->sm_header->find_live_slot_state(dep_task_id);
+        if (producer == nullptr) continue;
+        if (!append_fanin_or_fail(orch, &cur_slot_state, dep_slot, producer, seen_epoch)) {
             return result;
         }
     }
@@ -468,8 +952,10 @@ static TaskOutputTensors submit_task_common(
     };
 
     auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
-        int32_t prod_slot = static_cast<int32_t>(producer_task_id.local());
-        PTO2TaskSlotState *producer = &orch->sm_header->get_slot_state_by_task_id(prod_slot);
+        int32_t producer_local = static_cast<int32_t>(producer_task_id.local());
+        int32_t prod_slot = orch->sm_header->get_slot_by_task_id(producer_local);
+        PTO2TaskSlotState *producer = orch->sm_header->find_live_slot_state(producer_task_id);
+        if (producer == nullptr) return true;
         return append_fanin_or_fail(orch, &cur_slot_state, prod_slot, producer, seen_epoch);
     };
 
@@ -480,7 +966,7 @@ static TaskOutputTensors submit_task_common(
     CYCLE_COUNT_LAP(g_orch_lookup_cycle);
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
-    // The whole graph must fit; no TensorMap entries retire during orchestration.
+    // TensorMap entries do not retire during one orchestration invocation.
     int32_t tensormap_needed = count_registrable_outputs(dep_inputs, orch->in_manual_scope());
     if (tensormap_needed > 0 && !ensure_tensormap_capacity(orch, tensormap_needed)) {
         return result;
@@ -508,6 +994,7 @@ static TaskOutputTensors submit_task_common(
 
     payload.init(args, result, prepared.alloc_result, layout);
     cur_slot_state.set_allow_early_resolve(args.allow_early_resolve());
+    graph_record_task(prepared, /*completed_inline=*/false);
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         if (args.scalar_count() > 0) {
@@ -526,8 +1013,6 @@ static TaskOutputTensors submit_task_common(
 #endif
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
-
-    if (cur_slot_state.fanin_count == 0) orch->push_initial_ready(&cur_slot_state);
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
     CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);
@@ -678,6 +1163,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
 
     PTO2TaskDescriptor &task = *prepared.task;
     PTO2TaskPayload &payload = *prepared.payload;
+    graph_record_begin_task(prepared.task_id);
 
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
@@ -707,6 +1193,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
         // omit the dependency edge entirely.
         prepared.slot_state->mark_completed();
     }
+    graph_record_task(prepared, /*completed_inline=*/true);
     orch->inline_completed_tasks++;
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
@@ -721,6 +1208,78 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
 #endif
 
     return outputs;
+}
+
+PTO2GraphScopeResult
+PTO2OrchestratorState::graph_begin(uint64_t graph_key, const PTO2GraphBindings &bindings, uint64_t callable_hash) {
+    PTO2GraphScopeResult result;
+    auto *orch = this;
+    if (orch->fatal || bindings.overflow) return result;
+    if (g_graph_recording.active) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_NESTED_SCOPE);
+        return result;
+    }
+
+    uint64_t full_key = graph_full_key(callable_hash, graph_key);
+    PTO2GraphTemplate *cached = find_graph_template(full_key);
+    if (cached != nullptr) {
+#if SIMPLER_DFX
+        bool record_replay_orch = orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES;
+        uint64_t replay_start_ts = record_replay_orch ? get_sys_cnt_aicpu() : 0;
+#endif
+        uint64_t replay_orch_task_id = PTO2TaskId::invalid().raw;
+        if (graph_replay_template(orch, *cached, bindings, &replay_orch_task_id)) {
+#if SIMPLER_DFX
+            if (record_replay_orch) {
+                l2_swimlane_aicpu_record_orch_phase(
+                    replay_start_ts, get_sys_cnt_aicpu(), replay_orch_task_id, g_orch_submit_idx++
+                );
+            }
+#endif
+            LOG_INFO_V0(
+                "[GraphCache] replay key=0x%llx tasks=%d", static_cast<unsigned long long>(full_key), cached->task_count
+            );
+            result.execute_block = false;
+            result.recording = false;
+            return result;
+        }
+        if (orch->fatal) return result;
+    }
+
+    reset_graph_recording();
+    g_graph_recording.active = true;
+    g_graph_recording.full_key = full_key;
+    g_graph_recording.start_local_task_id = orch->task_allocator.active_count();
+    g_graph_recording.bindings = bindings;
+    reset_graph_template_header(&g_graph_recording.temp);
+    g_graph_recording.temp.full_key = full_key;
+    result.execute_block = true;
+    result.recording = true;
+    return result;
+}
+
+void PTO2OrchestratorState::graph_end(PTO2GraphCacheStats *stats) {
+    if (!g_graph_recording.active) return;
+    if (g_graph_recording.unsupported || g_graph_recording.temp.task_count <= 0) {
+        if (stats != nullptr && g_graph_recording.unsupported) stats->overflow++;
+        if (g_graph_recording.unsupported) {
+            LOG_WARN(
+                "graph cache record skipped: reason=%d task_index=%d tensor_index=%d recorded_tasks=%d",
+                g_graph_recording.unsupported_reason, g_graph_recording.unsupported_task_index,
+                g_graph_recording.unsupported_tensor_index, g_graph_recording.temp.task_count
+            );
+        }
+        reset_graph_recording();
+        return;
+    }
+    g_graph_recording.temp.in_use = true;
+    store_graph_template(g_graph_recording.temp);
+    if (stats != nullptr) stats->recorded++;
+    LOG_INFO_V0(
+        "[GraphCache] record key=0x%llx tasks=%d", static_cast<unsigned long long>(g_graph_recording.full_key),
+        g_graph_recording.temp.task_count
+    );
+    reset_graph_recording();
 }
 
 // =============================================================================

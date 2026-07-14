@@ -129,8 +129,9 @@ apply_env_value(const char *name, uint64_t min_val, uint64_t max_val, bool requi
 
 // ring_task_window / ring_heap / ring_dep_pool point into the #pragma pack(1)
 // RuntimeEnv wire struct (call_config.h), so their uint64_t entries are only
-// byte-aligned — runtime_env sits at offset 28 in CallConfig (after 7 int32_t),
-// i.e. 4-byte but not 8-byte aligned. Reading them as `base[idx]` is an
+// byte-aligned — runtime_env sits at offset 32 in CallConfig (after 8 int32_t),
+// which is not guaranteed to satisfy uint64_t alignment under packed ABI.
+// Reading them as `base[idx]` is an
 // unaligned 8-byte load: UB, and fatal under UBSan (-fsanitize=alignment). Copy
 // the bytes out instead. A null base means "no per-task overrides" -> 0 (unset).
 static uint64_t read_ring_override(const uint64_t *base, int idx) {
@@ -521,12 +522,6 @@ static bool stage_device_args(
     return true;
 }
 
-// replay_graph always freezes the complete graph before scheduling.
-static void apply_orch_sched_env_flags(Runtime *runtime) {
-    runtime->dev.serial_orch_sched = true;
-    LOG_INFO_V0("Replay graph orchestrator-to-scheduler phase barrier: enabled");
-}
-
 // per-(cid,config): reserve and acquire the static device pools. GM heap, PTO2
 // shared memory, and the prebuilt runtime arena all live in one backing
 // allocation; setup_static_arena reserves the three regions and commits in one
@@ -757,7 +752,6 @@ extern "C" int bind_callable_to_runtime_impl(
         return -1;
     }
 
-    apply_orch_sched_env_flags(runtime);
 
     int64_t t_prebuilt_start = _now_ms();
     {

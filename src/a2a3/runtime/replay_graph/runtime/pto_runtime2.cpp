@@ -61,6 +61,22 @@ static TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const L0TaskArg
     return rt->orchestrator.submit_dummy_task(args);
 }
 
+static PTO2GraphScopeResult graph_begin_impl(PTO2Runtime *rt, uint64_t graph_key, const PTO2GraphBindings &bindings) {
+    if (rt == nullptr || !rt->graph_cache_enabled) return PTO2GraphScopeResult{};
+    PTO2GraphScopeResult result = rt->orchestrator.graph_begin(graph_key, bindings, rt->active_callable_hash);
+    if (!result.execute_block) {
+        rt->graph_cache_stats.replayed++;
+    } else if (result.recording) {
+        rt->graph_cache_stats.missed++;
+    }
+    return result;
+}
+
+static void graph_end_impl(PTO2Runtime *rt) {
+    if (rt == nullptr || !rt->graph_cache_enabled) return;
+    rt->orchestrator.graph_end(&rt->graph_cache_stats);
+}
+
 void rt_scope_begin(PTO2Runtime *rt) {
     PTO2ScopeMode mode = rt->pending_scope_mode;
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
@@ -69,7 +85,93 @@ void rt_scope_begin(PTO2Runtime *rt) {
 
 void rt_scope_end(PTO2Runtime *rt) { rt->orchestrator.end_scope(); }
 
-void rt_orchestration_done(PTO2Runtime *rt) { rt->orchestrator.mark_done(); }
+void rt_orchestration_done(PTO2Runtime *rt) {
+    if (rt == nullptr) return;
+    if (!rt->orchestrator.fatal) {
+        rt->graph_pipeline.all_done.store(1, std::memory_order_release);
+        rt_graph_boundary(rt);
+    }
+    rt->orchestrator.mark_done();
+}
+
+void rt_graph_boundary(PTO2Runtime *rt) {
+    if (rt == nullptr || rt->orchestrator.sm_header == nullptr || rt->orchestrator.fatal) return;
+
+    PTO2ReplayGraphPipelineState &pipeline = rt->graph_pipeline;
+    const int32_t buffer_id = pipeline.active_buffer;
+    if (buffer_id < 0 || buffer_id >= PTO2_REPLAY_GRAPH_BUFFER_COUNT) {
+        rt->orchestrator.report_fatal(
+            PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "invalid active graph buffer id=%d", buffer_id
+        );
+        return;
+    }
+
+    PTO2ReplayGraphBufferControl &buffer = pipeline.buffers[buffer_id];
+    const int32_t task_end = rt->orchestrator.sm_header->fc.task_count.load(std::memory_order_acquire);
+    const int32_t task_begin = buffer.task_begin;
+    if (task_end < task_begin) {
+        rt->orchestrator.report_fatal(
+            PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "invalid graph task range [%d,%d)", task_begin, task_end
+        );
+        return;
+    }
+
+    buffer.task_count = task_end - task_begin;
+    int32_t completed_count = 0;
+    for (int32_t task_id = task_begin; task_id < task_end; task_id++) {
+        PTO2TaskSlotState &slot = rt->orchestrator.sm_header->get_slot_state_by_task_id(task_id);
+        if (slot.task_state.load(std::memory_order_acquire) >= PTO2_TASK_COMPLETED) completed_count++;
+    }
+    buffer.completed_count.store(completed_count, std::memory_order_release);
+    if (completed_count >= buffer.task_count) {
+        buffer.exec_done.store(1, std::memory_order_release);
+        buffer.state.store(PTO2ReplayGraphBufferState::DONE, std::memory_order_release);
+    } else {
+        buffer.exec_done.store(0, std::memory_order_release);
+        buffer.state.store(PTO2ReplayGraphBufferState::RUNNING, std::memory_order_release);
+    }
+    pipeline.published_task_count.store(task_end, std::memory_order_release);
+
+    if (rt->orchestrator.scheduler != nullptr) {
+        for (int32_t task_id = task_begin; task_id < task_end; task_id++) {
+            PTO2TaskSlotState &slot = rt->orchestrator.sm_header->get_slot_state_by_task_id(task_id);
+            if (slot.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) {
+                slot.payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel);
+                rt->orchestrator.scheduler->release_fanin_and_check_ready(slot);
+            }
+        }
+    }
+
+    pipeline.graph_count++;
+    pipeline.current_graph_epoch++;
+
+    const int32_t next_buffer_id = (buffer_id + 1) % PTO2_REPLAY_GRAPH_BUFFER_COUNT;
+    PTO2ReplayGraphBufferControl &next = pipeline.buffers[next_buffer_id];
+    next.dep_closed.store(1, std::memory_order_release);
+    pto2_try_release_graph_buffer(next);
+
+    if (pipeline.all_done.load(std::memory_order_acquire) != 0) {
+        buffer.dep_closed.store(1, std::memory_order_release);
+        pto2_try_release_graph_buffer(buffer);
+        return;
+    }
+
+    while (next.state.load(std::memory_order_acquire) != PTO2ReplayGraphBufferState::FREE) {
+        pto2_try_release_graph_buffer(next);
+        if (rt->orchestrator.fatal) return;
+        SPIN_WAIT_HINT();
+    }
+
+    rt->orchestrator.task_allocator.begin_buffer(next_buffer_id);
+    next.state.store(PTO2ReplayGraphBufferState::BUILDING, std::memory_order_release);
+    next.exec_done.store(0, std::memory_order_relaxed);
+    next.dep_closed.store(0, std::memory_order_relaxed);
+    next.completed_count.store(0, std::memory_order_relaxed);
+    next.graph_epoch = pipeline.current_graph_epoch;
+    next.task_begin = task_end;
+    next.task_count = 0;
+    pipeline.active_buffer = next_buffer_id;
+}
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
@@ -154,16 +256,16 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, const c
     auto do_wait = [&]() {
         // Step A: creator retention — read owner directly from tensor metadata
         if (owner.is_valid()) {
-            auto &s = orch.sm_header->get_slot_state_by_task_id(owner.local());
-            try_push(s);
+            PTO2TaskSlotState *s = orch.sm_header->find_live_slot_state(owner);
+            if (s != nullptr) try_push(*s);
             if (failed) return;
         }
 
         // Step B: modifier writer lookup (OverlapMap), direct callback
         orch.tensor_map.lookup(tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus) -> bool {
             PTO2TaskId pid = entry.producer_task_id;
-            auto &s = orch.sm_header->get_slot_state_by_task_id(pid.local());
-            try_push(s);
+            PTO2TaskSlotState *s = orch.sm_header->find_live_slot_state(pid);
+            if (s != nullptr) try_push(*s);
             return !failed;
         });
         if (failed) return;
@@ -240,11 +342,14 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
     .submit_dummy_task = submit_dummy_task_impl,
+    .graph_begin = graph_begin_impl,
+    .graph_end = graph_end_impl,
 #if SIMPLER_DFX
     .scope_set_site = scope_set_site_impl,
 #else
     .scope_set_site = nullptr,
 #endif
+    .graph_boundary = rt_graph_boundary,
 };
 
 // =============================================================================
@@ -259,6 +364,7 @@ static const PTO2RuntimeOps s_runtime_ops = {
 
 void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count) {
     rt->ops = &s_runtime_ops;
+    rt->scheduler.graph_pipeline = &rt->graph_pipeline;
     rt->orchestrator.total_cluster_count = aic_count;
     rt->orchestrator.total_aiv_count = aiv_count;
 }

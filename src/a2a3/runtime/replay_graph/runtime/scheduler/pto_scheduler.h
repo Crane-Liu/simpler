@@ -16,13 +16,13 @@
  * 1. Maintaining per-resource-shape ready queues
  * 2. Tracking task state (PENDING -> COMPLETED)
  * 3. Managing fanin/fanout refcounts for dependency resolution
- * 4. Traversing the frozen fanout graph
+ * 4. Closing and traversing concurrent fanout stacks
  * 5. Two-stage mixed-task completion (subtask done bits → mixed-task complete)
  *
  * The Scheduler runs on Device AI_CPU and processes:
  * - Task state transitions based on fanin_refcount
- * - Whole-graph single-shot storage (no per-task reclamation)
- * - Ring pointer advancement for flow control
+ * - Graph-level task/heap arena completion accounting
+ * - Ready and early-dispatch queue progress
  *
  * Based on: docs/RUNTIME_LOGIC.md
  */
@@ -434,6 +434,7 @@ struct PTO2SchedulerLayout {
 struct PTO2SchedulerState {
     // Shared memory access
     PTO2SharedMemoryHeader *sm_header;
+    PTO2ReplayGraphPipelineState *graph_pipeline;
 
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
@@ -715,11 +716,12 @@ struct PTO2SchedulerState {
         }
         if (p.payload->dispatch_propagated.exchange(1, std::memory_order_acq_rel) != 0)
             return;  // already propagated once
-        PTO2DepListEntry *edge = p.fanout_head;
+        PTO2DepListEntry *edge = p.fanout_head.load(std::memory_order_acquire);
+        if (pto2_is_fanout_closed(edge)) return;
         for (; edge != nullptr; edge = edge->next) {
             PTO2TaskSlotState *c = edge->slot_state;
-            // fanin_count is the exact number of pending producer edges. No
-            // wiring sentinel is needed because the graph is frozen first.
+            // fanin_count includes the graph publish dependency and every
+            // pending producer edge.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (nf != c->fanin_count) continue;
             PTO2ResourceShape shape = c->active_mask.to_shape();
@@ -936,6 +938,27 @@ struct PTO2SchedulerState {
         return (prev + 1) == slot_state.total_required_subtasks;
     }
 
+    void record_graph_task_complete(PTO2TaskSlotState &slot_state) {
+        if (graph_pipeline == nullptr || slot_state.task == nullptr) return;
+
+        const int32_t task_id = static_cast<int32_t>(slot_state.task->task_id.local());
+        for (int32_t i = 0; i < PTO2_REPLAY_GRAPH_BUFFER_COUNT; i++) {
+            PTO2ReplayGraphBufferControl &buffer = graph_pipeline->buffers[i];
+            const int32_t begin = buffer.task_begin;
+            const int32_t end = begin + buffer.task_count;
+            if (task_id < begin || task_id >= end) continue;
+
+            const int32_t completed = buffer.completed_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (completed >= buffer.task_count) {
+                buffer.exec_done.store(1, std::memory_order_release);
+                if (!pto2_try_release_graph_buffer(buffer)) {
+                    buffer.state.store(PTO2ReplayGraphBufferState::DONE, std::memory_order_release);
+                }
+            }
+            return;
+        }
+    }
+
     /**
      * Two-stage completion: second stage.
      * Called exactly once when all subtasks of a task are done (i.e.,
@@ -972,7 +995,9 @@ struct PTO2SchedulerState {
 #endif
 
         slot_state.mark_completed();
-        PTO2DepListEntry *current = slot_state.fanout_head;
+        PTO2DepListEntry *current =
+            slot_state.fanout_head.exchange(pto2_fanout_closed_sentinel(), std::memory_order_acq_rel);
+        if (pto2_is_fanout_closed(current)) current = nullptr;
 
         // Fanout: notify consumers. A pre-staged consumer that becomes ready has
         // its doorbell rung INLINE (db = nullptr) the moment its node is reached,
@@ -1010,6 +1035,7 @@ struct PTO2SchedulerState {
         for (int i = 0; i < rel_sink.n; i++) {
             propagate_dispatch_fanin(*rel_sink.items[i]);
         }
+        record_graph_task_complete(slot_state);
 
 #if SIMPLER_SCHED_PROFILING
         g_sched_fanout_atomic_count[thread_idx] += fanout_atomics;
