@@ -65,6 +65,8 @@ enum class PTO2ScopeMode : uint8_t {
     MANUAL = 1,
 };
 
+inline constexpr uint16_t PTO2_GRAPH_SCALAR_STATIC = UINT16_MAX;
+
 /**
  * TaskOutputTensors — returned by submit, holds materialized output Tensors.
  *
@@ -219,6 +221,11 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     bool allow_early_resolve_{false};
     void set_allow_early_resolve(bool v = true) { allow_early_resolve_ = v; }
     bool allow_early_resolve() const { return allow_early_resolve_; }
+
+    uint16_t graph_scalar_binding(int32_t index) const {
+        always_assert(index >= 0 && index < scalar_count_);
+        return graph_scalar_bindings_[index];
+    }
 
     void clear() {
         Base::clear();
@@ -376,12 +383,30 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         (add_scalar_one(std::forward<Args>(args)), ...);
     }
 
+    // Preserve the scalar's graph-binding provenance so replay patches this
+    // argument from the current invocation instead of freezing its record value.
+    template <typename T>
+    void add_graph_scalar(T &&value, uint16_t binding_index) {
+        static_assert(is_supported_scalar_arg_v<T>, "add_graph_scalar: value must be arithmetic or enum");
+        if (binding_index == PTO2_GRAPH_SCALAR_STATIC) {
+            set_error("add_graph_scalar: invalid graph binding index");
+            return;
+        }
+        if (scalar_count_ >= MaxS) {
+            set_error(scalar_cap_msg());
+            return;
+        }
+        add_scalar_one(std::forward<T>(value), binding_index);
+    }
+
     void add_scalars(const uint64_t *values, int count) {
         if (count < 0 || scalar_count_ + count > MaxS) {
             set_error(scalar_cap_msg());
             return;
         }
         memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
+        for (int i = 0; i < count; ++i)
+            graph_scalar_bindings_[scalar_count_ + i] = PTO2_GRAPH_SCALAR_STATIC;
 #if SIMPLER_DFX
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
@@ -420,6 +445,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 #if SIMPLER_DFX
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
+        for (int i = 0; i < count; ++i)
+            graph_scalar_bindings_[scalar_count_ + i] = PTO2_GRAPH_SCALAR_STATIC;
         scalar_count_ += count;
     }
 
@@ -437,6 +464,9 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
+        memcpy(
+            &graph_scalar_bindings_[scalar_count_], &src.graph_scalar_bindings_[src_offset], count * sizeof(uint16_t)
+        );
 #if SIMPLER_DFX
         dump_arg_selection_.copy_scalar_dtypes_from(src.dump_arg_selection_, scalar_count_, src_offset, count);
 #endif
@@ -456,6 +486,7 @@ private:
 #endif
     const PTO2TaskId *explicit_deps_{nullptr};
     uint32_t explicit_dep_count_{0};
+    uint16_t graph_scalar_bindings_[MaxS];
 #if SIMPLER_DFX
     template <typename T>
     static constexpr bool is_supported_dump_arg_v =
@@ -476,8 +507,9 @@ private:
     }
 
     template <typename T>
-    void add_scalar_one(T &&value) {
+    void add_scalar_one(T &&value, uint16_t graph_binding = PTO2_GRAPH_SCALAR_STATIC) {
         scalars_[scalar_count_] = to_u64(value);
+        graph_scalar_bindings_[scalar_count_] = graph_binding;
 #if SIMPLER_DFX
         uintptr_t scalar_source_ptr = 0;
         if constexpr (std::is_lvalue_reference_v<T>) {

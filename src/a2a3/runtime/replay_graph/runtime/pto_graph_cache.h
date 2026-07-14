@@ -18,9 +18,10 @@
 #include "graph_cache_stats.h"
 #include "tensor.h"
 
-inline constexpr uint64_t PTO2_GRAPH_CACHE_SCHEMA_VERSION = 1;
+inline constexpr uint64_t PTO2_GRAPH_CACHE_SCHEMA_VERSION = 2;
 inline constexpr uint32_t PTO2_GRAPH_MAX_BOUNDARY_TENSORS = 32;
 inline constexpr uint32_t PTO2_GRAPH_MAX_BOUNDARY_SCALARS = 32;
+inline constexpr uint16_t PTO2_GRAPH_INVALID_BINDING = UINT16_MAX;
 
 struct PTO2GraphBindings {
     uint32_t tensor_count{0};
@@ -34,6 +35,28 @@ struct PTO2GraphScopeResult {
     bool execute_block{true};
     bool recording{false};
 };
+
+inline uint16_t rt_graph_bind_tensor(PTO2GraphBindings &bindings, const Tensor &tensor) {
+    if (bindings.tensor_count >= PTO2_GRAPH_MAX_BOUNDARY_TENSORS) {
+        bindings.overflow = true;
+        return PTO2_GRAPH_INVALID_BINDING;
+    }
+    uint16_t index = static_cast<uint16_t>(bindings.tensor_count++);
+    bindings.tensors[index].copy(tensor);
+    return index;
+}
+
+// Scalar values are invocation parameters. The structural key hashes only the
+// binding count; add_graph_scalar() links individual task slots to these values.
+inline uint16_t rt_graph_bind_scalar(PTO2GraphBindings &bindings, uint64_t scalar) {
+    if (bindings.scalar_count >= PTO2_GRAPH_MAX_BOUNDARY_SCALARS) {
+        bindings.overflow = true;
+        return PTO2_GRAPH_INVALID_BINDING;
+    }
+    uint16_t index = static_cast<uint16_t>(bindings.scalar_count++);
+    bindings.scalars[index] = scalar;
+    return index;
+}
 
 constexpr uint64_t pto2_graph_hash_byte(uint64_t h, uint8_t b) {
     return (h ^ static_cast<uint64_t>(b)) * 1099511628211ULL;
@@ -62,17 +85,12 @@ inline uint64_t rt_graph_make_key(uint64_t namespace_hash, const PTO2GraphBindin
     for (uint32_t i = 0; i < bindings.tensor_count; ++i) {
         const Tensor &t = bindings.tensors[i];
         h = pto2_graph_hash_bytes(h, &t.buffer.size, sizeof(t.buffer.size));
-        h = pto2_graph_hash_bytes(h, &t.start_offset, sizeof(t.start_offset));
-        h = pto2_graph_hash_bytes(h, &t.version, sizeof(t.version));
         h = pto2_graph_hash_bytes(h, &t.ndims, sizeof(t.ndims));
         h = pto2_graph_hash_bytes(h, &t.dtype, sizeof(t.dtype));
         h = pto2_graph_hash_bytes(h, &t.manual_dep, sizeof(t.manual_dep));
         h = pto2_graph_hash_bytes(h, &t.is_contiguous, sizeof(t.is_contiguous));
         h = pto2_graph_hash_bytes(h, t.shapes, sizeof(uint32_t) * t.ndims);
         h = pto2_graph_hash_bytes(h, t.strides, sizeof(uint32_t) * t.ndims);
-    }
-    for (uint32_t i = 0; i < bindings.scalar_count; ++i) {
-        h = pto2_graph_hash_bytes(h, &bindings.scalars[i], sizeof(bindings.scalars[i]));
     }
     h = pto2_graph_hash_bytes(h, &bindings.overflow, sizeof(bindings.overflow));
     return h;

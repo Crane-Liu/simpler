@@ -20,53 +20,45 @@
 
 #include "pto_orchestration_api.h"
 
-static inline void qwen3_graph_add_tensor(PTO2GraphBindings &bindings, const Tensor &tensor) {
-    if (bindings.tensor_count >= PTO2_GRAPH_MAX_BOUNDARY_TENSORS) {
-        bindings.overflow = true;
-        return;
-    }
-    bindings.tensors[bindings.tensor_count++].copy(tensor);
-}
-
-static inline void qwen3_graph_add_scalar(PTO2GraphBindings &bindings, uint64_t scalar) {
-    if (bindings.scalar_count >= PTO2_GRAPH_MAX_BOUNDARY_SCALARS) {
-        bindings.overflow = true;
-        return;
-    }
-    bindings.scalars[bindings.scalar_count++] = scalar;
-}
+static constexpr uint16_t QWEN3_GRAPH_LAYER_INDEX = 0;
+static constexpr uint16_t QWEN3_GRAPH_HIDDEN_BASE = 1;
+static constexpr uint16_t QWEN3_GRAPH_INTER_BASE = 2;
+static constexpr uint16_t QWEN3_GRAPH_CACHE_BASE = 3;
 
 static PTO2GraphBindings make_qwen3_layer_graph_bindings(
     const Tensor &cur, const Tensor &next_hidden, const Tensor &ext_input_rms_weight, const Tensor &ext_wq,
-    const Tensor &ext_wk, const Tensor &ext_wv, const Tensor &ext_q_norm_weight, const Tensor &ext_k_norm_weight,
+    const Tensor &ext_wk, const Tensor &ext_wv, const Tensor &q_norm_weight, const Tensor &k_norm_weight,
     const Tensor &ext_seq_lens, const Tensor &ext_block_table, const Tensor &ext_slot_mapping,
     const Tensor &ext_rope_cos, const Tensor &ext_rope_sin, const Tensor &ext_k_cache, const Tensor &ext_v_cache,
     const Tensor &ext_wo, const Tensor &ext_w_gate, const Tensor &ext_w_up, const Tensor &ext_w_down,
-    const Tensor &ext_post_rms_weight, const Tensor &ext_out, int64_t layer_index
+    const Tensor &ext_post_rms_weight, int64_t layer_index, int64_t hidden_base, int64_t inter_base,
+    int64_t cache_base
 ) {
     PTO2GraphBindings bindings;
-    qwen3_graph_add_tensor(bindings, cur);
-    qwen3_graph_add_tensor(bindings, next_hidden);
-    qwen3_graph_add_tensor(bindings, ext_input_rms_weight);
-    qwen3_graph_add_tensor(bindings, ext_wq);
-    qwen3_graph_add_tensor(bindings, ext_wk);
-    qwen3_graph_add_tensor(bindings, ext_wv);
-    qwen3_graph_add_tensor(bindings, ext_q_norm_weight);
-    qwen3_graph_add_tensor(bindings, ext_k_norm_weight);
-    qwen3_graph_add_tensor(bindings, ext_seq_lens);
-    qwen3_graph_add_tensor(bindings, ext_block_table);
-    qwen3_graph_add_tensor(bindings, ext_slot_mapping);
-    qwen3_graph_add_tensor(bindings, ext_rope_cos);
-    qwen3_graph_add_tensor(bindings, ext_rope_sin);
-    qwen3_graph_add_tensor(bindings, ext_k_cache);
-    qwen3_graph_add_tensor(bindings, ext_v_cache);
-    qwen3_graph_add_tensor(bindings, ext_wo);
-    qwen3_graph_add_tensor(bindings, ext_w_gate);
-    qwen3_graph_add_tensor(bindings, ext_w_up);
-    qwen3_graph_add_tensor(bindings, ext_w_down);
-    qwen3_graph_add_tensor(bindings, ext_post_rms_weight);
-    qwen3_graph_add_tensor(bindings, ext_out);
-    qwen3_graph_add_scalar(bindings, static_cast<uint64_t>(layer_index));
+    rt_graph_bind_tensor(bindings, cur);
+    rt_graph_bind_tensor(bindings, next_hidden);
+    rt_graph_bind_tensor(bindings, ext_input_rms_weight);
+    rt_graph_bind_tensor(bindings, ext_wq);
+    rt_graph_bind_tensor(bindings, ext_wk);
+    rt_graph_bind_tensor(bindings, ext_wv);
+    rt_graph_bind_tensor(bindings, q_norm_weight);
+    rt_graph_bind_tensor(bindings, k_norm_weight);
+    rt_graph_bind_tensor(bindings, ext_seq_lens);
+    rt_graph_bind_tensor(bindings, ext_block_table);
+    rt_graph_bind_tensor(bindings, ext_slot_mapping);
+    rt_graph_bind_tensor(bindings, ext_rope_cos);
+    rt_graph_bind_tensor(bindings, ext_rope_sin);
+    rt_graph_bind_tensor(bindings, ext_k_cache);
+    rt_graph_bind_tensor(bindings, ext_v_cache);
+    rt_graph_bind_tensor(bindings, ext_wo);
+    rt_graph_bind_tensor(bindings, ext_w_gate);
+    rt_graph_bind_tensor(bindings, ext_w_up);
+    rt_graph_bind_tensor(bindings, ext_w_down);
+    rt_graph_bind_tensor(bindings, ext_post_rms_weight);
+    rt_graph_bind_scalar(bindings, static_cast<uint64_t>(layer_index));
+    rt_graph_bind_scalar(bindings, static_cast<uint64_t>(hidden_base));
+    rt_graph_bind_scalar(bindings, static_cast<uint64_t>(inter_base));
+    rt_graph_bind_scalar(bindings, static_cast<uint64_t>(cache_base));
     return bindings;
 }
 
@@ -123,10 +115,35 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
             TensorCreateInfo next_hidden_ci(next_hidden_ci_shapes, 2, DataType::BFLOAT16);
             TaskOutputTensors next_hidden_alloc = alloc_tensors(next_hidden_ci);
             const Tensor &next_hidden = next_hidden_alloc.get_ref(0);
+            int64_t layer_hidden_base_inline135 = (static_cast<int64_t>(i) * 5120);
+            int64_t layer_inter_base_inline231 = (static_cast<int64_t>(i) * 17408);
+            int64_t layer_cache_rows_inline153 = (2113536 / 3);
+            int64_t layer_cache_base_inline137 = (static_cast<int64_t>(i) * layer_cache_rows_inline153);
+            uint32_t q_norm_w_inline242_offsets[2] = {static_cast<uint32_t>(i), 0};
+            uint32_t q_norm_w_inline242_shapes[2] = {
+                (q_norm_w_inline242_offsets[0] >= ext_q_norm_weight.shapes[0] ?
+                     0u :
+                     std::min<uint32_t>(1, ext_q_norm_weight.shapes[0] - q_norm_w_inline242_offsets[0])),
+                (q_norm_w_inline242_offsets[1] >= ext_q_norm_weight.shapes[1] ?
+                     0u :
+                     std::min<uint32_t>(128, ext_q_norm_weight.shapes[1] - q_norm_w_inline242_offsets[1]))
+            };
+            Tensor q_norm_w_inline242 = ext_q_norm_weight.view(q_norm_w_inline242_shapes, q_norm_w_inline242_offsets);
+            uint32_t k_norm_w_inline138_offsets[2] = {static_cast<uint32_t>(i), 0};
+            uint32_t k_norm_w_inline138_shapes[2] = {
+                (k_norm_w_inline138_offsets[0] >= ext_k_norm_weight.shapes[0] ?
+                     0u :
+                     std::min<uint32_t>(1, ext_k_norm_weight.shapes[0] - k_norm_w_inline138_offsets[0])),
+                (k_norm_w_inline138_offsets[1] >= ext_k_norm_weight.shapes[1] ?
+                     0u :
+                     std::min<uint32_t>(128, ext_k_norm_weight.shapes[1] - k_norm_w_inline138_offsets[1]))
+            };
+            Tensor k_norm_w_inline138 = ext_k_norm_weight.view(k_norm_w_inline138_shapes, k_norm_w_inline138_offsets);
             PTO2GraphBindings layer_graph_bindings = make_qwen3_layer_graph_bindings(
-                cur__rv_v7, next_hidden, ext_input_rms_weight, ext_wq, ext_wk, ext_wv, ext_q_norm_weight,
-                ext_k_norm_weight, ext_seq_lens, ext_block_table, ext_slot_mapping, ext_rope_cos, ext_rope_sin,
-                ext_k_cache, ext_v_cache, ext_wo, ext_w_gate, ext_w_up, ext_w_down, ext_post_rms_weight, ext_out, i
+                cur__rv_v7, next_hidden, ext_input_rms_weight, ext_wq, ext_wk, ext_wv, q_norm_w_inline242,
+                k_norm_w_inline138, ext_seq_lens, ext_block_table, ext_slot_mapping, ext_rope_cos, ext_rope_sin,
+                ext_k_cache, ext_v_cache, ext_wo, ext_w_gate, ext_w_up, ext_w_down, ext_post_rms_weight, i,
+                layer_hidden_base_inline135, layer_inter_base_inline231, layer_cache_base_inline137
             );
             PTO2_GRAPH_SCOPE(
                 rt_graph_make_key(PTO2_GRAPH_KEY("qwen3_decode_3layer_layer_v1"), layer_graph_bindings),
@@ -233,37 +250,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 const Tensor &inv_rms_tile_inline255 = alloc_2.get_ref(9);
                 const Tensor &mlp_tile_inline238 = alloc_2.get_ref(10);
                 const Tensor &attn_fence_dummy_inline258 = alloc_2.get_ref(11);
-                int64_t layer_hidden_base_inline135 = (static_cast<int64_t>(i) * 5120);
-                int64_t layer_inter_base_inline231 = (static_cast<int64_t>(i) * 17408);
-                int64_t num_layers_actual_inline140 = 3;
-                int64_t t = 2113536;
-                int64_t layer_cache_rows_inline153 = (t / num_layers_actual_inline140);
-                int64_t layer_cache_base_inline137 = (static_cast<int64_t>(i) * layer_cache_rows_inline153);
                 int64_t user_batch_inline123 = 16;
                 int64_t t__tmp_v2 = 688;
                 int64_t max_blocks_per_seq_inline165 = (t__tmp_v2 / user_batch_inline123);
-                uint32_t q_norm_w_inline242_offsets[2] = {static_cast<uint32_t>(i), 0};
-                uint32_t q_norm_w_inline242_shapes[2] = {
-                    (q_norm_w_inline242_offsets[0] >= ext_q_norm_weight.shapes[0] ?
-                         0u :
-                         std::min<uint32_t>(1, ext_q_norm_weight.shapes[0] - q_norm_w_inline242_offsets[0])),
-                    (q_norm_w_inline242_offsets[1] >= ext_q_norm_weight.shapes[1] ?
-                         0u :
-                         std::min<uint32_t>(128, ext_q_norm_weight.shapes[1] - q_norm_w_inline242_offsets[1]))
-                };
-                Tensor q_norm_w_inline242 =
-                    ext_q_norm_weight.view(q_norm_w_inline242_shapes, q_norm_w_inline242_offsets);
-                uint32_t k_norm_w_inline138_offsets[2] = {static_cast<uint32_t>(i), 0};
-                uint32_t k_norm_w_inline138_shapes[2] = {
-                    (k_norm_w_inline138_offsets[0] >= ext_k_norm_weight.shapes[0] ?
-                         0u :
-                         std::min<uint32_t>(1, ext_k_norm_weight.shapes[0] - k_norm_w_inline138_offsets[0])),
-                    (k_norm_w_inline138_offsets[1] >= ext_k_norm_weight.shapes[1] ?
-                         0u :
-                         std::min<uint32_t>(128, ext_k_norm_weight.shapes[1] - k_norm_w_inline138_offsets[1]))
-                };
-                Tensor k_norm_w_inline138 =
-                    ext_k_norm_weight.view(k_norm_w_inline138_shapes, k_norm_w_inline138_offsets);
                 PTO2TaskId dcr_tids_inline154[5];
                 for (int64_t __init_i = 0; __init_i < 5; ++__init_i)
                     dcr_tids_inline154[__init_i] = PTO2TaskId::invalid();
@@ -273,7 +262,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 params_t1.add_inout(normed_states_inline146);
                 params_t1.add_input(cur__rv_v7);
                 params_t1.add_input(ext_input_rms_weight);
-                params_t1.add_scalar(i);
+                params_t1.add_graph_scalar(i, QWEN3_GRAPH_LAYER_INDEX);
                 params_t1.launch_spec.set_block_num(5);
                 rt_submit_aiv_task(1, params_t1);
 
@@ -293,7 +282,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 params_t4.add_inout(q_proj_inline129);
                 params_t4.add_input(normed_states_inline146);
                 params_t4.add_input(ext_wq);
-                params_t4.add_scalar(layer_hidden_base_inline135);
+                params_t4.add_graph_scalar(layer_hidden_base_inline135, QWEN3_GRAPH_HIDDEN_BASE);
                 params_t4.launch_spec.set_block_num(40);
                 rt_submit_aic_task(4, params_t4);
 
@@ -307,7 +296,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 params_t6.add_inout(k_proj_inline128);
                 params_t6.add_input(normed_states_inline146);
                 params_t6.add_input(ext_wk);
-                params_t6.add_scalar(layer_hidden_base_inline135);
+                params_t6.add_graph_scalar(layer_hidden_base_inline135, QWEN3_GRAPH_HIDDEN_BASE);
                 params_t6.launch_spec.set_block_num(8);
                 rt_submit_aic_task(6, params_t6);
 
@@ -321,7 +310,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 params_t8.add_inout(v_proj_inline152);
                 params_t8.add_input(normed_states_inline146);
                 params_t8.add_input(ext_wv);
-                params_t8.add_scalar(layer_hidden_base_inline135);
+                params_t8.add_graph_scalar(layer_hidden_base_inline135, QWEN3_GRAPH_HIDDEN_BASE);
                 params_t8.launch_spec.set_block_num(8);
                 rt_submit_aic_task(8, params_t8);
 
@@ -378,7 +367,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 params_t12.add_input(v_proj_inline152);
                 params_t12.add_input(q_inv_states_inline99);
                 params_t12.add_input(q_proj_norm_inline197);
-                params_t12.add_scalar(layer_cache_base_inline137);
+                params_t12.add_graph_scalar(layer_cache_base_inline137, QWEN3_GRAPH_CACHE_BASE);
                 params_t12.launch_spec.set_block_num(16);
                 rt_submit_aiv_task(12, params_t12);
 
@@ -414,7 +403,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 params_t16.add_input(ext_v_cache);
                 params_t16.add_inout(gm_pipe_buffer_0);
                 params_t16.add_scalar(max_blocks_per_seq_inline165);
-                params_t16.add_scalar(layer_cache_base_inline137);
+                params_t16.add_graph_scalar(layer_cache_base_inline137, QWEN3_GRAPH_CACHE_BASE);
                 MixedKernels mixed_16 = {16, 17, 17};
                 params_t16.launch_spec.set_block_num(24);
                 rt_submit_task(mixed_16, params_t16);
@@ -471,7 +460,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                             params_t20.add_input(ext_wo);
                             params_t20.add_inout(attn_proj_fp32_inline248);
                             params_t20.add_scalar(k_op_inline151);
-                            params_t20.add_scalar(layer_hidden_base_inline135);
+                            params_t20.add_graph_scalar(layer_hidden_base_inline135, QWEN3_GRAPH_HIDDEN_BASE);
                             params_t20.add_scalar(n_op_inline211);
                             PTO2TaskId params_t20_deps[2];
                             uint32_t params_t20_deps_count = 0;
@@ -519,7 +508,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                     params_t21.add_input(cur__rv_v7);
                     params_t21.add_input(ext_post_rms_weight);
                     params_t21.add_scalar(k_base_inline177);
-                    params_t21.add_scalar(i);
+                    params_t21.add_graph_scalar(i, QWEN3_GRAPH_LAYER_INDEX);
                     PTO2TaskId params_t21_deps[10];
                     uint32_t params_t21_deps_count = 0;
                     if (_submit_deps_buf_inline75[0].is_valid())
@@ -580,7 +569,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                     params_t22.add_input(cur__rv_v7);
                     params_t22.add_input(ext_post_rms_weight);
                     params_t22.add_scalar(k_base_inline177__ssa_v1);
-                    params_t22.add_scalar(i);
+                    params_t22.add_graph_scalar(i, QWEN3_GRAPH_LAYER_INDEX);
                     PTO2TaskId params_t22_deps[10];
                     uint32_t params_t22_deps_count = 0;
                     if (_submit_deps_buf_inline75__ssa_v1[0].is_valid())
@@ -641,7 +630,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                     params_t23.add_input(cur__rv_v7);
                     params_t23.add_input(ext_post_rms_weight);
                     params_t23.add_scalar(k_base_inline177__ssa_v2);
-                    params_t23.add_scalar(i);
+                    params_t23.add_graph_scalar(i, QWEN3_GRAPH_LAYER_INDEX);
                     PTO2TaskId params_t23_deps[10];
                     uint32_t params_t23_deps_count = 0;
                     if (_submit_deps_buf_inline75__ssa_v2[0].is_valid())
@@ -702,7 +691,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                     params_t24.add_input(cur__rv_v7);
                     params_t24.add_input(ext_post_rms_weight);
                     params_t24.add_scalar(k_base_inline177__ssa_v3);
-                    params_t24.add_scalar(i);
+                    params_t24.add_graph_scalar(i, QWEN3_GRAPH_LAYER_INDEX);
                     PTO2TaskId params_t24_deps[10];
                     uint32_t params_t24_deps_count = 0;
                     if (_submit_deps_buf_inline75__ssa_v3[0].is_valid())
@@ -763,7 +752,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                     params_t25.add_input(cur__rv_v7);
                     params_t25.add_input(ext_post_rms_weight);
                     params_t25.add_scalar(k_base_inline177__ssa_v4);
-                    params_t25.add_scalar(i);
+                    params_t25.add_graph_scalar(i, QWEN3_GRAPH_LAYER_INDEX);
                     PTO2TaskId params_t25_deps[10];
                     uint32_t params_t25_deps_count = 0;
                     if (_submit_deps_buf_inline75__ssa_v4[0].is_valid())
@@ -918,7 +907,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                             params_t27.add_input(ext_w_gate);
                             params_t27.add_inout(gate_acc_all_inline170);
                             params_t27.add_scalar(k0_inline202);
-                            params_t27.add_scalar(layer_hidden_base_inline135);
+                            params_t27.add_graph_scalar(layer_hidden_base_inline135, QWEN3_GRAPH_HIDDEN_BASE);
                             params_t27.add_scalar(n0_inline142);
                             PTO2TaskId params_t27_deps[2];
                             uint32_t params_t27_deps_count = 0;
@@ -943,7 +932,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                             params_t28.add_input(ext_w_up);
                             params_t28.add_inout(up_acc_all_inline247);
                             params_t28.add_scalar(k0_inline202);
-                            params_t28.add_scalar(layer_hidden_base_inline135);
+                            params_t28.add_graph_scalar(layer_hidden_base_inline135, QWEN3_GRAPH_HIDDEN_BASE);
                             params_t28.add_scalar(n0_inline142);
                             PTO2TaskId params_t28_deps[2];
                             uint32_t params_t28_deps_count = 0;
@@ -1037,7 +1026,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                             params_t30.add_input(ext_w_down);
                             params_t30.add_inout(down_acc_all_inline251);
                             params_t30.add_scalar(k0_inline202__ssa_v11);
-                            params_t30.add_scalar(layer_inter_base_inline231);
+                            params_t30.add_graph_scalar(layer_inter_base_inline231, QWEN3_GRAPH_INTER_BASE);
                             params_t30.add_scalar(n0_inline142__ssa_v8);
                             PTO2TaskId params_t30_deps[2];
                             uint32_t params_t30_deps_count = 0;
@@ -1176,19 +1165,19 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                         TaskOutputTensors task_32_outs = rt_submit_aiv_task(33, params_t32);
                     }
                 }
-                if (i == 2) {
-                    for (int64_t ob0 = 0; ob0 < 16; ob0 += 16) {
-                        PTO2_SCOPE() {
-                            // Task 33: copy_out
-                            L0TaskArgs params_t33;
-                            params_t33.add_output(ext_out);
-                            params_t33.add_input(next_hidden);
-                            params_t33.add_scalar(ob0);
-                            rt_submit_aiv_task(34, params_t33);
-                        }
+            }
+            }
+            if (i == 2) {
+                for (int64_t ob0 = 0; ob0 < 16; ob0 += 16) {
+                    PTO2_SCOPE() {
+                        // Task 33: copy_out
+                        L0TaskArgs params_t33;
+                        params_t33.add_output(ext_out);
+                        params_t33.add_input(next_hidden);
+                        params_t33.add_scalar(ob0);
+                        rt_submit_aiv_task(34, params_t33);
                     }
                 }
-            }
             }
             rt_graph_boundary();
             Tensor cur__ssa_v8 = next_hidden;
