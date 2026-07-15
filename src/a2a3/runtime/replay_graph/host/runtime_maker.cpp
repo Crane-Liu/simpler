@@ -30,19 +30,24 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <string>
 #include <thread>
@@ -71,6 +76,24 @@ static int64_t _now_ms() {
     struct timeval tv;
     gettimeofday(&tv, nullptr);
     return static_cast<int64_t>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
+}
+
+static int64_t _steady_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
+
+extern "C" uint64_t host_graph_record_now_ns() { return static_cast<uint64_t>(_steady_now_ns()); }
+
+extern "C" uint64_t host_graph_record_minor_faults() {
+    struct rusage usage {};
+#ifdef RUSAGE_THREAD
+    const int who = RUSAGE_THREAD;
+#else
+    const int who = RUSAGE_SELF;
+#endif
+    return getrusage(who, &usage) == 0 ? static_cast<uint64_t>(usage.ru_minflt) : 0;
 }
 
 static bool is_power_of_2_u64(uint64_t value) { return value != 0 && (value & (value - 1)) == 0; }
@@ -855,6 +878,10 @@ public:
         ptrs_ = ptrs;
         device_args_ = device_args;
         entry_points_ = static_cast<HostOrchEntryPoints *>(host_orch_func_ptr);
+#if SIMPLER_HOST_STRACE
+        strace_inv_ = simpler::strace::StraceScope::current_inv();
+        strace_hid_ = simpler::strace::StraceScope::current_hid();
+#endif
         if (runtime_ == nullptr || api_ == nullptr || entry_points_ == nullptr || entry_points_->entry == nullptr ||
             entry_points_->bind == nullptr || api_->capture_thread_context == nullptr ||
             api_->bind_thread_context == nullptr || api_->unbind_thread_context == nullptr) {
@@ -932,6 +959,9 @@ public:
         runtime_->set_host_orch_result(-1);
         try {
             worker_ = std::thread([this]() {
+#if SIMPLER_HOST_STRACE
+                STRACE_SET_CONTEXT(strace_inv_, strace_hid_);
+#endif
                 if (api_->bind_thread_context(thread_context_) != 0) {
                     LOG_ERROR("HostGraph async worker failed to bind the platform thread context");
                     result_ = -1;
@@ -939,6 +969,16 @@ public:
                     return;
                 }
                 worker_start_state_.store(1, std::memory_order_release);
+                {
+                    std::unique_lock<std::mutex> lock(run_gate_mutex_);
+                    run_gate_cv_.wait(lock, [this]() {
+                        return run_gate_state_.load(std::memory_order_acquire) != 0;
+                    });
+                }
+                if (run_gate_state_.load(std::memory_order_acquire) < 0) {
+                    api_->unbind_thread_context();
+                    return;
+                }
                 try {
                     run();
                 } catch (const std::exception &e) {
@@ -964,34 +1004,118 @@ public:
         return true;
     }
 
+    bool release_for_run() {
+        int32_t expected = 0;
+        if (!run_gate_state_.compare_exchange_strong(
+                expected, 1, std::memory_order_release, std::memory_order_acquire
+            )) {
+            return expected == 1;
+        }
+        run_gate_cv_.notify_one();
+        LOG_INFO_V0("HostGraph async worker released after runner profiling setup");
+        return true;
+    }
+
     bool publish_boundary(bool final_publish) {
         if (source_ == nullptr || target_ == nullptr || source_->orchestrator.sm_header == nullptr) return false;
+        const int32_t layer = publish_epoch_;
+        const int64_t boundary_start_ns = _steady_now_ns();
         const int32_t task_end =
             source_->orchestrator.sm_header->fc.task_count.load(std::memory_order_acquire);
+        const int32_t task_count = task_end - task_begin_;
+        const int64_t build_end_ns = boundary_start_ns;
+        const int64_t build_ns = task_count > 0 && layer_build_start_ns_ > 0 ? build_end_ns - layer_build_start_ns_ : 0;
+        const uint64_t recorded = source_->graph_cache_stats.recorded;
+        const uint64_t replayed = source_->graph_cache_stats.replayed;
+        const bool recorded_this_layer = recorded > last_cache_recorded_;
+        const bool replayed_this_layer = replayed > last_cache_replayed_;
+        const char *cache_mode =
+            recorded_this_layer ? (replayed_this_layer ? "mixed" : "record")
+                                : (replayed_this_layer ? "replay" : "none");
+        last_cache_recorded_ = recorded;
+        last_cache_replayed_ = replayed;
+        char trace_attrs[160];
+        std::snprintf(
+            trace_attrs, sizeof(trace_attrs), "layer=%d tasks=%d final=%d cache=%s", layer, task_count,
+            final_publish ? 1 : 0, cache_mode
+        );
+        if (build_ns > 0) {
+            STRACE_HOST_SPAN_AT(
+                "simpler_run.host_orch.layer_build", layer_build_start_ns_, build_ns, 1, trace_attrs
+            );
+        }
 
-        HostGraph graph;
-        if (!capture_host_graph_range(source_, task_begin_, task_end, &graph)) {
-            LOG_ERROR("Failed to capture HostGraph range [%d,%d)", task_begin_, task_end);
-            return false;
-        }
+        STRACE_A("simpler_run.host_orch.boundary", trace_attrs);
+        boundary_h2d_calls_ = 0;
+        boundary_h2d_bytes_ = 0;
+        boundary_d2h_reads_ = 0;
+
+        HostGraphHeader graph_header;
         const int32_t dep_begin = target_->orchestrator.dep_pool.top;
-        if (!import_host_graph(graph, target_, false)) {
-            LOG_ERROR("Failed to import HostGraph range [%d,%d)", task_begin_, task_end);
-            return false;
+        const int64_t materialize_start_ns = _steady_now_ns();
+        {
+            STRACE_A("simpler_run.host_orch.boundary.materialize", trace_attrs);
+            if (!materialize_host_graph_range(source_, task_begin_, task_end, target_, &graph_header)) {
+                LOG_ERROR("Failed to materialize HostGraph range [%d,%d)", task_begin_, task_end);
+                return false;
+            }
         }
+        const int64_t materialize_end_ns = _steady_now_ns();
         const int32_t dep_end = target_->orchestrator.dep_pool.top;
 
+        // Stage the inactive graph buffer while Device S executes the current
+        // range. The epoch remains unchanged, so Device S cannot observe the
+        // staged range until commit_graph_publication() writes it last.
+        const int64_t stage_upload_start_ns = materialize_end_ns;
+        {
+            STRACE_A("simpler_run.host_orch.boundary.stage_upload", trace_attrs);
+            if (!stage_graph_bytes(graph_header, dep_begin, dep_end)) return false;
+        }
+        const int64_t stage_upload_end_ns = _steady_now_ns();
+
         // A full previous-graph barrier replaces cross-range producer edges.
-        // Host can build/import the next range while S executes the current
-        // one, but it cannot publish that range until every prior task is done.
-        if (!wait_for_completion(publish_epoch_)) return false;
+        // Only the publication metadata remains after this barrier.
+        const int64_t wait_start_ns = stage_upload_end_ns;
+        {
+            STRACE_A("simpler_run.host_orch.boundary.wait", trace_attrs);
+            if (!wait_for_completion(publish_epoch_)) return false;
+        }
+        const int64_t wait_end_ns = _steady_now_ns();
 
         const int32_t next_epoch = publish_epoch_ + 1;
-        if (!publish_graph_bytes(graph, dep_begin, dep_end, next_epoch, final_publish)) return false;
+        const int64_t commit_start_ns = wait_end_ns;
+        {
+            STRACE_A("simpler_run.host_orch.boundary.commit", trace_attrs);
+            if (!commit_graph_publication(graph_header, next_epoch, final_publish)) return false;
+        }
+        const int64_t commit_end_ns = _steady_now_ns();
+        const int64_t release_wait_start_ns = commit_end_ns;
+        if (!final_publish) {
+            STRACE_A("simpler_run.host_orch.boundary.release_wait", trace_attrs);
+            if (!wait_for_release(next_epoch)) return false;
+        }
+        const int64_t release_wait_end_ns = _steady_now_ns();
+        const int64_t active_ns = build_ns + (materialize_end_ns - materialize_start_ns) +
+                                  (stage_upload_end_ns - stage_upload_start_ns) +
+                                  (commit_end_ns - commit_start_ns);
         publish_epoch_ = next_epoch;
         LOG_INFO_V0(
             "HostGraph async publish epoch=%d buffer=%d tasks=[%d,%d) edges=%d final=%d", publish_epoch_,
-            buffer_id_, task_begin_, task_end, graph.header.edge_count, final_publish ? 1 : 0
+            buffer_id_, task_begin_, task_end, graph_header.edge_count, final_publish ? 1 : 0
+        );
+        LOG_INFO_V0(
+            "[HostGraphProfile] layer=%d cache=%s tasks=%d edges=%d final=%d active_us=%.3f build_us=%.3f "
+            "materialize_us=%.3f stage_upload_us=%.3f wait_us=%.3f commit_us=%.3f "
+            "release_wait_us=%.3f h2d_calls=%llu h2d_bytes=%llu d2h_reads=%llu",
+            layer, cache_mode, task_count, graph_header.edge_count, final_publish ? 1 : 0, active_ns / 1000.0,
+            build_ns / 1000.0,
+            (materialize_end_ns - materialize_start_ns) / 1000.0,
+            (stage_upload_end_ns - stage_upload_start_ns) / 1000.0,
+            (wait_end_ns - wait_start_ns) / 1000.0, (commit_end_ns - commit_start_ns) / 1000.0,
+            (release_wait_end_ns - release_wait_start_ns) / 1000.0,
+            static_cast<unsigned long long>(boundary_h2d_calls_),
+            static_cast<unsigned long long>(boundary_h2d_bytes_),
+            static_cast<unsigned long long>(boundary_d2h_reads_)
         );
 
         if (!final_publish) {
@@ -1003,11 +1127,18 @@ public:
             target_->orchestrator.task_allocator.begin_buffer(next_buffer);
             buffer_id_ = next_buffer;
             task_begin_ = task_end;
+            layer_build_start_ns_ = _steady_now_ns();
         }
         return true;
     }
 
     int join() {
+        int32_t expected = 0;
+        if (run_gate_state_.compare_exchange_strong(
+                expected, -1, std::memory_order_release, std::memory_order_acquire
+            )) {
+            run_gate_cv_.notify_one();
+        }
         if (worker_.joinable()) worker_.join();
         return result_;
     }
@@ -1021,6 +1152,8 @@ private:
         }
         void *dst = static_cast<void *>(static_cast<char *>(ptrs_.gm_sm) + offset);
         const int rc = api_->copy_to_device(dst, src, size);
+        boundary_h2d_calls_++;
+        boundary_h2d_bytes_ += size;
         if (rc != 0) {
             LOG_ERROR("HostGraph SM H2D failed (offset=%zu size=%zu rc=%d)", offset, size, rc);
             return false;
@@ -1040,6 +1173,8 @@ private:
             static_cast<char *>(ptrs_.runtime_arena_dev) + offset
         );
         const int rc = api_->copy_to_device(dst, src, size);
+        boundary_h2d_calls_++;
+        boundary_h2d_bytes_ += size;
         if (rc != 0) {
             LOG_ERROR("HostGraph arena H2D failed (offset=%zu size=%zu rc=%d)", offset, size, rc);
             return false;
@@ -1051,26 +1186,27 @@ private:
         if (api_->copy_from_device == nullptr) return fallback;
         int32_t value = fallback;
         const void *src = static_cast<const void *>(static_cast<const char *>(ptrs_.gm_sm) + offset);
+        boundary_d2h_reads_++;
         return api_->copy_from_device(&value, src, sizeof(value)) == 0 ? value : fallback;
     }
 
-    bool wait_for_completion(int32_t epoch) const {
+    bool wait_for_device_epoch(size_t offset, int32_t epoch, const char *kind) const {
         if (epoch <= 0) return true;
         const int64_t deadline = _now_ms() + 120000;
-        while (read_device_i32(offsetof(PTO2SharedMemoryHeader, device_graph_complete_epoch), 0) < epoch) {
+        while (read_device_i32(offset, 0) < epoch) {
             const int32_t orch_error =
                 read_device_i32(offsetof(PTO2SharedMemoryHeader, orch_error_code), PTO2_ERROR_NONE);
             const int32_t sched_error =
                 read_device_i32(offsetof(PTO2SharedMemoryHeader, sched_error_code), PTO2_ERROR_NONE);
             if (orch_error != PTO2_ERROR_NONE || sched_error != PTO2_ERROR_NONE) {
                 LOG_ERROR(
-                    "HostGraph completion wait failed at epoch=%d (orch=%d sched=%d)", epoch, orch_error,
+                    "HostGraph %s wait failed at epoch=%d (orch=%d sched=%d)", kind, epoch, orch_error,
                     sched_error
                 );
                 return false;
             }
             if (_now_ms() >= deadline) {
-                LOG_ERROR("HostGraph completion wait timed out at epoch=%d", epoch);
+                LOG_ERROR("HostGraph %s wait timed out at epoch=%d", kind, epoch);
                 return false;
             }
             usleep(50);
@@ -1078,9 +1214,19 @@ private:
         return true;
     }
 
-    bool publish_graph_bytes(
-        const HostGraph &graph, int32_t dep_begin, int32_t dep_end, int32_t epoch, bool final_publish
-    ) {
+    bool wait_for_completion(int32_t epoch) const {
+        return wait_for_device_epoch(
+            offsetof(PTO2SharedMemoryHeader, device_graph_complete_epoch), epoch, "completion"
+        );
+    }
+
+    bool wait_for_release(int32_t epoch) const {
+        return wait_for_device_epoch(
+            offsetof(PTO2SharedMemoryHeader, device_graph_release_epoch), epoch, "release"
+        );
+    }
+
+    bool stage_graph_bytes(const HostGraphHeader &graph, int32_t dep_begin, int32_t dep_end) {
         HostGraphRelocation reloc{
             reinterpret_cast<uint64_t>(target_sm_.data()), reinterpret_cast<uint64_t>(ptrs_.gm_sm), sizes_.sm_size,
             reinterpret_cast<uint64_t>(target_arena_.base()),
@@ -1088,19 +1234,35 @@ private:
         };
         bool ok = true;
         PTO2DepListPool &dep_pool = target_->orchestrator.dep_pool;
-        for (int32_t i = dep_begin; i < dep_end; i++) {
-            PTO2DepListEntry tmp = dep_pool.base[i];
-            tmp.slot_state = relocate_host_graph_pointer(reloc, tmp.slot_state, &ok);
-            tmp.next = relocate_host_graph_pointer(reloc, tmp.next, &ok);
-            if (!ok || !copy_arena(&dep_pool.base[i], &tmp, sizeof(tmp))) return false;
+        if (dep_end > dep_begin) {
+            const size_t dep_count = static_cast<size_t>(dep_end - dep_begin);
+            std::vector<uint8_t> dep_bytes(dep_count * sizeof(PTO2DepListEntry));
+            for (int32_t i = dep_begin; i < dep_end; i++) {
+                PTO2DepListEntry tmp = dep_pool.base[i];
+                tmp.slot_state = relocate_host_graph_pointer(reloc, tmp.slot_state, &ok);
+                tmp.next = relocate_host_graph_pointer(reloc, tmp.next, &ok);
+                if (!ok) return false;
+                std::memcpy(
+                    dep_bytes.data() + static_cast<size_t>(i - dep_begin) * sizeof(tmp), &tmp, sizeof(tmp)
+                );
+            }
+            if (!copy_arena(&dep_pool.base[dep_begin], dep_bytes.data(), dep_bytes.size())) return false;
         }
 
         PTO2SharedMemoryHeader *header = target_->orchestrator.sm_header;
-        for (int32_t task_id = graph.header.first_task_id;
-             task_id < graph.header.first_task_id + graph.header.task_count; task_id++) {
+        struct TaskUploadRun {
+            int32_t first_slot{-1};
+            int32_t count{0};
+            std::vector<uint8_t> slot_bytes;
+        };
+        std::vector<TaskUploadRun> task_runs;
+        for (int32_t task_id = graph.first_task_id; task_id < graph.first_task_id + graph.task_count; task_id++) {
             const int32_t slot_id = header->get_slot_by_task_id(task_id);
-            PTO2TaskDescriptor &task = header->get_task_by_slot(slot_id);
-            PTO2TaskPayload &payload = header->get_payload_by_slot(slot_id);
+            if (slot_id < 0 || slot_id >= static_cast<int32_t>(header->task_window_size)) {
+                LOG_ERROR("HostGraph task slot is invalid (task=%d slot=%d window=%llu)", task_id, slot_id,
+                          static_cast<unsigned long long>(header->task_window_size));
+                return false;
+            }
             PTO2TaskSlotState &slot = header->get_slot_state_by_slot(slot_id);
             PTO2TaskSlotState slot_copy;
             std::memcpy(&slot_copy, &slot, sizeof(slot_copy));
@@ -1110,28 +1272,66 @@ private:
             slot_copy.fanout_head.store(
                 relocate_host_graph_pointer(reloc, fanout, &ok), std::memory_order_relaxed
             );
-            if (!ok || !copy_sm(
-                           static_cast<size_t>(reinterpret_cast<char *>(&task) -
-                                               reinterpret_cast<char *>(target_sm_.data())),
-                           &task, sizeof(task)
-                       ) ||
+            if (!ok) return false;
+
+            if (task_runs.empty() || slot_id != task_runs.back().first_slot + task_runs.back().count) {
+                task_runs.push_back(TaskUploadRun{});
+                task_runs.back().first_slot = slot_id;
+            }
+            TaskUploadRun &run = task_runs.back();
+            const size_t slot_offset = static_cast<size_t>(run.count) * sizeof(slot_copy);
+            run.slot_bytes.resize(slot_offset + sizeof(slot_copy));
+            std::memcpy(run.slot_bytes.data() + slot_offset, &slot_copy, sizeof(slot_copy));
+            run.count++;
+        }
+
+        const char *sm_host_base = reinterpret_cast<const char *>(target_sm_.data());
+        for (const TaskUploadRun &run : task_runs) {
+            const size_t task_bytes = static_cast<size_t>(run.count) * sizeof(PTO2TaskDescriptor);
+            const size_t payload_bytes = static_cast<size_t>(run.count) * sizeof(PTO2TaskPayload);
+            const size_t slot_bytes = static_cast<size_t>(run.count) * sizeof(PTO2TaskSlotState);
+            PTO2TaskDescriptor *tasks = &header->task_descriptors[run.first_slot];
+            PTO2TaskPayload *payloads = &header->task_payloads[run.first_slot];
+            PTO2TaskSlotState *slots = &header->slot_states[run.first_slot];
+            if (!copy_sm(static_cast<size_t>(reinterpret_cast<const char *>(tasks) - sm_host_base), tasks, task_bytes) ||
                 !copy_sm(
-                    static_cast<size_t>(reinterpret_cast<char *>(&payload) -
-                                        reinterpret_cast<char *>(target_sm_.data())),
-                    &payload, sizeof(payload)
+                    static_cast<size_t>(reinterpret_cast<const char *>(payloads) - sm_host_base), payloads,
+                    payload_bytes
                 ) ||
                 !copy_sm(
-                    static_cast<size_t>(reinterpret_cast<char *>(&slot) -
-                                        reinterpret_cast<char *>(target_sm_.data())),
-                    &slot_copy, sizeof(slot_copy)
+                    static_cast<size_t>(reinterpret_cast<const char *>(slots) - sm_host_base),
+                    run.slot_bytes.data(), slot_bytes
                 )) {
                 return false;
             }
-            const int32_t map_index = task_id & header->task_window_mask;
+        }
+
+        const int32_t task_count = graph.task_count;
+        if (task_count > 0) {
+            if (task_count > static_cast<int32_t>(header->task_window_size)) {
+                LOG_ERROR(
+                    "HostGraph task range exceeds the slot map (tasks=%d window=%llu)", task_count,
+                    static_cast<unsigned long long>(header->task_window_size)
+                );
+                return false;
+            }
+            const int32_t map_begin = graph.first_task_id & header->task_window_mask;
+            const int32_t first_count =
+                task_count < static_cast<int32_t>(header->task_window_size) - map_begin
+                    ? task_count
+                    : static_cast<int32_t>(header->task_window_size) - map_begin;
             if (!copy_sm(
-                    static_cast<size_t>(reinterpret_cast<char *>(&header->task_slot_map[map_index]) -
-                                        reinterpret_cast<char *>(target_sm_.data())),
-                    &slot_id, sizeof(slot_id)
+                    static_cast<size_t>(reinterpret_cast<const char *>(&header->task_slot_map[map_begin]) -
+                                        sm_host_base),
+                    &header->task_slot_map[map_begin], static_cast<size_t>(first_count) * sizeof(int32_t)
+                )) {
+                return false;
+            }
+            const int32_t second_count = task_count - first_count;
+            if (second_count > 0 &&
+                !copy_sm(
+                    static_cast<size_t>(reinterpret_cast<const char *>(header->task_slot_map) - sm_host_base),
+                    header->task_slot_map, static_cast<size_t>(second_count) * sizeof(int32_t)
                 )) {
                 return false;
             }
@@ -1144,22 +1344,48 @@ private:
             return false;
         }
 
-        const int32_t task_begin = graph.header.first_task_id;
-        const int32_t task_end = task_begin + graph.header.task_count;
+        const uint64_t output_values[2] = {graph.graph_output_ptr, graph.graph_output_size};
+        static_assert(
+            offsetof(PTO2SharedMemoryHeader, graph_output_size) ==
+            offsetof(PTO2SharedMemoryHeader, graph_output_ptr) + sizeof(std::atomic<uint64_t>)
+        );
+        if (!copy_sm(
+                offsetof(PTO2SharedMemoryHeader, graph_output_ptr), output_values, sizeof(output_values)
+            )) {
+            LOG_ERROR(
+                "Failed to stage HostGraph range [%d,%d)", graph.first_task_id,
+                graph.first_task_id + graph.task_count
+            );
+            return false;
+        }
+        return true;
+    }
+
+    bool commit_graph_publication(const HostGraphHeader &graph, int32_t epoch, bool final_publish) const {
+        const int32_t task_begin = graph.first_task_id;
+        const int32_t task_end = graph.first_task_id + graph.task_count;
         const int32_t final_value = final_publish ? 1 : 0;
         const int32_t done_value = final_publish ? 1 : 0;
-        const uint64_t output_ptr = graph.header.graph_output_ptr;
-        const uint64_t output_size = graph.header.graph_output_size;
-        if (!copy_sm(offsetof(PTO2SharedMemoryHeader, fc), &task_end, sizeof(task_end)) ||
-            !copy_sm(offsetof(PTO2SharedMemoryHeader, graph_output_ptr), &output_ptr, sizeof(output_ptr)) ||
-            !copy_sm(offsetof(PTO2SharedMemoryHeader, graph_output_size), &output_size, sizeof(output_size)) ||
-            !copy_sm(offsetof(PTO2SharedMemoryHeader, host_graph_task_begin), &task_begin, sizeof(task_begin)) ||
-            !copy_sm(offsetof(PTO2SharedMemoryHeader, host_graph_task_end), &task_end, sizeof(task_end)) ||
-            !copy_sm(offsetof(PTO2SharedMemoryHeader, host_graph_final), &final_value, sizeof(final_value)) ||
+        const int32_t range_values[3] = {task_begin, task_end, final_value};
+        static_assert(
+            offsetof(PTO2SharedMemoryHeader, host_graph_task_end) ==
+            offsetof(PTO2SharedMemoryHeader, host_graph_task_begin) + sizeof(std::atomic<int32_t>)
+        );
+        static_assert(
+            offsetof(PTO2SharedMemoryHeader, host_graph_final) ==
+            offsetof(PTO2SharedMemoryHeader, host_graph_task_end) + sizeof(std::atomic<int32_t>)
+        );
+        if (!copy_sm(
+                offsetof(PTO2SharedMemoryHeader, host_graph_task_begin), range_values, sizeof(range_values)
+            ) ||
+            !copy_sm(
+                offsetof(PTO2SharedMemoryHeader, fc) + offsetof(PTO2FlowControl, task_count),
+                &task_end, sizeof(task_end)
+            ) ||
             (final_publish &&
              !copy_sm(offsetof(PTO2SharedMemoryHeader, orchestrator_done), &done_value, sizeof(done_value))) ||
             !copy_sm(offsetof(PTO2SharedMemoryHeader, host_graph_publish_epoch), &epoch, sizeof(epoch))) {
-            LOG_ERROR("Failed to publish HostGraph epoch=%d", epoch);
+            LOG_ERROR("Failed to commit HostGraph epoch=%d", epoch);
             return false;
         }
         return true;
@@ -1183,6 +1409,7 @@ private:
         L2TaskArgs host_args;
         host_args.create_from_chip_args(device_args_);
         rt_scope_begin(source_);
+        layer_build_start_ns_ = _steady_now_ns();
         entry_points_->entry(host_args);
         rt_scope_end(source_);
         if (source_->graph_cache_enabled) {
@@ -1229,9 +1456,22 @@ private:
     PTO2Runtime *target_{nullptr};
     std::thread worker_;
     std::atomic<int32_t> worker_start_state_{0};
+    std::atomic<int32_t> run_gate_state_{0};
+    std::mutex run_gate_mutex_;
+    std::condition_variable run_gate_cv_;
     int32_t buffer_id_{0};
     int32_t task_begin_{0};
     int32_t publish_epoch_{0};
+    int64_t layer_build_start_ns_{0};
+    mutable uint64_t boundary_h2d_calls_{0};
+    mutable uint64_t boundary_h2d_bytes_{0};
+    mutable uint64_t boundary_d2h_reads_{0};
+    uint64_t last_cache_recorded_{0};
+    uint64_t last_cache_replayed_{0};
+#if SIMPLER_HOST_STRACE
+    unsigned strace_inv_{0};
+    uint64_t strace_hid_{0};
+#endif
     int result_{-1};
 };
 
@@ -1281,6 +1521,14 @@ static int join_async_host_graph_pipeline(Runtime *runtime) {
     const int rc = job->join();
     delete job;
     return rc;
+}
+
+extern "C" int release_async_host_graph_pipeline(Runtime *runtime) {
+    if (runtime == nullptr) return -1;
+    auto *job = static_cast<HostGraphAsyncJob *>(runtime->take_host_orch_job());
+    if (job == nullptr) return 0;
+    runtime->set_host_orch_job(job);
+    return job->release_for_run() ? 0 : -1;
 }
 
 /**

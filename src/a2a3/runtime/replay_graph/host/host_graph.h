@@ -79,3 +79,6 @@ struct HostGraph {
 
 bool capture_host_graph_range(PTO2Runtime *source, int32_t task_begin, int32_t task_end, HostGraph *out);
 bool import_host_graph(const HostGraph &graph, PTO2Runtime *target, bool finalize = true);
+bool materialize_host_graph_range(
+    PTO2Runtime *source, int32_t task_begin, int32_t task_end, PTO2Runtime *target, HostGraphHeader *out_header
+);

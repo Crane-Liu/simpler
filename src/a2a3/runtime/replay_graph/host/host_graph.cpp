@@ -217,3 +217,108 @@ bool import_host_graph(const HostGraph &graph, PTO2Runtime *target, bool finaliz
     target->orchestrator.mark_done();
     return true;
 }
+
+bool materialize_host_graph_range(
+    PTO2Runtime *source, int32_t task_begin, int32_t task_end, PTO2Runtime *target, HostGraphHeader *out_header
+) {
+    if (source == nullptr || target == nullptr || source->orchestrator.sm_header == nullptr ||
+        target->orchestrator.sm_header == nullptr || out_header == nullptr) {
+        return false;
+    }
+
+    PTO2SharedMemoryHeader *source_header = source->orchestrator.sm_header;
+    PTO2SharedMemoryHeader *target_header = target->orchestrator.sm_header;
+    const int32_t total_tasks = source_header->fc.task_count.load(std::memory_order_acquire);
+    const int32_t task_count = task_end - task_begin;
+    const int32_t max_range =
+        static_cast<int32_t>(source_header->task_window_size / PTO2_REPLAY_GRAPH_BUFFER_COUNT);
+    if (task_begin < 0 || task_end < task_begin || task_end > total_tasks || task_count > max_range ||
+        task_count >
+            static_cast<int32_t>(target_header->task_window_size / PTO2_REPLAY_GRAPH_BUFFER_COUNT) ||
+        target->orchestrator.task_allocator.active_count() != task_begin) {
+        LOG_ERROR(
+            "HostGraph materialize range [%d,%d) is invalid (source_total=%d target_total=%d)", task_begin,
+            task_end, total_tasks, target->orchestrator.task_allocator.active_count()
+        );
+        return false;
+    }
+
+    HostGraphHeader header;
+    header.task_record_size = sizeof(HostGraphTaskRecord);
+    header.boundary_record_size = sizeof(HostGraphBoundaryRecord);
+    header.first_task_id = task_begin;
+    header.task_count = task_count;
+    header.boundary_count = 1;
+    header.graph_output_ptr = source_header->graph_output_ptr.load(std::memory_order_acquire);
+    header.graph_output_size = source_header->graph_output_size.load(std::memory_order_acquire);
+
+    for (int32_t task_id = task_begin; task_id < task_end; ++task_id) {
+        PTO2TaskSlotState &source_slot = source_header->get_slot_state_by_task_id(task_id);
+        if (source_slot.task == nullptr || source_slot.payload == nullptr) {
+            LOG_ERROR("HostGraph task %d has incomplete source bindings", task_id);
+            return false;
+        }
+
+        PTO2TaskAllocResult alloc = target->orchestrator.task_allocator.alloc(0);
+        if (alloc.failed() || alloc.task_id != task_id) return false;
+        PTO2TaskDescriptor &target_task = target_header->get_task_by_slot(alloc.slot);
+        PTO2TaskPayload &target_payload = target_header->get_payload_by_slot(alloc.slot);
+        PTO2TaskSlotState &target_slot = target_header->get_slot_state_by_slot(alloc.slot);
+        std::memcpy(&target_task, source_slot.task, sizeof(target_task));
+        std::memcpy(&target_payload, source_slot.payload, sizeof(target_payload));
+
+        const PTO2TaskState task_state = source_slot.task_state.load(std::memory_order_acquire);
+        target_slot.bind_buffers(&target_payload, &target_task);
+        target_slot.fanout_head.store(nullptr, std::memory_order_relaxed);
+        target_slot.task_state.store(task_state, std::memory_order_relaxed);
+        target_slot.fanin_refcount.store(0, std::memory_order_relaxed);
+        target_slot.fanin_count = 1;
+        target_slot.active_mask = source_slot.active_mask;
+        target_slot.bind_ring(0);
+        target_slot.allow_early_resolve = source_slot.allow_early_resolve;
+        target_slot.ready_state.store(
+            task_state == PTO2_TASK_COMPLETED ? PTO2_COMPLETION_DONE : PTO2_READY_UNCLAIMED,
+            std::memory_order_relaxed
+        );
+        target_slot.completed_subtasks.store(0, std::memory_order_relaxed);
+        target_slot.total_required_subtasks = source_slot.total_required_subtasks;
+        target_slot.logical_block_num = source_slot.logical_block_num;
+        target_slot.next_block_idx.store(0, std::memory_order_relaxed);
+        if (task_state >= PTO2_TASK_COMPLETED) header.inline_completed_tasks++;
+    }
+
+    for (int32_t producer_id = task_begin; producer_id < task_end; ++producer_id) {
+        PTO2TaskSlotState &source_producer = source_header->get_slot_state_by_task_id(producer_id);
+        PTO2DepListEntry *source_edge = source_producer.fanout_head.load(std::memory_order_acquire);
+        while (source_edge != nullptr && !pto2_is_fanout_closed(source_edge)) {
+            if (source_edge->slot_state == nullptr || source_edge->slot_state->task == nullptr) {
+                LOG_ERROR("HostGraph task %d has an invalid source fanout edge", producer_id);
+                return false;
+            }
+            const int32_t consumer_id =
+                static_cast<int32_t>(source_edge->slot_state->task->task_id.local());
+            if (consumer_id >= task_begin && consumer_id < task_end) {
+                if (producer_id >= consumer_id) {
+                    LOG_ERROR("HostGraph contains an invalid dependency edge (%d -> %d)", producer_id, consumer_id);
+                    return false;
+                }
+                PTO2TaskSlotState &target_producer = target_header->get_slot_state_by_task_id(producer_id);
+                PTO2TaskSlotState &target_consumer = target_header->get_slot_state_by_task_id(consumer_id);
+                PTO2DepListEntry *target_edge = target->orchestrator.dep_pool.alloc();
+                if (target_edge == nullptr) return false;
+                target_edge->slot_state = &target_consumer;
+                target_edge->next = target_producer.fanout_head.load(std::memory_order_relaxed);
+                target_producer.fanout_head.store(target_edge, std::memory_order_relaxed);
+                target_consumer.fanin_count++;
+                header.edge_count++;
+            }
+            source_edge = source_edge->next;
+        }
+    }
+
+    target->orchestrator.inline_completed_tasks += header.inline_completed_tasks;
+    target_header->graph_output_ptr.store(header.graph_output_ptr, std::memory_order_relaxed);
+    target_header->graph_output_size.store(header.graph_output_size, std::memory_order_relaxed);
+    *out_header = header;
+    return true;
+}

@@ -61,6 +61,11 @@ __attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
     uint64_t, bool, bool, int, const void *const *, const uint8_t *, int, const uint64_t *, int, const int32_t[3]
 ) {}
 
+// HostGraph runtime_maker supplies strong implementations. AICPU builds retain
+// these zero-cost fallbacks, so Host Record profiling cannot perturb device O.
+extern "C" __attribute__((weak, visibility("hidden"))) uint64_t host_graph_record_now_ns() { return 0; }
+extern "C" __attribute__((weak, visibility("hidden"))) uint64_t host_graph_record_minor_faults() { return 0; }
+
 // Scope_stats enable gate, queried via the same predicate idiom as
 // is_dep_gen_enabled above. The AICPU collector links the strong definition;
 // host builds fall back to this weak `false`. Gating here still skips the
@@ -286,11 +291,23 @@ struct PTO2GraphRecordingState {
     PTO2GraphTemplate temp;
 };
 
+struct PTO2GraphRecordProfile {
+    bool active{false};
+    uint64_t start_ns{0};
+    uint64_t task_record_ns{0};
+    uint64_t task_zero_ns{0};
+    uint64_t tensor_classify_ns{0};
+    uint64_t start_minor_faults{0};
+    uint64_t tensor_count{0};
+    uint64_t fanin_count{0};
+};
+
 // The AICPU runtime DSO stays loaded for the DeviceRunner lifetime, so this
 // cache survives repeated simpler_run calls in the same process.
 PTO2GraphTemplate g_graph_templates[PTO2_GRAPH_TEMPLATE_CAP];
 int32_t g_graph_next_replace = 0;
 PTO2GraphRecordingState g_graph_recording;
+PTO2GraphRecordProfile g_graph_record_profile;
 
 enum PTO2GraphUnsupportedReason : int32_t {
     PTO2_GRAPH_UNSUPPORTED_NONE = 0,
@@ -363,8 +380,15 @@ void store_graph_template(const PTO2GraphTemplate &templ) {
         target = g_graph_next_replace;
         g_graph_next_replace = (g_graph_next_replace + 1) % PTO2_GRAPH_TEMPLATE_CAP;
     }
-    g_graph_templates[target] = templ;
-    g_graph_templates[target].in_use = true;
+    PTO2GraphTemplate &stored = g_graph_templates[target];
+    stored.in_use = false;
+    stored.full_key = templ.full_key;
+    stored.task_count = templ.task_count;
+    memcpy(
+        stored.tasks, templ.tasks,
+        static_cast<size_t>(templ.task_count) * sizeof(PTO2GraphTaskTemplate)
+    );
+    stored.in_use = true;
 }
 
 void graph_record_begin_task(PTO2TaskId task_id) {
@@ -558,8 +582,13 @@ static void graph_record_task(const PTO2PreparedTask &prepared, const L0TaskArgs
         return;
     }
 
+    const bool profile = g_graph_record_profile.active;
+    const uint64_t task_start_ns = profile ? host_graph_record_now_ns() : 0;
     PTO2GraphTaskTemplate &task = g_graph_recording.temp.tasks[task_index];
-    task = PTO2GraphTaskTemplate{};
+    // Replay reads fixed fields plus only the [0,count) portion of each array;
+    // all of those values are overwritten below. Leave unused tails untouched
+    // instead of faulting and clearing the full fixed-capacity task template.
+    const uint64_t task_zero_end_ns = profile ? host_graph_record_now_ns() : 0;
     for (int i = 0; i < PTO2_SUBTASK_SLOT_COUNT; ++i)
         task.kernel_id[i] = prepared.task->kernel_id[i];
     task.active_mask = prepared.slot_state->active_mask;
@@ -580,6 +609,7 @@ static void graph_record_task(const PTO2PreparedTask &prepared, const L0TaskArgs
         return;
     }
 
+    const uint64_t tensor_start_ns = profile ? host_graph_record_now_ns() : 0;
     for (int32_t i = 0; i < task.tensor_count; ++i) {
         task.tensors[i].copy(prepared.payload->tensors[i]);
         task.tensor_arg_types[i] = args.tag(i);
@@ -588,12 +618,22 @@ static void graph_record_task(const PTO2PreparedTask &prepared, const L0TaskArgs
             return;
         }
     }
+    const uint64_t tensor_end_ns = profile ? host_graph_record_now_ns() : 0;
     memcpy(task.scalars, prepared.payload->scalars, sizeof(uint64_t) * static_cast<size_t>(task.scalar_count));
     for (int32_t i = 0; i < task.scalar_count; ++i)
         task.scalar_binding_indices[i] = args.graph_scalar_binding(i);
     task.fanin_count = g_graph_recording.current_fanin_count;
     for (int32_t i = 0; i < task.fanin_count; ++i)
         task.fanins[i] = g_graph_recording.current_fanins[i];
+
+    if (profile) {
+        const uint64_t task_end_ns = host_graph_record_now_ns();
+        g_graph_record_profile.task_record_ns += task_end_ns - task_start_ns;
+        g_graph_record_profile.task_zero_ns += task_zero_end_ns - task_start_ns;
+        g_graph_record_profile.tensor_classify_ns += tensor_end_ns - tensor_start_ns;
+        g_graph_record_profile.tensor_count += static_cast<uint64_t>(task.tensor_count);
+        g_graph_record_profile.fanin_count += static_cast<uint64_t>(task.fanin_count);
+    }
 
     g_graph_recording.temp.task_count++;
     g_graph_recording.current_task_index = -1;
@@ -1321,6 +1361,12 @@ PTO2OrchestratorState::graph_begin(uint64_t graph_key, const PTO2GraphBindings &
     g_graph_recording.bindings = bindings;
     reset_graph_template_header(&g_graph_recording.temp);
     g_graph_recording.temp.full_key = full_key;
+    g_graph_record_profile = PTO2GraphRecordProfile{};
+    g_graph_record_profile.start_ns = host_graph_record_now_ns();
+    g_graph_record_profile.active = g_graph_record_profile.start_ns != 0;
+    if (g_graph_record_profile.active) {
+        g_graph_record_profile.start_minor_faults = host_graph_record_minor_faults();
+    }
     result.execute_block = true;
     result.recording = true;
     return result;
@@ -1337,16 +1383,40 @@ void PTO2OrchestratorState::graph_end(PTO2GraphCacheStats *stats) {
                 g_graph_recording.unsupported_tensor_index, g_graph_recording.temp.task_count
             );
         }
+        g_graph_record_profile = PTO2GraphRecordProfile{};
         reset_graph_recording();
         return;
     }
     g_graph_recording.temp.in_use = true;
+    const uint64_t store_start_ns = g_graph_record_profile.active ? host_graph_record_now_ns() : 0;
     store_graph_template(g_graph_recording.temp);
+    const uint64_t store_end_ns = g_graph_record_profile.active ? host_graph_record_now_ns() : 0;
     if (stats != nullptr) stats->recorded++;
     LOG_INFO_V0(
         "[GraphCache] record key=0x%llx tasks=%d", static_cast<unsigned long long>(g_graph_recording.full_key),
         g_graph_recording.temp.task_count
     );
+    if (g_graph_record_profile.active) {
+        const uint64_t scope_ns = store_end_ns - g_graph_record_profile.start_ns;
+        const uint64_t store_ns = store_end_ns - store_start_ns;
+        const uint64_t accounted_ns = g_graph_record_profile.task_record_ns + store_ns;
+        const uint64_t other_ns = scope_ns > accounted_ns ? scope_ns - accounted_ns : 0;
+        const uint64_t end_minor_faults = host_graph_record_minor_faults();
+        const uint64_t minor_faults = end_minor_faults >= g_graph_record_profile.start_minor_faults
+                                          ? end_minor_faults - g_graph_record_profile.start_minor_faults
+                                          : 0;
+        LOG_INFO_V0(
+            "[GraphRecordProfile] tasks=%d tensors=%llu fanins=%llu total_us=%.3f task_record_us=%.3f "
+            "task_zero_us=%.3f tensor_classify_us=%.3f store_us=%.3f other_us=%.3f minor_faults=%llu",
+            g_graph_recording.temp.task_count,
+            static_cast<unsigned long long>(g_graph_record_profile.tensor_count),
+            static_cast<unsigned long long>(g_graph_record_profile.fanin_count), scope_ns / 1000.0,
+            g_graph_record_profile.task_record_ns / 1000.0, g_graph_record_profile.task_zero_ns / 1000.0,
+            g_graph_record_profile.tensor_classify_ns / 1000.0, store_ns / 1000.0, other_ns / 1000.0,
+            static_cast<unsigned long long>(minor_faults)
+        );
+    }
+    g_graph_record_profile = PTO2GraphRecordProfile{};
     reset_graph_recording();
 }
 
