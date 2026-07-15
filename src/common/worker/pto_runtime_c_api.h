@@ -122,11 +122,19 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  *      simpler_run invocations reuse this resident pair — no binary bytes
  *      cross the C ABI on per-run paths.
  *
- * Returns 0 on success, negative on attach failure.
+ *   4. When `prewarm_config` is non-null, build + upload + cache the prebuilt
+ *      runtime-arena for its `runtime_env` ring sizing (tensormap_and_ringbuffer;
+ *      a no-op for runtimes without a prebuilt arena). The device is up by this
+ *      point, so the first simpler_run with matching sizing skips the (~800ms)
+ *      cold build. The sizing is fork-constant, so it rides init rather than a
+ *      separate call. Only `prewarm_config->runtime_env` is read.
+ *
+ * Returns 0 on success, negative on attach or prewarm-build failure.
  */
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *prewarm_config
 );
 
 /**

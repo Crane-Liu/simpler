@@ -124,7 +124,7 @@ function(add_a2a3_orchestrator_runtime_test name src)
         ${src}
         ${A2A3_RUNTIME_DIR}/pto_orchestrator.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
-        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/tensor_dump_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
     )
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
@@ -279,7 +279,7 @@ function(add_a5_orchestrator_runtime_test name src)
         ${src}
         ${A5_RUNTIME_DIR}/pto_orchestrator.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
-        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/tensor_dump_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
     )
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
@@ -388,6 +388,17 @@ target_include_directories(test_buffer_pool_manager PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/log
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
 )
+add_common_utils_test(test_profiler_base common/test_profiler_base.cpp)
+target_sources(test_profiler_base PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/unified_log_host.cpp
+)
+target_include_directories(test_profiler_base PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+)
+
 add_common_utils_test(test_l3_l2_orch_comm common/test_l3_l2_orch_comm.cpp)
 
 add_executable(test_trb_runtime_temp_buffer
@@ -478,7 +489,7 @@ add_executable(test_l3_l2_orch_comm_sim_runner
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/l2_swimlane_collector.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/shared/host/pmu_collector.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/tensor_dump_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/args_dump_collector.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/scope_stats_collector.cpp
     stubs/test_stubs.cpp
 )
@@ -535,6 +546,59 @@ target_link_libraries(test_scope_stats_collector PRIVATE
 add_test(NAME test_scope_stats_collector COMMAND test_scope_stats_collector)
 set_tests_properties(test_scope_stats_collector PROPERTIES LABELS "no_hardware")
 
+function(add_pmu_collector_test name platform)
+    add_executable(${name}
+        common/test_pmu_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/shared/host/pmu_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/sim/host/profiling_copy.cpp
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+    )
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+add_pmu_collector_test(test_pmu_collector_a2a3 a2a3)
+add_pmu_collector_test(test_pmu_collector_a5 a5)
+
+function(add_args_dump_collector_test name platform)
+    add_executable(${name}
+        common/test_args_dump_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/args_dump_collector.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/sim/host/profiling_copy.cpp
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+    )
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/${platform}/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+add_args_dump_collector_test(test_args_dump_collector_a2a3 a2a3)
+add_args_dump_collector_test(test_args_dump_collector_a5 a5)
+
 # Per-callable_id orch SO file naming regression (see rtStreamSynchronize
 # 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`
 # against the test source so it runs on no-hw runners too.
@@ -571,7 +635,7 @@ add_a2a3_runtime_test(test_a2a3_tensormap   a2a3/test_tensormap.cpp)
 add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
 add_a2a3_orchestrator_runtime_test(test_a2a3_orchestrator_fanin a2a3/test_orchestrator_fanin.cpp)
 add_a2a3_orchestrator_runtime_test(test_wiring a2a3/test_wiring.cpp)
-add_a2a3_orchestrator_runtime_test(test_a2a3_tensor_dump a2a3/test_tensor_dump.cpp)
+add_a2a3_orchestrator_runtime_test(test_a2a3_args_dump a2a3/test_args_dump.cpp)
 add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
 add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_collector.cpp)
 
@@ -598,7 +662,7 @@ add_a5_runtime_test(test_a5_tensormap        a5/test_tensormap.cpp)
 add_a5_runtime_test(test_a5_fanin_pool       a5/test_fanin_pool.cpp)
 add_a5_orchestrator_runtime_test(test_a5_orchestrator_fanin a5/test_orchestrator_fanin.cpp)
 add_a5_orchestrator_runtime_test(test_a5_wiring a5/test_wiring.cpp)
-add_a5_orchestrator_runtime_test(test_a5_tensor_dump a5/test_tensor_dump.cpp)
+add_a5_orchestrator_runtime_test(test_a5_args_dump a5/test_args_dump.cpp)
 add_a5_runtime_test(test_a5_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)
 
 # Host logger silent/off behavior — no runtime deps, just compile host_log.cpp
@@ -726,7 +790,7 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
         ${PROJECT_ROOT}/src/common/platform/onboard/host/device_runner_base.cpp
         ${PROJECT_ROOT}/src/common/platform/shared/host/l3_l2_orch_comm_service.cpp
         ${PROJECT_ROOT}/src/common/platform/shared/host/scope_stats_collector.cpp
-        ${PROJECT_ROOT}/src/common/platform/shared/host/tensor_dump_collector.cpp
+        ${PROJECT_ROOT}/src/common/platform/shared/host/args_dump_collector.cpp
         ${PROJECT_ROOT}/src/a5/platform/onboard/host/profiling_copy.cpp
         ${PROJECT_ROOT}/src/a5/platform/onboard/host/memory_allocator.cpp
         ${PROJECT_ROOT}/src/common/platform/shared/host/l2_swimlane_collector.cpp

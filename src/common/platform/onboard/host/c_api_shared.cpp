@@ -208,6 +208,13 @@ static void mark_prebuilt_runtime_arena_cached_wrapper(
     } catch (...) {}
 }
 
+// Weak no-op default lives in device_runner_base.cpp; tensormap_and_ringbuffer
+// links a strong override that builds + caches the prebuilt runtime-arena.
+// simpler_init calls it directly for the fork-constant ring sizing.
+extern "C" int prewarm_config_impl(
+    const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+);
+
 // The HostApi is a set of context-free function pointers: each wrapper above
 // recovers its runner from the thread-local current_runner(), so a single
 // filled table is valid for every runner and every run. Build it once at load
@@ -317,7 +324,8 @@ int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx) {
 
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *prewarm_config
 ) {
     if (ctx == NULL) return -1;
 
@@ -375,6 +383,22 @@ int simpler_init(
         return -1;
     }
     if (rc != 0) return rc;
+
+    // Prebuilt runtime-arena prewarm: the device is up, so build + cache the
+    // arena for the fork-constant ring sizing now. trb provides a strong
+    // prewarm_config_impl; other runtimes link the weak no-op. Only the ring
+    // sizing is read.
+    if (prewarm_config != NULL) {
+        try {
+            rc = prewarm_config_impl(
+                &g_host_api, prewarm_config->runtime_env.ring_task_window, prewarm_config->runtime_env.ring_heap,
+                prewarm_config->runtime_env.ring_dep_pool
+            );
+        } catch (...) {
+            return -1;
+        }
+        if (rc != 0) return rc;
+    }
     return 0;
 }
 

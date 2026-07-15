@@ -47,6 +47,9 @@
 #include "acl/acl.h"
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+#include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
+#endif
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
 // layer in case we need to swap (e.g., InitConfig variant) later.
@@ -97,6 +100,9 @@ struct CommHandle_ {
     bool owns_device_ctx = false;
     std::vector<CommContext *> derived_contexts;
     std::unordered_map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
+#endif
 };
 
 // ============================================================================
@@ -730,9 +736,11 @@ static std::string domain_barrier_tag(uint64_t allocation_id, const char *phase)
 // Idempotently provision the process-global PTO-ISA async-SDMA scratch
 // workspace on the comm handle and mirror its address into host_ctx.  Both
 // the base-window path and the dynamic per-domain path call this; only the
-// first call allocates.  CANN 9.0+ feature: on 8.5 the aclnn dlsym fails by
-// design, so we leave workSpace == 0 and SDMA demos self-skip.  No-op when
-// the build-time PTO-ISA dependency is absent.
+// first call allocates.  Requires CANN to expose working
+// aclnnShmemSdmaStarsQuery primitives — see docs/a5-sdma-overlay.md for why
+// this is gated behind SIMPLER_ENABLE_PTO_SDMA_WORKSPACE (default OFF) and
+// how to re-enable it once the a5 environment supports it (#1315).  No-op (workSpace
+// stays 0, SDMA demos self-skip) when the macro is undefined.
 static void ensure_sdma_workspace(CommHandle h) {
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     if (h->sdma_workspace) return;

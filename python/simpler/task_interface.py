@@ -944,7 +944,7 @@ class ChipWorker:
         self._live_handles: dict[int, bytes] = {}
         self._next_handle_id = 0
 
-    def init(self, device_id, bins, log_level=None, log_info_v=None):
+    def init(self, device_id, bins, log_level=None, log_info_v=None, prewarm_config=None):
         """Attach the calling thread to ``device_id``, load the host runtime
         library, and cache platform binaries.
 
@@ -1010,6 +1010,7 @@ class ChipWorker:
             str(bins.aicore_path),
             "" if dispatcher_path is None else str(dispatcher_path),
             int(device_id),
+            prewarm_config,
         )
         for slot_id, callable_obj in list(self._callable_registry.items()):
             self._impl.register_callable(int(slot_id), callable_obj)

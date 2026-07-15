@@ -60,7 +60,7 @@ ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-    const std::string &dispatcher_path, int device_id
+    const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -169,9 +169,12 @@ void ChipWorker::init(
             dispatcher_bytes = read_binary_file(dispatcher_path);
         }
         const uint8_t *dispatcher_ptr = dispatcher_bytes.empty() ? nullptr : dispatcher_bytes.data();
+        // `prewarm_config` (fork-constant, COW-delivered) rides simpler_init: the
+        // platform builds + caches the prebuilt runtime-arena for its ring sizing
+        // right after the device comes up. Null => no prewarm.
         init_rc = simpler_init_fn_(
             device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(), aicore_bytes.size(),
-            dispatcher_ptr, dispatcher_bytes.size()
+            dispatcher_ptr, dispatcher_bytes.size(), prewarm_config
         );
     } catch (...) {
         destroy_device_context_fn_(device_ctx_);

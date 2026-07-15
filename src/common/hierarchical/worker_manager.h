@@ -152,7 +152,6 @@ static constexpr uint64_t CTRL_COMM_INIT = 9;
 static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
 static constexpr uint64_t CTRL_L3_L2_ORCH_COMM_INIT = 13;
-
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc/register; ptr for free; dst for copy)
 //   offset 24: uint64 arg1 (src for copy)

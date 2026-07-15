@@ -10,12 +10,12 @@
  */
 #include <cstddef>
 
-#include "aicpu/platform_regs.h"
+#include "aicpu/cache_maintenance.h"
 
-void cache_invalidate_range(const void * /* addr */, size_t /* size */) {
-    // No-op on simulation: no hardware cache to invalidate
-}
+namespace aicpu_cache_maintenance {
 
-void cache_flush_range(const void * /* addr */, size_t /* size */) {
-    // No-op on simulation: no hardware cache to flush
-}
+void invalidate_range_impl(const void * /* addr */, size_t /* size */) {}
+
+void flush_range_impl(const void * /* addr */, size_t /* size */) {}
+
+}  // namespace aicpu_cache_maintenance

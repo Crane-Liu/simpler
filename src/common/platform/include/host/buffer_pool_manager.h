@@ -12,7 +12,7 @@
 /**
  * @file buffer_pool_manager.h
  * @brief Generic buffer-pool data structure shared by L2Swimlane, PMU,
- *        DepGen, TensorDump, and ScopeStats collectors. Owns:
+ *        DepGen, ArgsDump, and ScopeStats collectors. Owns:
  *
  *   - ready_queue shard(s) (mgmt → collector) as SPSC rings,
  *   - done_queue shard(s) (collector → mgmt) as SPSC rings,
@@ -142,13 +142,13 @@ struct DoneInfo {
 };
 
 template <typename Module, typename = void>
-struct ProfilerModuleCollectorThreadCount {
+struct ProfilerModuleMaxCollectorThreads {
     static constexpr int value = 1;
 };
 
 template <typename Module>
-struct ProfilerModuleCollectorThreadCount<Module, std::void_t<decltype(Module::kCollectorThreadCount)>> {
-    static constexpr int value = Module::kCollectorThreadCount;
+struct ProfilerModuleMaxCollectorThreads<Module, std::void_t<decltype(Module::kMaxCollectorThreads)>> {
+    static constexpr int value = Module::kMaxCollectorThreads;
 };
 
 template <typename Module, typename = void>
@@ -180,6 +180,27 @@ template <typename Module>
 struct ProfilerModuleHostRecycledQueueCapacity<Module, std::void_t<decltype(Module::kHostRecycledQueueSize)>> {
     static constexpr size_t value = Module::kHostRecycledQueueSize > 0 ? Module::kHostRecycledQueueSize : 1;
 };
+
+template <typename Module>
+auto profiler_module_recycled_warm_target_impl(int kind, int shard_count, int)
+    -> decltype(Module::recycled_warm_target(kind, shard_count)) {
+    return Module::recycled_warm_target(kind, shard_count);
+}
+
+template <typename Module>
+auto profiler_module_recycled_warm_target_impl(int kind, int, long) -> decltype(Module::recycled_warm_target(kind)) {
+    return Module::recycled_warm_target(kind);
+}
+
+template <typename Module>
+int profiler_module_recycled_warm_target_impl(int, int, ...) {
+    return 0;
+}
+
+template <typename Module>
+int profiler_module_recycled_warm_target(int kind, int shard_count) {
+    return profiler_module_recycled_warm_target_impl<Module>(kind, shard_count, 0);
+}
 
 template <typename T, size_t Capacity>
 class SpscRing {
@@ -284,8 +305,10 @@ class BufferPoolManager {
 
 public:
     using ReadyBufferInfo = typename Module::ReadyBufferInfo;
-    static constexpr int kCollectorShardCount = ProfilerModuleCollectorThreadCount<Module>::value;
-    static_assert(kCollectorShardCount >= 1, "Module::kCollectorThreadCount must be >= 1");
+    // Compile-time CAPACITY of the shard arrays. The number of shards actually
+    // in use is the runtime `shard_count_` (<= this), set via set_shard_count().
+    static constexpr int kMaxCollectorShards = ProfilerModuleMaxCollectorThreads<Module>::value;
+    static_assert(kMaxCollectorShards >= 1, "Module::kMaxCollectorThreads must be >= 1");
     static constexpr size_t kReadyQueueCapacity = ProfilerModuleHostQueueCapacity<Module>::value;
     static constexpr size_t kPoolQueueCapacity = ProfilerModuleHostPoolQueueCapacity<Module>::value;
     static constexpr size_t kRecycledQueueCapacity = ProfilerModuleHostRecycledQueueCapacity<Module>::value;
@@ -318,6 +341,22 @@ public:
         shm_size_ = shm_size;
         device_id_ = device_id;
     }
+
+    /**
+     * Set how many of the kMaxCollectorShards shards are live for this run.
+     * Every shard-indexed method folds its argument modulo this value, so it
+     * must be set before the first push_recycled() — collectors seed their
+     * recycled lanes during init(), ahead of ProfilerBase::start().
+     */
+    void set_shard_count(int n) {
+        if (n < 1 || n > kMaxCollectorShards) {
+            LOG_ERROR("BufferPoolManager: shard_count %d out of range [1, %d]; clamping", n, kMaxCollectorShards);
+            n = n < 1 ? 1 : kMaxCollectorShards;
+        }
+        shard_count_ = n;
+    }
+
+    int shard_count() const { return shard_count_; }
 
     /**
      * Release every device buffer the framework currently owns: recycled
@@ -423,14 +462,18 @@ public:
             shard.queue.clear();
         }
         std::unordered_set<void *> release_ptrs;
+        std::vector<void *> release_order;
         for (const auto &kv : dev_to_host_) {
             if (kv.first != nullptr) {
                 if (void *release_ptr = allocation_base_for_locked(kv.first); release_ptr != nullptr) {
-                    release_ptrs.insert(release_ptr);
+                    if (release_ptrs.insert(release_ptr).second) {
+                        release_order.push_back(release_ptr);
+                    }
                 }
             }
         }
-        for (void *p : release_ptrs) {
+        std::sort(release_order.begin(), release_order.end(), std::less<void *>{});
+        for (void *p : release_order) {
             release_fn(p);
         }
         for (void *host_ptr : malloc_shadows_) {
@@ -585,8 +628,8 @@ public:
 
     // -------------------------------------------------------------------------
     // done_queue shards: collector threads report buffers they have finished
-    // copying; mgmt folds them back into the same shard's recycled pool of the
-    // right kind.
+    // copying; replenish routes each buffer to a same-kind recycled lane below
+    // its warm target, or back to the origin lane when no deficit exists.
     // -------------------------------------------------------------------------
 
     bool notify_copy_done(void *dev_ptr, int kind, int shard_index = 0) {
@@ -784,8 +827,8 @@ public:
     }
 
     void *pop_recycled_for_startup(int kind) {
-        for (size_t shard = 0; shard < recycled_.size(); shard++) {
-            if (void *p = pop_recycled(kind, static_cast<int>(shard)); p != nullptr) return p;
+        for (int shard = 0; shard < shard_count_; shard++) {
+            if (void *p = pop_recycled(kind, shard); p != nullptr) return p;
         }
         return nullptr;
     }
@@ -821,16 +864,16 @@ public:
 
     size_t recycled_count(int kind) const {
         size_t total = 0;
-        for (size_t shard = 0; shard < recycled_.size(); shard++) {
-            total += recycled_[shard][kind].size();
+        for (int shard = 0; shard < shard_count_; shard++) {
+            total += recycled_[static_cast<size_t>(shard)][kind].size();
         }
         return total;
     }
 
     bool recycled_empty() const {
-        for (size_t shard = 0; shard < recycled_.size(); shard++) {
+        for (int shard = 0; shard < shard_count_; shard++) {
             for (int kind = 0; kind < Module::kBufferKinds; kind++) {
-                if (!recycled_[shard][kind].empty()) return false;
+                if (!recycled_[static_cast<size_t>(shard)][kind].empty()) return false;
             }
         }
         return true;
@@ -854,10 +897,27 @@ public:
         return drained;
     }
 
+    /**
+     * Drain every done shard, filling the largest same-kind recycled deficit
+     * before returning a buffer to its origin shard. The replenish thread is
+     * the only runtime consumer for all done shards and the only runtime
+     * producer for all recycled lanes.
+     */
     size_t drain_done_into_recycled() {
         size_t drained = 0;
-        for (size_t shard = 0; shard < done_shards_.size(); shard++) {
-            drained += drain_done_into_recycled(static_cast<int>(shard));
+        for (int origin_shard = 0; origin_shard < shard_count_; origin_shard++) {
+            auto &done = done_shards_[static_cast<size_t>(origin_shard)];
+            DoneInfo info{};
+            while (done.queue.pop(info)) {
+                size_t target_shard = select_recycled_shard(info.kind, static_cast<size_t>(origin_shard));
+                bool published = push_recycled(info.kind, info.dev_ptr, static_cast<int>(target_shard));
+                if (!published && target_shard != static_cast<size_t>(origin_shard)) {
+                    published = push_recycled(info.kind, info.dev_ptr, origin_shard);
+                }
+                if (published || retire_unqueued_buffer(info.kind, info.dev_ptr, origin_shard)) {
+                    drained++;
+                }
+            }
         }
         return drained;
     }
@@ -919,9 +979,9 @@ private:
         DoneRing queue;
     };
 
-    static size_t normalize_shard(int shard_index) {
+    size_t normalize_shard(int shard_index) const {
         if (shard_index < 0) return 0;
-        return static_cast<size_t>(shard_index) % static_cast<size_t>(kCollectorShardCount);
+        return static_cast<size_t>(shard_index) % static_cast<size_t>(shard_count_);
     }
 
     static size_t align_up(size_t value, size_t alignment) {
@@ -930,6 +990,26 @@ private:
         if (rem == 0) return value;
         if (value > std::numeric_limits<size_t>::max() - (alignment - rem)) return 0;
         return value + (alignment - rem);
+    }
+
+    size_t select_recycled_shard(int kind, size_t origin_shard) const {
+        size_t selected = origin_shard;
+        size_t largest_deficit = 0;
+        int configured_target = profiler_module_recycled_warm_target<Module>(kind, shard_count_);
+        if (configured_target <= 0) return selected;
+
+        size_t target = std::min(static_cast<size_t>(configured_target), kRecycledQueueCapacity);
+        size_t live_shards = static_cast<size_t>(shard_count_);
+        for (size_t offset = 1; offset <= live_shards; offset++) {
+            size_t shard = (origin_shard + offset) % live_shards;
+            size_t current = recycled_[shard][kind].size();
+            size_t deficit = current < target ? target - current : 0;
+            if (deficit > largest_deficit) {
+                selected = shard;
+                largest_deficit = deficit;
+            }
+        }
+        return selected;
     }
 
     void *allocation_base_for_locked(void *dev_ptr) const {
@@ -973,11 +1053,18 @@ private:
     int device_id_{-1};
     MemoryOps ops_;
 
+    // Live shard count for this run; <= kMaxCollectorShards. Written once by
+    // set_shard_count() during the collector's init(), read by the drain,
+    // replenish and collector threads that start() spawns afterwards — the
+    // std::thread constructor is the synchronization point, so a plain int
+    // needs no atomic.
+    int shard_count_{kMaxCollectorShards};
+
     // mgmt → collector
-    std::array<ReadyQueueShard, kCollectorShardCount> ready_shards_;
+    std::array<ReadyQueueShard, kMaxCollectorShards> ready_shards_;
 
     // collector → mgmt
-    std::array<DoneQueueShard, kCollectorShardCount> done_shards_;
+    std::array<DoneQueueShard, kMaxCollectorShards> done_shards_;
 
     // Host-side pointer mappings are shared across all collector shards.
     mutable std::mutex mapping_mutex_;
@@ -994,11 +1081,11 @@ private:
     std::unordered_set<void *> malloc_shadows_;
 
     // Local recycled buffer pools indexed by collector shard, then Module-defined kind id.
-    std::array<std::array<RecycledRing, Module::kBufferKinds>, kCollectorShardCount> recycled_;
+    std::array<std::array<RecycledRing, Module::kBufferKinds>, kMaxCollectorShards> recycled_;
 
     // Error-path holding pools for buffers removed from recycled_ or popped
     // from device ready queues but not published to a collector/free_queue.
-    std::array<std::array<RetiredPool, Module::kBufferKinds>, kCollectorShardCount> retired_;
+    std::array<std::array<RetiredPool, Module::kBufferKinds>, kMaxCollectorShards> retired_;
 };
 
 }  // namespace profiling_common

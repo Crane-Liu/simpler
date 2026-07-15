@@ -68,11 +68,21 @@ class TestL2Swimlane(SceneTestCase):
         ],
     }
 
+    # The host's drain/collector thread count follows aicpu_thread_num, so the
+    # low-thread cases exercise a shard layout the 4-thread default never
+    # reaches. The task-count assertions below are exact, so a record lost to a
+    # mis-sharded buffer fails the run rather than degrading it silently.
     CASES = [
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 3},
+            "params": {},
+        },
+        {
+            "name": "aicpu_threads_2",
+            "platforms": ["a5sim", "a5"],
+            "config": {"aicpu_thread_num": 2, "block_dim": 3},
             "params": {},
         },
     ]

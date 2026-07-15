@@ -33,8 +33,9 @@ void report_endpoint_error(const L3L2OrchEndpoint &endpoint) {
         PTO2_ERROR_EXPLICIT_ORCH_FATAL,
         "L3-L2 endpoint error op=%s kind=%u region=%llu counter_addr=%llu counter_operand=%d observed_counter=%d "
         "msg=%s",
-        err.op, static_cast<unsigned>(err.kind), static_cast<unsigned long long>(err.region_id),
-        static_cast<unsigned long long>(err.counter_addr), err.counter_operand, err.observed_counter, err.message
+        l3_l2_endpoint_op_to_string(err.op), static_cast<unsigned>(err.kind),
+        static_cast<unsigned long long>(err.region_id), static_cast<unsigned long long>(err.counter_addr),
+        err.counter_operand, err.observed_counter, err.message
     );
 }
 
@@ -43,7 +44,7 @@ bool has_endpoint_error(const L3L2OrchEndpoint &endpoint) {
 }
 
 bool read_payload_or_fail(L3L2OrchEndpoint &endpoint, uint64_t offset, uint64_t nbytes, L3L2OrchPayloadView *out) {
-    if (endpoint.payload_read(offset, nbytes, out)) {
+    if (out != nullptr && endpoint.payload_read(offset, nbytes, *out)) {
         return true;
     }
     report_endpoint_error(endpoint);
@@ -82,8 +83,8 @@ __attribute__((visibility("default"))) void l3_l2_orch_comm_orchestration(const 
     uint32_t shape[1] = {numel};
     uint64_t data_ready_counter_addr = 0;
     uint64_t completion_counter_addr = 0;
-    if (!endpoint.counter_addr(data_ready_counter_offset, &data_ready_counter_addr) ||
-        !endpoint.counter_addr(completion_counter_offset, &completion_counter_addr)) {
+    if (!endpoint.counter_addr(data_ready_counter_offset, data_ready_counter_addr) ||
+        !endpoint.counter_addr(completion_counter_offset, completion_counter_addr)) {
         report_endpoint_error(endpoint);
         return;
     }
@@ -91,7 +92,7 @@ __attribute__((visibility("default"))) void l3_l2_orch_comm_orchestration(const 
     for (uint64_t seq = 1;; ++seq) {
         const int32_t signal_value = static_cast<int32_t>(seq);
         int32_t observed = 0;
-        if (!endpoint.signal_wait(data_ready_counter_addr, signal_value, L3L2OrchWaitCmp::GE, timeout, &observed)) {
+        if (!endpoint.signal_wait(data_ready_counter_addr, signal_value, L3L2OrchWaitCmp::GE, timeout, observed)) {
             report_endpoint_error(endpoint);
             return;
         }

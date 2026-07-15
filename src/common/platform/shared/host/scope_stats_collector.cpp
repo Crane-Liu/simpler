@@ -51,14 +51,21 @@ int ScopeStatsCollector::init(
     int num_threads, const ScopeStatsAllocCallback &alloc_cb, ScopeStatsRegisterCallback register_cb,
     const ScopeStatsFreeCallback &free_cb, int device_id
 ) {
-    if (num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
-        LOG_ERROR("ScopeStatsCollector::init: invalid arguments");
+    if (num_threads <= 0 || num_threads > PLATFORM_MAX_AICPU_THREADS || alloc_cb == nullptr || free_cb == nullptr) {
+        LOG_ERROR(
+            "ScopeStatsCollector::init: invalid arguments (num_threads=%d, valid range: 1-%d)", num_threads,
+            PLATFORM_MAX_AICPU_THREADS
+        );
         return -1;
     }
     if (initialized_) {
         LOG_ERROR("ScopeStatsCollector already initialized");
         return -1;
     }
+
+    // Must precede the recycled-lane seeding below: push_recycled() folds its
+    // shard argument modulo the manager's shard count.
+    set_aicpu_thread_num(num_threads);
 
     total_collected_ = 0;
     records_.clear();

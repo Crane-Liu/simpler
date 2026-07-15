@@ -41,9 +41,13 @@ public:
     /// unified_log_* (and, on sim, sim_context_*) symbols against those
     /// globals. The Python `ChipWorker` wrapper does this with `ctypes.CDLL(...,
     /// mode=RTLD_GLOBAL)`.
+    /// `prewarm_config`, when non-null, builds + caches the prebuilt
+    /// runtime-arena for its ring sizing right after the device comes up (the
+    /// sizing is fork-constant, delivered by COW into init). A no-op for
+    /// runtimes without a prebuilt arena.
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-        const std::string &dispatcher_path, int device_id
+        const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr
     );
 
     /// Tear down everything: device resources and runtime library.
@@ -142,8 +146,9 @@ private:
     // From host_runtime.so. Single platform-side init that does (a) thread
     // attach + device-id record, (b) executor binary takeover, (c) onboard
     // CANN dlog sync. Reads the current log level off HostLogger itself.
-    using SimplerInitFn =
-        int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t);
+    using SimplerInitFn = int (*)(
+        void *, int, const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t, const CallConfig *
+    );
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
     using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);

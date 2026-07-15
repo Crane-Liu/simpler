@@ -88,8 +88,6 @@ struct L2SwimlaneModule {
         PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE +
         PLATFORM_MAX_AICPU_THREADS * (PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD + PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD) +
         PLATFORM_MAX_CORES * PLATFORM_AICORE_BUFFERS_PER_CORE;
-    static constexpr uint32_t kMaxCoresPerCollectorShard =
-        (PLATFORM_MAX_CORES + PLATFORM_MAX_AICPU_THREADS - 1) / PLATFORM_MAX_AICPU_THREADS;
     static constexpr uint32_t kAicpuTaskRecycledQueueSize = PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE;
     static constexpr uint32_t kAicoreTaskRecycledQueueSize = PLATFORM_MAX_CORES * PLATFORM_AICORE_BUFFERS_PER_CORE;
     static constexpr uint32_t kPhaseRecycledQueueSize =
@@ -105,8 +103,9 @@ struct L2SwimlaneModule {
                                                                        kPhaseRecycledQueueSize));
     static constexpr uint32_t kSlotCount = PLATFORM_PROF_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "L2SwimlaneModule";
-    static constexpr int kMgmtDrainThreadCount = PLATFORM_MAX_AICPU_THREADS;
-    static constexpr int kCollectorThreadCount = PLATFORM_MAX_AICPU_THREADS;
+    // Producers are the scheduler threads (task / sched-phase records) plus the
+    // orchestrator (orch-phase records) — one per AICPU thread.
+    static constexpr int kMaxCollectorThreads = PLATFORM_MAX_AICPU_THREADS;
 
     /**
      * Startup-only batch allocation size for proactive_replenish. Sched and
@@ -139,23 +138,28 @@ struct L2SwimlaneModule {
     // The recycled watermark is a steady-state low-water mark, not an
     // additional startup preallocation target. Keep half of the init-seeded
     // surplus per shard; kinds with no surplus keep a minimal reserve.
-    static constexpr int half_initial_surplus_warm_target(int buffers_per_core) {
+    // Cores are spread across the live collector shards, so each shard owns
+    // ceil(cores / shard_count) of them. The watermark must therefore grow as
+    // the shard count shrinks — sizing it against the platform's max thread
+    // count instead would under-provision a run with fewer AICPU threads.
+    static constexpr int cores_per_shard(int shard_count) {
+        return shard_count > 0 ? (PLATFORM_MAX_CORES + shard_count - 1) / shard_count : PLATFORM_MAX_CORES;
+    }
+
+    static constexpr int half_initial_surplus_warm_target(int buffers_per_core, int shard_count) {
         int surplus_per_core = buffers_per_core > static_cast<int>(PLATFORM_PROF_SLOT_COUNT) ?
                                    buffers_per_core - static_cast<int>(PLATFORM_PROF_SLOT_COUNT) :
                                    0;
-        int initial_surplus = surplus_per_core * static_cast<int>(kMaxCoresPerCollectorShard);
+        int initial_surplus = surplus_per_core * cores_per_shard(shard_count);
         return initial_surplus > 0 ? (initial_surplus + 1) / 2 : 1;
     }
 
-    static constexpr int recycled_warm_target(int kind) {
-        constexpr int kAicpuTaskWarmTarget = half_initial_surplus_warm_target(PLATFORM_PROF_BUFFERS_PER_CORE);
-        constexpr int kAicoreTaskWarmTarget = half_initial_surplus_warm_target(PLATFORM_AICORE_BUFFERS_PER_CORE);
-
+    static constexpr int recycled_warm_target(int kind, int shard_count) {
         switch (static_cast<L2SwimlaneBufferKind>(kind)) {
         case L2SwimlaneBufferKind::AicpuTask:
-            return kAicpuTaskWarmTarget;
+            return half_initial_surplus_warm_target(PLATFORM_PROF_BUFFERS_PER_CORE, shard_count);
         case L2SwimlaneBufferKind::AicoreTask:
-            return kAicoreTaskWarmTarget;
+            return half_initial_surplus_warm_target(PLATFORM_AICORE_BUFFERS_PER_CORE, shard_count);
         case L2SwimlaneBufferKind::AicpuSchedPhase:
         case L2SwimlaneBufferKind::AicpuOrchPhase:
             return 0;

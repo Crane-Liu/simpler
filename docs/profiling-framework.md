@@ -1,7 +1,7 @@
 # Profiling Framework
 
 Shared profiling infrastructure that the PMU, L2Swimlane, DepGen,
-TensorDump, and ScopeStats collectors are built on. The host-side framework
+ArgsDump, and ScopeStats collectors are built on. The host-side framework
 headers live in
 [`src/common/platform/include/host/`](../src/common/platform/include/host/)
 and are consumed verbatim by both a2a3 and a5 collectors (PR #944
@@ -34,13 +34,14 @@ Each profiling subsystem needs the same plumbing on the host:
   refills device free queues from shard-local recycled lanes, and recycles
   collector-returned buffers while kernels are still running. A module may
   opt into split drain/refill threads plus a replenish thread. Runtime
-  allocation, when enabled, is confined to the replenish thread and publishes
-  only to host-side recycled lanes.
+  allocation, when enabled, is confined to the replenish thread. Before it
+  allocates, that thread routes newly returned buffers to compatible recycled
+  lanes below their watermarks.
 - Collector thread shards that drain host-side hand-off queues and copy
   records out of each ready buffer.
 - A pool of pre-registered device buffers (allocated up-front, refilled on
   demand from host-side watermarks) keyed by "kind". PMU, DepGen,
-  TensorDump, and ScopeStats have one kind; L2Swimlane has four.
+  ArgsDump, and ScopeStats have one kind; L2Swimlane has four.
 - A dev↔host pointer map so the management thread can resolve a device
   pointer popped off a ready queue to the host-mapped pointer the collector
   thread will read.
@@ -122,8 +123,8 @@ Owns:
   fixed-capacity SPSC ring. The producer is the collector shard; the single
   consumer is the replenish thread.
 - `recycled_[shard][kind]` — shard-local SPSC lanes of free device buffers;
-  runtime drain reads the owning shard while replenish writes returned buffers
-  and optional watermark allocations.
+  runtime drain reads the owning shard while replenish writes compatible
+  returned buffers and optional watermark allocations.
 - `retired_[shard][kind]` — mutex-protected exceptional holding pools for
   buffers that were removed from a queue but could not be published to the
   next queue. They are drained only during teardown.
@@ -152,19 +153,21 @@ Provides:
 - Split mgmt threads — `mgmt_drain_loop` drains ready queues and refills the
   originating free queue from the current drain shard's local recycled pool
   (`ProfilerAlgorithms<Module>::process_entry` per popped entry), while
-  `mgmt_replenish_loop` drains done buffers into shard-local recycled pools
-  and keeps optional recycled watermarks topped up by batched allocation. The
-  replenish thread never writes device free queues, so the drain hot path
-  stays allocation-free and remains the only runtime writer to free queues.
+  `mgmt_replenish_loop` routes done buffers to compatible shard-local pools
+  below their recycled watermarks, then tops up remaining deficits by batched
+  allocation. The replenish thread never writes device free queues, so the
+  drain hot path stays allocation-free and remains the only runtime writer to
+  free queues.
   A one-shot `proactive_replenish` seeds every free queue before the threads
   start. Split drain threads do not bulk-mirror the whole
   shared-memory region; they refresh only their queue indices / entries
   before advancing `queue_heads`. On an empty scan, split drain does a short
   busy-poll window before falling back to the 10 us sleep, so micro-bursts
   are less likely to miss AICPU's bounded wait window.
-- Optional collector sharding (`Module::kCollectorThreadCount`) — each
-  collector drains one host ready shard and returns finished buffers through
-  the matching done shard.
+- Optional collector sharding (`Module::kMaxCollectorThreads` caps the shard
+  arrays; the live shard count is the runtime `min(aicpu_thread_num,
+  kMaxCollectorThreads)`) — each collector drains one host ready shard and
+  returns finished buffers through the matching done shard.
 - `poll_and_collect_loop` — per-shard `wait_pop_ready` with a 100 ms cv
   tick, dispatches to `Derived::on_buffer_collected`, then calls
   `manager_.notify_copy_done(...)` itself; idle-timeout hang detector.
@@ -215,10 +218,9 @@ the required members are:
 | `kHostPoolQueueSize` | Optional host done ring depth |
 | `kHostRecycledQueueSize` | Optional per-kind, per-shard recycled ring depth; defaults to `kHostPoolQueueSize` |
 | `kSubsystemName` | Tag used in framework log lines |
-| `kMgmtDrainThreadCount` | Optional; number of mgmt drain shards (defaults to 1) |
-| `kCollectorThreadCount` | Optional number of collector / host ready-queue shards |
+| `kMaxCollectorThreads` | Optional compile-time CAPACITY of the drain / collector shard arrays (defaults to 1); live shard count is the runtime `min(aicpu_thread_num, kMaxCollectorThreads)` set via `set_aicpu_thread_num()` |
 | `refresh_replenish_metadata(mgr, header)` | Optional hook to refresh cached queue metadata before a replenish pass |
-| `recycled_warm_target(kind[, shard]) → int` | Optional startup/runtime low-water mark for shard-local recycled lanes |
+| `recycled_warm_target(kind[, shard_count]) → int` | Optional low-water mark used first for same-kind done-buffer routing, then for startup/runtime allocation; the two-arg form scales the mark with the live shard count |
 | `header_from_shm(void*) → DataHeader*` | Cast shared-memory base to header |
 | `batch_size(int kind) → int` | Per-kind batch-alloc count |
 | `resolve_entry(shm, header, q, entry) → optional<EntrySite>` | Map a popped ready entry to (kind, free_queue, buffer_size, partial info); return `nullopt` to drop |
@@ -229,7 +231,7 @@ The Module structs are defined alongside their collectors in
 [pmu_collector.h](../src/a2a3/platform/include/host/pmu_collector.h),
 [l2_swimlane_collector.h](../src/common/platform/include/host/l2_swimlane_collector.h),
 [dep_gen_collector.h](../src/common/platform/include/host/dep_gen_collector.h),
-[tensor_dump_collector.h](../src/common/platform/include/host/tensor_dump_collector.h),
+[args_dump_collector.h](../src/common/platform/include/host/args_dump_collector.h),
 and
 [scope_stats_collector.h](../src/common/platform/include/host/scope_stats_collector.h)
 — each is a few dozen lines of static methods over the subsystem's own
@@ -240,16 +242,20 @@ and
 Each collector inherits as `class XxxCollector : public ProfilerBase<XxxCollector, XxxModule>`
 and only has to provide:
 
-- `void on_buffer_collected(const ReadyBufferInfo& info)` — copy the
-  records out of `info.host_buffer_ptr` and update collector-specific
-  state (CSV row, in-memory aggregator, file writer thread, …). The
-  framework calls `manager_.notify_copy_done(...)` afterwards; **Derived
+- `void on_buffer_collected(const ReadyBufferInfo& info)` or the optional
+  shard-aware overload `void on_buffer_collected(const ReadyBufferInfo& info,
+  int collector_shard)` — copy records out of `info.host_buffer_ptr` and
+  update collector-specific state (CSV row, in-memory aggregator, file writer
+  thread, …). PMU and ArgsDump use the shard id for lock-free local
+  accumulation. DepGen and ScopeStats have one orchestrator producer, so they
+  retain their single-accumulator path. The framework calls
+  `manager_.notify_copy_done(...)` afterwards; **Derived
   must not call it directly.**
 - `static constexpr int kIdleTimeoutSec` — bound on no-progress idle in
   the collector loop. Use the subsystem's `PLATFORM_*_TIMEOUT_SECONDS`
   constant.
 - `static constexpr const char* kSubsystemName` — appears in the idle
-  timeout log line (e.g. `"PMU"`, `"L2Swimlane"`, `"TensorDump"`).
+  timeout log line (e.g. `"PMU"`, `"L2Swimlane"`, `"ArgsDump"`).
 - `init(...)` and `finalize(...)` — domain-specific setup/teardown.
   `init` must call `set_memory_context()` on the success path so
   `start(tf)` is not a no-op. `finalize` must release framework-owned
@@ -295,7 +301,7 @@ Each AICPU writer defines a local `XxxDeviceModule` trait with:
 
 Current users:
 
-- ScopeStats, DepGen, TensorDump, and PMU use the engine for
+- ScopeStats, DepGen, ArgsDump, and PMU use the engine for
   ready/free/switch.
 - L2Swimlane uses the engine for ready enqueue / free wait primitives and
   AICPU task-buffer pop/switch.
@@ -323,18 +329,20 @@ Current users:
                                           ▲
                                           │
                             replenish thread:
-                            done shard q → recycled[q]
+                            done shard q → recycled[largest same-kind deficit]
+                                           or recycled[q] if none
 ```
 
 The queue shards plus the shard-local recycled pools and the dev↔host map all
 live in the single `BufferPoolManager` instance owned by `ProfilerBase`.
 Each ready shard has one collector consumer; each done shard is written by
-its matching collector and drained by the replenish thread into the same
-recycled shard. Split drain refills the originating free queue on the hot
-path from `recycled[q]`; replenish does not write free queues at runtime.
-Backpressure fallbacks that cannot publish a buffer to ready/free/recycled
-place it in `retired_[q][kind]`, which is outside the hot SPSC path and is
-released at teardown.
+its matching collector and drained by the replenish thread. A completed
+buffer first fills the largest same-kind recycled deficit; when no shard is
+below its target, it returns to its origin shard. Split drain refills the
+originating free queue on the hot path from `recycled[q]`; replenish does not
+write free queues at runtime. Backpressure fallbacks that cannot publish a
+buffer to ready/free/recycled place it in `retired_[q][kind]`, which is outside
+the hot SPSC path and is released at teardown.
 
 ## 5. Lifecycle
 
@@ -398,7 +406,9 @@ mid-run by the framework.
 Two things follow:
 
 - `dev_to_host_` has a narrow mapping lock; ready/done/recycled hand-off is
-  SPSC by shard, so the hot drain/refill path stays on the owning lane.
+  SPSC by shard. Cross-shard return routing does not change ownership:
+  replenish remains the only recycled-lane producer, and each drain shard
+  remains its lane's only consumer.
 - Device-side queue backpressure is bounded for the profiling writers that
   use this protocol. If the host does not make ready-queue space or
   free-queue entries visible within the short wait budget, AICPU records a
@@ -444,7 +454,7 @@ Existing collectors are the canonical examples:
   — single kind, per-core instances. See [pmu-profiling.md](dfx/pmu-profiling.md).
 - [`DepGenCollector`](../src/common/platform/include/host/dep_gen_collector.h)
   — single kind, one instance. See [dep_gen.md](dfx/dep_gen.md).
-- [`TensorDumpCollector`](../src/common/platform/include/host/tensor_dump_collector.h)
+- [`ArgsDumpCollector`](../src/common/platform/include/host/args_dump_collector.h)
   — single kind, per-AICPU-thread instances. See [args-dump.md](dfx/args-dump.md).
 - [`ScopeStatsCollector`](../src/common/platform/include/host/scope_stats_collector.h)
   — single kind, one instance. See [scope-stats.md](dfx/scope-stats.md).
@@ -501,7 +511,7 @@ Most collectors keep `reconcile_counters` passive — same shape as a2a3. It
 pulls the post-`stop()` `BufferState`s, logs an error if any
 `current_buf_ptr` still references a non-empty buffer (a device flush bug,
 since AICPU is the only writer that can clear it), and runs the collector's
-counter cross-check/accounting against device-side counters. TensorDump and
+counter cross-check/accounting against device-side counters. ArgsDump and
 ScopeStats are the recovery-oriented exceptions: on abnormal exit they may
 recover a non-empty `current_buf_ptr` host-side before export, so already
 recorded dump metadata or scope samples still reach the output files.
@@ -531,7 +541,7 @@ state surface, never the runtime protocol.
 
 L2Swimlane and PMU on a5 both use the "AICore writes, AICPU commits" model.
 The AICore-side write target is a per-core
-[`L2SwimlaneAicoreRing`](../src/a5/platform/include/common/l2_swimlane_profiling.h) /
+[`L2SwimlaneAicoreRing`](../src/common/platform/include/common/l2_swimlane_profiling.h) /
 [`PmuAicoreRing`](../src/a5/platform/include/common/pmu_profiling.h) of
 `PLATFORM_{L2,PMU}_AICORE_RING_SIZE` (= 2, dual-issue) slots, allocated
 once by the host and addressed by

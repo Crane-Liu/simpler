@@ -18,6 +18,7 @@
  */
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
@@ -742,21 +743,21 @@ NB_MODULE(_task_interface, m) {
                 }
             }
         )
+        // Accept either an int dump level (0=off, 1=partial, 2=full,
+        // 3=full_json_only) or a Python bool. `True` maps to level 1
+        // (partial) — the default when --dump-args is passed without a
+        // value; `False` maps to 0.
         .def_prop_rw(
-            "enable_dump_tensor",
+            "enable_dump_args",
             [](const CallConfig &c) {
-                return c.enable_dump_tensor;
+                return c.enable_dump_args;
             },
-            // Accept either an int dump level (0=off, 1=partial, 2=full,
-            // 3=full_json_only) or a Python bool. `True` maps to level 1
-            // (partial) — the default when --dump-args is passed without a
-            // value; `False` maps to 0.
             [](CallConfig &c, nb::object v) {
                 if (PyBool_Check(v.ptr())) {
-                    c.enable_dump_tensor = nb::cast<bool>(v) ? 1 : 0;
+                    c.enable_dump_args = nb::cast<bool>(v) ? 1 : 0;
                 } else {
                     int level = nb::cast<int>(v);
-                    c.enable_dump_tensor = (level < 0) ? 0 : (level > 3) ? 3 : level;
+                    c.enable_dump_args = (level < 0) ? 0 : (level > 3) ? 3 : level;
                 }
             }
         )
@@ -808,9 +809,8 @@ NB_MODULE(_task_interface, m) {
         .def("__repr__", [append_ring_values](const CallConfig &self) -> std::string {
             std::ostringstream os;
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
-               << ", enable_l2_swimlane=" << self.enable_l2_swimlane
-               << ", enable_dump_tensor=" << self.enable_dump_tensor << ", enable_pmu=" << self.enable_pmu
-               << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
+               << ", enable_l2_swimlane=" << self.enable_l2_swimlane << ", enable_dump_args=" << self.enable_dump_args
+               << ", enable_pmu=" << self.enable_pmu << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
                << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False")
                << ", enable_graph_cache=" << (self.enable_graph_cache ? "True" : "False");
             if (self.runtime_env.any()) {
@@ -838,8 +838,20 @@ NB_MODULE(_task_interface, m) {
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())
         .def(
-            "init", &ChipWorker::init, nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"),
-            nb::arg("dispatcher_path"), nb::arg("device_id")
+            "init",
+            [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
+               const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
+               std::optional<CallConfig> prewarm_config) {
+                self.init(
+                    host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id,
+                    prewarm_config.has_value() ? &(*prewarm_config) : nullptr
+                );
+            },
+            nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
+            nb::arg("device_id"), nb::arg("prewarm_config") = nb::none(),
+            "Bind the runtime library and attach to device_id. When prewarm_config is "
+            "given, its ring sizing is built + cached inside init (fork-constant, no "
+            "cross-process control command). A no-op for runtimes without a prebuilt arena."
         )
         .def("finalize", &ChipWorker::finalize)
         .def(

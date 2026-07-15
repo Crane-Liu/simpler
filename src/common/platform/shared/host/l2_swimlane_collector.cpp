@@ -112,6 +112,10 @@ int L2SwimlaneCollector::initialize(
         return -1;
     }
 
+    // Must precede the recycled-lane seeding below: push_recycled() folds its
+    // shard argument modulo the manager's shard count.
+    set_aicpu_thread_num(aicpu_thread_num);
+
     num_aicore_ = num_aicore;
     aicpu_thread_num_ = aicpu_thread_num;
     l2_swimlane_level_ = l2_swimlane_level;
@@ -387,12 +391,16 @@ int L2SwimlaneCollector::initialize(
         return 0;
     };
 
-    // Sched: actual scheduler-thread count is unknown at host-alloc time, so
-    // size buffers to the platform max. Orch: a single instance (pool 0), so
-    // allocate buffers for just one pool while still zeroing all MAX states.
+    // The shm layout spans PLATFORM_MAX_AICPU_THREADS pool states (state_count)
+    // because AICPU's pool-array offsets are fixed at that stride, but only the
+    // first `aicpu_thread_num` of them ever get a producer — so buffers are
+    // allocated for those alone. Seeding a pool at t >= aicpu_thread_num would
+    // also push its surplus into recycled lane `t`, which no drain thread owns.
+    // Orch: a single instance (pool 0), so allocate buffers for just one pool
+    // while still zeroing all MAX states.
     if (init_phase_pools(
             static_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(nullptr), get_sched_phase_buffer_state,
-            /*state_count=*/num_phase_threads, /*buffer_count=*/num_phase_threads,
+            /*state_count=*/num_phase_threads, /*buffer_count=*/aicpu_thread_num,
             /*buffers_per_thread=*/PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD, ProfBufferType::AICPU_SCHED_PHASE, "sched"
         ) != 0) {
         return -1;
@@ -465,7 +473,7 @@ size_t L2SwimlaneCollector::normalize_collector_shard(int collector_shard) const
 }
 
 void L2SwimlaneCollector::reset_collector_shards() {
-    const size_t shard_count = static_cast<size_t>(L2SwimlaneModule::kCollectorThreadCount);
+    const size_t shard_count = static_cast<size_t>(manager_.shard_count());
 
     collected_perf_records_.assign(num_aicore_, {});
     collected_aicore_records_.assign(num_aicore_, {});
@@ -1218,7 +1226,7 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
     // shm_host_ aliases freed device/host memory now; null it so is_initialized()
     // reports false, the dtor's "destroyed without finalize()" warning stays
     // quiet, and a re-entrant finalize() / re-init hits the early-out instead of
-    // walking freed buffer state. Mirrors PMU/DepGen/TensorDump collectors.
+    // walking freed buffer state. Mirrors PMU/DepGen/ArgsDump collectors.
     shm_host_ = nullptr;
     collected_perf_records_.clear();
     collected_aicore_records_.clear();

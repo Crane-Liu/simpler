@@ -141,7 +141,7 @@ _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
-# 8 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
+# 8 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_args,
 # enable_pmu, enable_dep_gen, enable_scope_stats, enable_graph_cache) + uint64 ring sizing
 # overrides (3 per-ring arrays of RUNTIME_ENV_RING_COUNT: ring_task_window,
 # ring_heap, ring_dep_pool) + 1024-byte NUL-terminated output_prefix. Log config
@@ -1327,7 +1327,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                 pass
 
 
-def _chip_process_loop(
+def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins, identity tables, log config, prewarm sizing) must cross the fork as explicit COW args; the child cannot read parent state after os.fork
     buf: memoryview,
     bins,
     device_id: int,
@@ -1338,6 +1338,7 @@ def _chip_process_loop(
     log_info_v: int = 5,
     platform: str = "",
     runtime: str = "",
+    prewarm_config=None,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -1352,7 +1353,7 @@ def _chip_process_loop(
 
     try:
         cw = ChipWorker()
-        cw.init(device_id, bins, log_level=log_level, log_info_v=log_info_v)
+        cw.init(device_id, bins, log_level=log_level, log_info_v=log_info_v, prewarm_config=prewarm_config)
     except Exception as e:
         _tb.print_exc()
         # Write the message so any parent reader that *does* inspect this
@@ -1410,7 +1411,7 @@ def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
     cfg.block_dim = block_dim
     cfg.aicpu_thread_num = aicpu_tn
     cfg.enable_l2_swimlane = swl
-    cfg.enable_dump_tensor = int(dt)
+    cfg.enable_dump_args = int(dt)
     cfg.enable_pmu = pmu
     cfg.enable_dep_gen = bool(dep_gen)
     cfg.enable_scope_stats = bool(scope_stats)
@@ -1567,6 +1568,11 @@ class Worker:
         self._hierarchical_start_state = "not_started"
         self._hierarchical_start_mu = threading.Lock()
         self._hierarchical_start_cv = threading.Condition(self._hierarchical_start_mu)
+
+        # Optional CallConfig whose ring sizing is pre-warmed at init() so the
+        # first run() with the same sizing skips the (~800ms) cold prebuilt
+        # runtime-arena build. Set by init(prewarm_config=...); None = disabled.
+        self._prewarm_config: Any | None = None
 
         # Level-2 internals
         self._chip_worker: ChipWorker | None = None
@@ -3048,9 +3054,28 @@ class Worker:
     # init — auto-discovery
     # ------------------------------------------------------------------
 
-    def init(self) -> None:
+    def init(self, prewarm_config=None) -> None:
+        """Initialize the worker.
+
+        Args:
+            prewarm_config: Optional CallConfig. When given, its ring sizing
+                (``runtime_env.ring_task_window`` / ``ring_heap`` /
+                ``ring_dep_pool``) is built + cached so the first ``run`` with the
+                same sizing skips the (~800ms) cold prebuilt runtime-arena build.
+                Timing is level-dependent: an L2 worker prewarms here in
+                ``init``; an L3+ worker has no chip children until the hierarchy
+                starts on the first ``run``, so it prewarms there — during
+                hierarchy startup, alongside the callable SO upload and before the
+                first task dispatches. A no-op for runtimes without a prebuilt
+                arena (host_build_graph). ``None`` (default) disables prewarm.
+        """
         if self._initialized:
             raise RuntimeError("Worker already initialized")
+        # Validate up front so a bad config fails here regardless of level, even
+        # though an L3+ worker does not build the arena until the first run.
+        if prewarm_config is not None:
+            prewarm_config.validate()
+        self._prewarm_config = prewarm_config
 
         try:
             if self.level == 2:
@@ -3076,7 +3101,10 @@ class Worker:
         binaries = builder.get_binaries(runtime)
 
         self._chip_worker = ChipWorker()
-        self._chip_worker.init(device_id, binaries)
+        # The prebuilt runtime-arena is prewarmed inside cw.init for the declared
+        # config's ring sizing (built right after the device comes up), so the
+        # first run() with matching sizing skips the cold arena build.
+        self._chip_worker.init(device_id, binaries, prewarm_config=self._prewarm_config)
 
         # Pre-warm any registered ChipCallable so the first run(handle, …)
         # does not pay the H2D upload cost.
@@ -3231,6 +3259,7 @@ class Worker:
                             log_info_v=chip_log_info_v,
                             platform=str(self._config["platform"]),
                             runtime=str(self._config["runtime"]),
+                            prewarm_config=self._prewarm_config,
                         )
                         os._exit(0)
                     else:
@@ -3265,7 +3294,10 @@ class Worker:
                 if pid == 0:
                     buf = self._next_level_shms[idx].buf
                     assert buf is not None
-                    inner_worker.init()
+                    # Propagate the fork-constant prewarm sizing down so L4+ trees
+                    # prewarm their L3 chips too (each inner Worker prewarms on its
+                    # own first run). Closes the prior L4+ silent no-op.
+                    inner_worker.init(prewarm_config=self._prewarm_config)
                     registry, identity_table, identity_refs = _make_local_identity_tables(
                         identity_snapshot,
                         callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
@@ -3312,6 +3344,10 @@ class Worker:
                     if kind == "CHIP_CALLABLE" and namespace == "LOCAL_CHIP" and isinstance(target, ChipCallable):
                         for worker_id in range(len(self._chip_shms)):
                             dw.control_prepare(worker_id, digest)
+
+            # The prebuilt runtime-arena is prewarmed inside each chip child's
+            # cw.init (the fork-constant sizing is COW-inherited via
+            # _chip_process_loop's prewarm_config arg) — no control command here.
 
             self._hierarchical_started = True
             with self._hierarchical_start_cv:

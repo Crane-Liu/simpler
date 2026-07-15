@@ -88,8 +88,10 @@ struct DepGenModule {
     static constexpr uint32_t kHostPoolQueueSize = PLATFORM_MAX_AICPU_THREADS * PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE;
     static constexpr uint32_t kSlotCount = PLATFORM_DEP_GEN_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "DepGenModule";
-    static constexpr int kMgmtDrainThreadCount = PLATFORM_MAX_AICPU_THREADS;
-    static constexpr int kCollectorThreadCount = PLATFORM_MAX_AICPU_THREADS;
+    // The orchestrator is the sole device-side producer (dep_gen_collector_aicpu
+    // enqueues into queues[s_orch_thread_idx]), so one drain thread scanning
+    // every AICPU ready queue covers it; further shards would only ever be empty.
+    static constexpr int kMaxCollectorThreads = 1;
 
     /**
      * Startup-only batch allocation size for proactive_replenish when the

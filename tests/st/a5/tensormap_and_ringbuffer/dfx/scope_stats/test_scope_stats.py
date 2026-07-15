@@ -79,11 +79,22 @@ class TestScopeStats(SceneTestCase):
         ],
     }
 
+    # The host runs one drain/collector thread per live shard, and the shard
+    # count follows aicpu_thread_num. Fewer threads means each surviving
+    # recycled lane serves more cores, so the low-thread cases are the ones
+    # that catch an under-provisioned watermark — which surfaces here as a
+    # non-zero `dropped` in the run's scope_stats.jsonl.
     CASES = [
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 3},
+            "params": {},
+        },
+        {
+            "name": "aicpu_threads_2",
+            "platforms": ["a5sim", "a5"],
+            "config": {"aicpu_thread_num": 2, "block_dim": 3},
             "params": {},
         },
     ]

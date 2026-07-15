@@ -49,10 +49,17 @@ int DepGenCollector::init(
         LOG_ERROR("DepGenCollector already initialized");
         return -1;
     }
-    if (num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
-        LOG_ERROR("DepGenCollector::init: invalid arguments");
+    if (num_threads <= 0 || num_threads > PLATFORM_MAX_AICPU_THREADS || alloc_cb == nullptr || free_cb == nullptr) {
+        LOG_ERROR(
+            "DepGenCollector::init: invalid arguments (num_threads=%d, valid range: 1-%d)", num_threads,
+            PLATFORM_MAX_AICPU_THREADS
+        );
         return -1;
     }
+
+    // Must precede the recycled-lane seeding below: push_recycled() folds its
+    // shard argument modulo the manager's shard count.
+    set_aicpu_thread_num(num_threads);
 
     num_threads_ = num_threads;
     total_collected_ = 0;
