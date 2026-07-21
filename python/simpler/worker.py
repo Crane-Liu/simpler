@@ -1481,6 +1481,40 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
         raise RuntimeError("chip run worker 0 must be the control ChipWorker")
     stop_run_workers = threading.Event()
 
+    def run_task(slot_index: int, slot_worker: ChipWorker) -> None:
+        frame_offset = slot_index * MAILBOX_TASK_SLOT_SIZE
+        slot_state_addr = state_addr if slot_index == 0 else mailbox_addr + frame_offset + _OFF_STATE
+        code = 0
+        msg = ""
+        try:
+            _validate_task_protocol(buf, frame_offset)
+            digest = _read_task_digest(buf, frame_offset)
+            cid = identity_table.get(digest)
+            if cid is None:
+                raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
+            if cid not in registered_callables:
+                raise RuntimeError(
+                    f"chip_process dev={device_id}: cid {cid} not registered before TASK_READY "
+                    f"(register via _CTRL_PREPARE first)"
+                )
+            blob_offset = frame_offset + _OFF_TASK_ARGS_BLOB
+            if host_buf_ranges:
+                _rewrite_blob_host_addrs(buf, blob_offset, host_buf_ranges)
+            cfg = _read_config_from_mailbox(buf, frame_offset)
+            # Each slot has a dedicated DeviceRunner, so its private arena
+            # is bank 0. HostGraph's async thread does not inherit the
+            # caller's arena-bank TLS; selecting bank 1 here would split
+            # Host O and Device S across different arenas.
+            slot_worker._impl.run_from_blob(int(cid), mailbox_addr + blob_offset, _MAILBOX_ARGS_CAPACITY, cfg, 0)
+        except Exception as e:  # noqa: BLE001
+            code = 1
+            msg = _format_exc(f"chip_process dev={device_id} slot={slot_index}", e)
+
+        if code == 0 and on_task_done_success is not None:
+            code, msg = on_task_done_success()
+        _write_error(buf, code, msg, frame_offset)
+        _mailbox_store_i32(slot_state_addr, _TASK_DONE)
+
     def run_task_loop(slot_index: int, slot_worker: ChipWorker) -> None:
         frame_offset = slot_index * MAILBOX_TASK_SLOT_SIZE
         slot_state_addr = state_addr if slot_index == 0 else mailbox_addr + frame_offset + _OFF_STATE
@@ -1488,51 +1522,29 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
             if _mailbox_load_i32(slot_state_addr) != _TASK_READY:
                 time.sleep(0.00005)
                 continue
-            code = 0
-            msg = ""
-            try:
-                _validate_task_protocol(buf, frame_offset)
-                digest = _read_task_digest(buf, frame_offset)
-                cid = identity_table.get(digest)
-                if cid is None:
-                    raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
-                if cid not in registered_callables:
-                    raise RuntimeError(
-                        f"chip_process dev={device_id}: cid {cid} not registered before TASK_READY "
-                        f"(register via _CTRL_PREPARE first)"
-                    )
-                blob_offset = frame_offset + _OFF_TASK_ARGS_BLOB
-                if host_buf_ranges:
-                    _rewrite_blob_host_addrs(buf, blob_offset, host_buf_ranges)
-                cfg = _read_config_from_mailbox(buf, frame_offset)
-                # Each slot has a dedicated DeviceRunner, so its private arena
-                # is bank 0. HostGraph's async thread does not inherit the
-                # caller's arena-bank TLS; selecting bank 1 here would split
-                # Host O and Device S across different arenas.
-                slot_worker._impl.run_from_blob(int(cid), mailbox_addr + blob_offset, _MAILBOX_ARGS_CAPACITY, cfg, 0)
-            except Exception as e:  # noqa: BLE001
-                code = 1
-                msg = _format_exc(f"chip_process dev={device_id} slot={slot_index}", e)
+            run_task(slot_index, slot_worker)
 
-            if code == 0 and on_task_done_success is not None:
-                code, msg = on_task_done_success()
-            _write_error(buf, code, msg, frame_offset)
-            _mailbox_store_i32(slot_state_addr, _TASK_DONE)
-
-    task_threads = [
-        threading.Thread(
-            target=run_task_loop,
-            args=(slot_index, slot_worker),
-            name=f"simpler-chip-run-{slot_index}",
-        )
-        for slot_index, slot_worker in enumerate(slot_workers)
-    ]
+    # Preserve the native runtime's thread affinity on every single-slot
+    # platform. Only the two-slot a2a3 HostGraph path needs background run
+    # threads so its control loop can admit another request concurrently.
+    task_threads = []
+    if len(slot_workers) > 1:
+        task_threads = [
+            threading.Thread(
+                target=run_task_loop,
+                args=(slot_index, slot_worker),
+                name=f"simpler-chip-run-{slot_index}",
+            )
+            for slot_index, slot_worker in enumerate(slot_workers)
+        ]
     for thread in task_threads:
         thread.start()
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
-            if state == _CONTROL_REQUEST:
+            if len(slot_workers) == 1 and state == _TASK_READY:
+                run_task(0, slot_workers[0])
+            elif state == _CONTROL_REQUEST:
                 sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
                 code = 0
                 msg = ""

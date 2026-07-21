@@ -1865,6 +1865,60 @@ class TestChipMainLoopDigestRegister:
         t.start()
         return t
 
+    def test_single_slot_runs_on_chip_main_thread(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        digest = b"\x05" * 32
+        cw = MagicMock()
+        run_threads = []
+        cw._impl.run_from_blob.side_effect = lambda *_args: run_threads.append(threading.get_ident())
+        shm, buf, state_addr = self._build_mailbox()
+        monitor_errors = []
+
+        def shutdown_after_done():
+            import time  # noqa: PLC0415
+
+            deadline = time.monotonic() + 2.0
+            try:
+                while _mailbox_load_i32(state_addr) != worker_mod._TASK_DONE:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("single-slot run did not publish TASK_DONE")
+                    time.sleep(0.001)
+            except BaseException as exc:  # noqa: BLE001
+                monitor_errors.append(exc)
+            finally:
+                _mailbox_store_i32(state_addr, worker_mod._SHUTDOWN)
+
+        try:
+            struct.pack_into("Q", buf, worker_mod.MAILBOX_OFF_PROTOCOL, worker_mod.MAILBOX_PROTOCOL_MAGIC_VERSION)
+            start = worker_mod._OFF_TASK_CALLABLE_HASH
+            buf[start : start + len(digest)] = digest
+            monitor = threading.Thread(target=shutdown_after_done)
+            monitor.start()
+            caller_thread = threading.get_ident()
+            _mailbox_store_i32(state_addr, worker_mod._TASK_READY)
+            worker_mod._run_chip_main_loop(
+                cw,
+                buf,
+                _mailbox_addr(shm),
+                state_addr,
+                0,
+                {0: object()},
+                {digest: 0},
+                {digest: 1},
+                chip_platform="a5",
+                prepared={0},
+                run_workers=[cw],
+            )
+            monitor.join(timeout=2.0)
+            assert not monitor.is_alive()
+            assert not monitor_errors
+            assert run_threads == [caller_thread]
+        finally:
+            buf.release()
+            shm.close()
+            shm.unlink()
+
     def test_register_uses_payload_size_and_allocates_local_slot(self):
         from unittest.mock import MagicMock  # noqa: PLC0415
 
