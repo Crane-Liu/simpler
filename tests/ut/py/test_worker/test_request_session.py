@@ -12,6 +12,7 @@ import time
 from typing import cast
 
 import pytest
+import simpler.worker as worker_mod
 from simpler.request_session import RequestCancelledError, RequestEmitter, RequestSession, RequestStream
 from simpler.worker import Worker
 
@@ -168,10 +169,22 @@ def test_session_runs_two_submitted_requests_concurrently() -> None:
         session.close()
 
 
+def test_worker_close_closes_active_request_session() -> None:
+    worker = Worker(level=3, device_ids=[])
+    worker.init()
+    session = worker.open_request_session(lambda *_args: None)
+
+    worker.close()
+
+    assert session._closed.is_set()
+    assert worker._request_session is None
+    assert all(not thread.is_alive() for thread in session._threads)
+
+
 def test_worker_groups_overlapping_run_calls_into_one_drain() -> None:
     worker = Worker(level=3, device_ids=[])
     orch = _ConcurrentOrchestrator()
-    worker._initialized = True
+    worker._lifecycle = worker_mod._Lifecycle.READY
     worker._worker = object()
     worker._orch = orch
     worker._start_hierarchical = lambda: None

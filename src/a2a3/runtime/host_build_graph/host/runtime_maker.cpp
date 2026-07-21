@@ -553,8 +553,9 @@ materialize_streaming_host_graph_range(PTO2Runtime *source, PTO2Runtime *target,
         target_slot.fanin_count = 1;  // publication gate
         target_slot.active_mask = source_slot.active_mask;
         target_slot.allow_early_resolve = false;
-        target_slot.ready_state.store(
-            task_state >= PTO2_TASK_COMPLETED ? PTO2_COMPLETION_DONE : PTO2_READY_UNCLAIMED, std::memory_order_relaxed
+        target_slot.lifecycle_flags.store(
+            task_state >= PTO2_TASK_COMPLETED ? PTO2_COMPLETION_DONE : PTO2_LIFECYCLE_FLAGS_NONE,
+            std::memory_order_relaxed
         );
         target_slot.total_required_subtasks = source_slot.total_required_subtasks;
         target_slot.logical_block_num = source_slot.logical_block_num;

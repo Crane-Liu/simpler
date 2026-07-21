@@ -5933,13 +5933,16 @@ class Worker:
 
     def open_request_session(self, orchestration, *, max_pending: int = 8, max_active_runs: int = 1):
         """Open a non-blocking request stream over this hierarchical Worker."""
-        if not self._initialized:
-            raise RuntimeError("Worker.open_request_session requires Worker.init()")
         if self.level < 3:
             raise RuntimeError("Worker.open_request_session requires a hierarchical Worker")
         from .request_session import RequestSession  # noqa: PLC0415
 
         with self._request_session_lock:
+            # Re-check under the session lock. Worker.close() publishes CLOSED
+            # before taking this lock, so a racing open is either observed and
+            # closed by that teardown or rejected here.
+            if not self._initialized:
+                raise RuntimeError("Worker.open_request_session requires Worker.init()")
             if self._request_session is not None:
                 raise RuntimeError("Worker already has an active RequestSession")
             session = RequestSession(
@@ -6132,6 +6135,14 @@ class Worker:
                     if teardown_tree:
                         self._teardown_attempted = True
             if teardown_tree:
+                # CLOSED already rejects new run leases. Closing the session now
+                # stops its idle dispatchers and cancels queued requests before
+                # their backing native tree is dismantled. An active dispatcher
+                # was covered by the lease drain above.
+                with self._request_session_lock:
+                    request_session = self._request_session
+                if request_session is not None:
+                    request_session.close()
                 self._teardown_ready_tree()
         except BaseException as exc:  # noqa: BLE001
             if result is None:
