@@ -69,17 +69,37 @@ def token_orch_windows(spans: list[dict]) -> dict[int, tuple[int, int]]:
 
 
 def token_schedule_windows(spans: list[dict], tokens: list[dict]) -> dict[int, tuple[int, int]]:
-    publish_ends = {
-        int(span["attrs"]["epoch"]): span["ts"] + span["dur"]
+    """Build device epoch windows from release and completion observations."""
+    release_times = {
+        int(span["attrs"]["target_epoch"]): span["ts"] + span["dur"]
         for span in spans
-        if span["name"].endswith("epoch.commit") and "epoch" in span["attrs"]
+        if span["name"].endswith("epoch.wait_device")
+        and span["attrs"].get("kind") == "release"
+        and "target_epoch" in span["attrs"]
+    }
+    completion_times = {
+        int(span["attrs"]["target_epoch"]): span["ts"] + span["dur"]
+        for span in spans
+        if span["name"].endswith("epoch.wait_device")
+        and span["attrs"].get("kind") == "exec-done"
+        and "target_epoch" in span["attrs"]
     }
     receive_times = {token["seq"]: token["ts"] for token in tokens}
-    return {
-        epoch: (publish_end, receive_times[epoch])
-        for epoch, publish_end in publish_ends.items()
-        if epoch in receive_times and receive_times[epoch] >= publish_end
-    }
+    final_epoch = max(receive_times, default=None)
+    windows = {}
+    for epoch, start in sorted(release_times.items()):
+        if epoch not in receive_times:
+            continue
+        if epoch in completion_times:
+            end = completion_times[epoch]
+        elif epoch == final_epoch:
+            end = receive_times[epoch]
+        else:
+            raise ValueError(f"non-final token {epoch} has no device exec-done observation")
+        if end < start:
+            raise ValueError(f"token {epoch} completed before its device release observation")
+        windows[epoch] = (start, end)
+    return windows
 
 
 def parse_log(log: Path) -> tuple[dict[int, list[dict]], list[dict], list[dict], list[int]]:
@@ -204,7 +224,10 @@ def build_summary(
             },
             "max_l3_to_user_ms": max(delivery_ms.values(), default=None),
         },
-        "schedule_window": "Host publish completion to L3 token receipt (inferred).",
+        "schedule_window": (
+            "Device-observed epoch release to exec-done; the final epoch ends at final L3 token receipt "
+            "because no later Host wait observes its exec-done boundary."
+        ),
     }
 
 
@@ -265,7 +288,7 @@ def main() -> int:
                     "name": "thread_name",
                     "pid": TRACE_PID,
                     "tid": schedule_tid,
-                    "args": {"name": f"Request {label} · S (Schedule)"},
+                    "args": {"name": f"Request {label} · S (device epoch)"},
                 },
                 {
                     "ph": "M",
