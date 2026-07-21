@@ -232,6 +232,11 @@ _STARTUP_POLL_INTERVAL_S = 0.001
 # to close gracefully (so it unlinks the nested mailbox shms only it knows the
 # names of) before being SIGKILLed. This bounds that graceful wait.
 _ROLLBACK_GRACEFUL_TIMEOUT_S = 10.0
+# Communicator teardown can legitimately remain inside the native HCCL
+# destroy barrier for up to 120 seconds. Give chip children a matching grace
+# window once a base communicator exists; ordinary child teardown keeps the
+# shorter rollback bound above.
+_COMM_REAP_GRACEFUL_TIMEOUT_S = 130.0
 # Bounded re-check interval for a close() joiner waiting on an in-flight
 # _CloseAttempt. A joiner normally wakes immediately on the completing thread's
 # notify_all(); the timeout is a backstop so that if that notify is skipped (an
@@ -6384,7 +6389,8 @@ class Worker:
             # teardown entry — so the (blocking) pre-child cleanup above cannot
             # eat it. Reap removes reclaimed pids/shms in place; a surviving child
             # is left in place and reported as an error (terminal, not retried).
-            reap_deadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
+            reap_timeout_s = _COMM_REAP_GRACEFUL_TIMEOUT_S if self._comm_base_ready else _ROLLBACK_GRACEFUL_TIMEOUT_S
+            reap_deadline = time.monotonic() + reap_timeout_s
             _step(lambda: self._reap_child_groups(groups, reap_deadline))
             _step(self._close_l3_l2_orch_comm)
             # Drop next-level worker refs only once their pids/shms are reclaimed.
