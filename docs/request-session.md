@@ -11,6 +11,53 @@ independently. Device launches remain ordered by each chip worker's mailbox, so
 a later run can prepare Host O through the admission lane while the earlier run
 executes Device S.
 
+## Accepted PR1379 Redesign
+
+The admission lane and split prepare/execute ABI above describe the current
+implementation. PR1379 will replace them with a bounded multi-flight mailbox.
+The accepted target has these invariants:
+
+- one resident child message thread owns mailbox state transitions;
+- two long-lived run threads execute complete HostGraph runs;
+- run thread 0 always uses arena bank 0, and run thread 1 uses bank 1;
+- each run thread owns its Runtime storage and mutable run context;
+- task completion is correlated by slot generation, so completion order may
+  differ from submission order;
+- control and shutdown operations are exclusive and wait for active task slots
+  to drain;
+- cancellation never interrupts active device work, but it suppresses output
+  and releases the slot after completion;
+- onboard HostGraph endpoints advertise two credits; TRB, simulation, SUB, and
+  remote endpoints initially remain single-credit.
+
+The target request path is:
+
+```text
+parent scheduler -> task slot 0 -> run thread 0 -> arena bank 0 -> completion
+                 -> task slot 1 -> run thread 1 -> arena bank 1 -> completion
+```
+
+The parent-side endpoint publishes a ready slot without waiting for Device S.
+A completion pump reports the matching scheduler completion only after the
+child marks that slot done. This is the non-blocking boundary; changing only
+`submit_next_level` would leave the current synchronous endpoint bottleneck in
+place.
+
+The redesign removes these cross-request mechanisms after the multi-flight
+path is validated:
+
+- `HostRequestAdmissionClient` and `_HostRequestAdmissionService`;
+- the prepared-request TaskArgs marker;
+- `prepare_from_request_blob` and `execute_prepared`;
+- the platform split prepare/execute C ABI;
+- the prepared-request map, bank wait state, and HostGraph prepare gate.
+
+HostApi thread context, scheduler completion latches, the HostGraph epoch/token
+pipeline, arena banks, and concurrent top-level `Worker.run` batching remain.
+The rollout first fixes session shutdown, then introduces the multi-slot
+protocol at one credit, enables two HostGraph credits after hardware
+validation, and finally removes the superseded admission path.
+
 ## API
 
 Open one session on an initialized L3-or-higher Worker:

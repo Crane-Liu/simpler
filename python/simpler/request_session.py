@@ -344,6 +344,8 @@ class RequestSession:
         self._next_request_id = 1
         self._live_work: dict[int, _RequestWork] = {}
         self._dispatcher_idents: set[int] = set()
+        self._close_lock = threading.Lock()
+        self._closed = threading.Event()
         self._threads = [
             threading.Thread(
                 target=self._dispatch_loop,
@@ -393,19 +395,27 @@ class RequestSession:
         return True
 
     def close(self) -> None:
-        should_stop = False
-        with self._state_lock:
-            if self._accepting:
+        with self._close_lock:
+            if self._closed.is_set():
+                return
+            with self._state_lock:
                 self._accepting = False
-                should_stop = True
-        if should_stop:
+                live_work = list(self._live_work.values())
+                for work in live_work:
+                    work.cancelled.set()
+
+            for work in live_work:
+                work.stream._finish(
+                    RequestCancelledError(f"request {work.request_id} was cancelled by session close")
+                )
             for _thread in self._threads:
                 self._requests.put(_STOP)
-        current_ident = threading.get_ident()
-        for thread in self._threads:
-            if thread.ident != current_ident:
-                thread.join()
-        self._worker._release_request_session(self)
+            current_ident = threading.get_ident()
+            for thread in self._threads:
+                if thread.ident != current_ident:
+                    thread.join()
+            self._worker._release_request_session(self)
+            self._closed.set()
 
     def _owns_current_thread(self) -> bool:
         with self._state_lock:

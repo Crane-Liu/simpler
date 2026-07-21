@@ -11,7 +11,8 @@ import threading
 import time
 from typing import cast
 
-from simpler.request_session import RequestEmitter, RequestSession, RequestStream
+import pytest
+from simpler.request_session import RequestCancelledError, RequestEmitter, RequestSession, RequestStream
 from simpler.worker import Worker
 
 
@@ -66,6 +67,14 @@ class _ConcurrentOrchestrator:
             self.drain_count += 1
 
 
+class _InlineWorker:
+    def run(self, task_orch, args=None, config=None) -> None:
+        task_orch(None, args, config)
+
+    def _release_request_session(self, _session) -> None:
+        pass
+
+
 def test_emit_waits_until_consumer_receives_token() -> None:
     stream = RequestStream(7, cast(RequestSession, _StreamSession()))
     emitter = RequestEmitter(stream)
@@ -83,6 +92,62 @@ def test_emit_waits_until_consumer_receives_token() -> None:
     assert producer_done.wait(1.0)
     stream._finish(None)
     thread.join()
+
+
+def test_close_cancels_unconsumed_stream_and_joins_dispatcher() -> None:
+    callback_entered = threading.Event()
+
+    def request_orch(_orch, _request, _request_id, emitter, _config) -> None:
+        callback_entered.set()
+        emitter.emit("unconsumed-token")
+
+    session = RequestSession(_InlineWorker(), request_orch)
+    session._start()
+    stream = session.submit(object(), request_id=11)
+    assert callback_entered.wait(1.0)
+
+    close_done = threading.Event()
+
+    def close() -> None:
+        session.close()
+        close_done.set()
+
+    closer = threading.Thread(target=close, daemon=True)
+    closer.start()
+    assert close_done.wait(1.0)
+    closer.join()
+
+    with pytest.raises(RequestCancelledError, match="cancelled by session close"):
+        stream.wait(timeout=0.1)
+    assert all(not thread.is_alive() for thread in session._threads)
+
+
+def test_cancel_unblocks_emit_and_allows_request_id_reuse() -> None:
+    callback_entered = threading.Event()
+
+    def request_orch(_orch, request, _request_id, emitter, _config) -> None:
+        if request == "blocking":
+            callback_entered.set()
+            emitter.emit("unconsumed-token")
+
+    session = RequestSession(_InlineWorker(), request_orch)
+    session._start()
+    try:
+        stream = session.submit("blocking", request_id=23)
+        assert callback_entered.wait(1.0)
+        assert stream.cancel()
+        with pytest.raises(RequestCancelledError, match="request 23 was cancelled"):
+            stream.wait(timeout=1.0)
+
+        deadline = time.monotonic() + 1.0
+        while 23 in session._live_work and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert 23 not in session._live_work
+
+        replacement = session.submit("complete", request_id=23)
+        replacement.wait(timeout=1.0)
+    finally:
+        session.close()
 
 
 def test_session_runs_two_submitted_requests_concurrently() -> None:
