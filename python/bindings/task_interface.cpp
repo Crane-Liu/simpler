@@ -1457,7 +1457,7 @@ NB_MODULE(_task_interface, m) {
         .def(
             "run_from_blob",
             [](ChipWorker &self, int32_t callable_id, uint64_t args_blob_ptr, size_t blob_capacity,
-               const CallConfig &config, unsigned arena_bank) {
+               const CallConfig &config, unsigned pipeline_slot, uint64_t accepted_state_addr) {
                 // The mailbox region is the on-wire format `write_blob` produced;
                 // `read_blob` is the matching reader that returns a zero-copy
                 // TaskArgsView into the caller-owned bytes. Forwards to the
@@ -1465,10 +1465,15 @@ NB_MODULE(_task_interface, m) {
                 // loops never re-implement the tensor/scalar layout in Python
                 // (where it has historically dropped fields like child_memory).
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
-                self.run(callable_id, view, config, arena_bank);
+                ChipStorageTaskArgs storage = view_to_chip_storage(view);
+                self.run(
+                    callable_id, &storage, config, pipeline_slot,
+                    reinterpret_cast<volatile int32_t *>(accepted_state_addr)
+                );
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
-            nb::arg("arena_bank") = 0, nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("pipeline_slot") = 0, nb::arg("accepted_state_addr") = 0,
+            nb::call_guard<nb::gil_scoped_release>(),
             "Launch a callable_id from a raw mailbox-blob pointer + capacity "
             "(used by chip-child mailbox loops to avoid Python-side re-deserialisation "
             "of the per-task tensor/scalar layout). The blob must be in the format "
@@ -1486,6 +1491,14 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
+        .def_prop_ro(
+            "pipeline_slot_count", &ChipWorker::pipeline_slot_count,
+            "Pipeline depth declared by the bound runtime's resource contract."
+        )
+        .def_prop_ro(
+            "arena_bank_count", &ChipWorker::arena_bank_count,
+            "Number of independently filled arena banks declared by the bound runtime."
+        )
         .def_prop_ro(
             "aicpu_dlopen_count", &ChipWorker::aicpu_dlopen_count,
             "Number of distinct callable entries the AICPU has dlopened for on the "

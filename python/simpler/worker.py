@@ -204,6 +204,7 @@ _OFF_CONTROL_CALLABLE_HASH = _OFF_ARGS + 32
 _IDLE = 0
 _TASK_READY = 1
 _TASK_DONE = 2
+_TASK_ACCEPTED = 8
 _SHUTDOWN = 3
 _CONTROL_REQUEST = 4
 _CONTROL_DONE = 5
@@ -1457,6 +1458,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     on_task_done_success=None,
     prepared: set[int] | None = None,
     run_workers=None,
+    pipeline_slots: int = 1,
 ) -> None:
     """Unified TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
 
@@ -1481,9 +1483,12 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     # rebuilt from the table on every map/unmap.
     host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}  # token -> (shm, lo, hi, child_base)
     host_buf_ranges: list[tuple[int, int, int]] = []  # (parent_lo, parent_hi, child_base)
-    slot_workers = list(run_workers) if run_workers is not None else [cw]
-    if not slot_workers or slot_workers[0] is not cw:
+    control_workers = list(run_workers) if run_workers is not None else [cw]
+    if not control_workers or control_workers[0] is not cw:
         raise RuntimeError("chip run worker 0 must be the control ChipWorker")
+    if pipeline_slots not in (1, 2):
+        raise RuntimeError(f"chip pipeline_slots must be 1 or 2, got {pipeline_slots}")
+    slot_workers = [cw] * pipeline_slots
     stop_run_workers = threading.Event()
 
     def run_task(slot_index: int, slot_worker: ChipWorker) -> None:
@@ -1506,11 +1511,13 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
             if host_buf_ranges:
                 _rewrite_blob_host_addrs(buf, blob_offset, host_buf_ranges)
             cfg = _read_config_from_mailbox(buf, frame_offset)
-            # Each slot has a dedicated DeviceRunner, so its private arena
-            # is bank 0. HostGraph's async thread does not inherit the
-            # caller's arena-bank TLS; selecting bank 1 here would split
-            # Host O and Device S across different arenas.
-            slot_worker._impl.run_from_blob(int(cid), mailbox_addr + blob_offset, _MAILBOX_ARGS_CAPACITY, cfg, 0)
+            # The shared ChipWorker owns one DeviceRunner and two Runtime
+            # buffers. The slot index selects the matching Runtime/image bank;
+            # arena selection is thread-local, so Host O and Device S for this
+            # request stay on the same bank.
+            slot_worker._impl.run_from_blob(
+                int(cid), mailbox_addr + blob_offset, _MAILBOX_ARGS_CAPACITY, cfg, slot_index, slot_state_addr
+            )
         except Exception as e:  # noqa: BLE001
             code = 1
             msg = _format_exc(f"chip_process dev={device_id} slot={slot_index}", e)
@@ -1578,7 +1585,9 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                             raise RuntimeError(
                                 f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
                             )
-                        _ensure_registered(slot_workers, registry, registered_callables, int(cid), device_id=device_id)
+                        _ensure_registered(
+                            control_workers, registry, registered_callables, int(cid), device_id=device_id
+                        )
                     elif sub_cmd == _CTRL_REGISTER:
                         digest = _read_control_digest(buf)
                         payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
@@ -1610,7 +1619,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                                 # registered state for the reusable private slot.
                                 if int(cid) in registered_callables:
                                     try:
-                                        for slot_worker in slot_workers:
+                                        for slot_worker in control_workers:
                                             slot_worker._unregister_slot(int(cid))
                                     except Exception:  # noqa: BLE001
                                         pass
@@ -1620,7 +1629,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                                     addr = ctypes.addressof(exported)
                                     registered_workers = []
                                     try:
-                                        for slot_worker in slot_workers:
+                                        for slot_worker in control_workers:
                                             slot_worker._impl.register_callable_from_blob(int(cid), addr)
                                             registered_workers.append(slot_worker)
                                     except Exception:
@@ -1643,7 +1652,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         digest = _read_control_digest(buf)
                         cid, removed = _remove_local_identity(registry, identity_table, identity_refs, digest)
                         if removed and cid is not None:
-                            for slot_worker in slot_workers:
+                            for slot_worker in control_workers:
                                 slot_worker._unregister_slot(int(cid))
                             registered_callables.discard(int(cid))
                     elif sub_cmd == _CTRL_ALLOC_DOMAIN:
@@ -1741,17 +1750,6 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             enable_sdma=enable_sdma,
         )
         run_workers.append(cw)
-        if platform == "a2a3" and runtime == "host_build_graph":
-            secondary = ChipWorker()
-            run_workers.append(secondary)
-            secondary.init(
-                device_id,
-                bins,
-                log_level=log_level,
-                log_info_v=log_info_v,
-                prewarm_config=prewarm_config,
-                enable_sdma=enable_sdma,
-            )
     except Exception as e:
         _tb.print_exc()
         # Publish the cause into the mailbox and flag INIT_FAILED so the
@@ -1784,6 +1782,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
     state_addr = mailbox_addr + _OFF_STATE
+    # Publish the runtime's resource-contract depth before INIT_READY. The
+    # parent reads this immutable bootstrap field when assigning endpoint
+    # credits, so admission is contract-driven rather than runtime-name based.
+    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, cw.pipeline_slot_count)
     # Signal init success. The parent's readiness barrier waits for every chip
     # child to reach _INIT_READY before dispatching the first task, so the
     # per-rank host-side stream sync budget only covers actual op execution
@@ -1806,6 +1808,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             chip_runtime=runtime,
             prepared=prepared,
             run_workers=run_workers,
+            pipeline_slots=cw.pipeline_slot_count,
         )
     finally:
         for worker in reversed(run_workers):
@@ -4429,10 +4432,11 @@ class Worker:
 
         # Register chip workers as NEXT_LEVEL (L3)
         if device_ids:
-            max_in_flight = (
-                2 if self._config["platform"] == "a2a3" and self._config["runtime"] == "host_build_graph" else 1
-            )
             for shm in self._chip_shms:
+                assert shm.buf is not None
+                max_in_flight = int(struct.unpack_from("Q", shm.buf, _CTRL_OFF_RESULT)[0])
+                if max_in_flight not in (1, 2):
+                    raise RuntimeError(f"chip child published invalid pipeline slot count {max_in_flight}")
                 dw.add_next_level_worker(_mailbox_addr(shm), max_in_flight=max_in_flight)
 
         # Register Worker children as NEXT_LEVEL (L4+)

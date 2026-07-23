@@ -378,7 +378,9 @@ WorkerCompletion LocalMailboxEndpoint::run_task_slot(Ring *ring, const WorkerDis
     // Signal child process.
     write_mailbox_state(frame, MailboxState::TASK_READY);
 
-    // Spin-poll until child signals TASK_DONE.
+    // TASK_ACCEPTED is the post-KernelLaunch flight ACK. This endpoint keeps
+    // ownership of the slot until TASK_DONE so generation/error validation and
+    // Gate-A bank reuse remain completion-driven.
     while (read_mailbox_state(frame) != MailboxState::TASK_DONE) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }

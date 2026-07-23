@@ -680,6 +680,24 @@ int select_arena_bank_ctx(DeviceContextHandle ctx, unsigned arena_bank) {
     }
 }
 
+int select_pipeline_slot_ctx(DeviceContextHandle ctx, unsigned pipeline_slot) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->select_pipeline_slot(pipeline_slot);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int set_task_accepted_state_ctx(DeviceContextHandle ctx, volatile int32_t *state, int32_t accepted_value) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->set_task_accepted_state(state, accepted_value);
+    } catch (...) {
+        return -1;
+    }
+}
+
 int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     if (ctx == NULL) return -1;
     try {

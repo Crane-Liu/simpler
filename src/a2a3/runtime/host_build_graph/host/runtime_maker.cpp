@@ -46,11 +46,13 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "../common/pto_runtime_status.h"
@@ -62,6 +64,7 @@
 #include "../runtime/runtime.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
+#include "../../../../common/worker/pto_runtime_c_api.h"
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/strace.h"
@@ -69,6 +72,23 @@
 #include "host/raii_scope_guard.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
+
+extern "C" const PipelineContract *get_pipeline_contract(void) {
+    static const PipelineContract contract = {
+        PTO_PIPELINE_CONTRACT_ABI_VERSION,
+        5,
+        2,
+        2,
+        {
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_FILL_MEM, 0},
+            {PTO_PIPELINE_GM_SM, PTO_PIPELINE_FILL_MEM, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_FILL_MEM, 0},
+            {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+            {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+        },
+    };
+    return &contract;
+}
 
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
 // carries RUNTIME_ENV_RING_COUNT slots, shared with tensormap_and_ringbuffer.
@@ -882,6 +902,19 @@ int32_t run_host_orchestration(
     return total_tasks;
 }
 
+std::shared_ptr<std::mutex> stage1_gate_for_runner(void *runner_context) {
+    static std::mutex registry_mutex;
+    static std::unordered_map<void *, std::weak_ptr<std::mutex>> gates;
+
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    auto gate = gates[runner_context].lock();
+    if (gate == nullptr) {
+        gate = std::make_shared<std::mutex>();
+        gates[runner_context] = gate;
+    }
+    return gate;
+}
+
 class HostGraphAsyncJob {
 public:
     ~HostGraphAsyncJob() { (void)join(); }
@@ -962,6 +995,7 @@ public:
             LOG_ERROR("host-orch: failed to capture the runner thread context");
             return false;
         }
+        stage1_gate_ = stage1_gate_for_runner(thread_context_);
 
         try {
             worker_ = std::thread([this]() {
@@ -985,6 +1019,11 @@ public:
                     api_->unbind_thread_context();
                     return;
                 }
+                // Host orchestration uses one control flow per runner. A later
+                // request may prepare while the prior request executes on the
+                // device, but two Host Stage1 sections must never mutate the
+                // orchestration runtime at the same time.
+                std::unique_lock<std::mutex> stage1_lock(*stage1_gate_);
                 try {
                     run();
                 } catch (const std::exception &e) {
@@ -1409,6 +1448,7 @@ private:
     Runtime *runtime_{nullptr};
     const HostApi *api_{nullptr};
     void *thread_context_{nullptr};
+    std::shared_ptr<std::mutex> stage1_gate_;
     PTO2RuntimeArenaLayout layout_{};
     DeviceArena target_arena_;
     PTO2Runtime *target_rt_{nullptr};
@@ -1465,6 +1505,14 @@ static int join_async_host_graph_pipeline(Runtime *runtime) {
 }
 
 }  // namespace
+
+extern "C" int open_async_host_graph_pipeline(Runtime *runtime) {
+    if (runtime == nullptr) return -1;
+    auto *job = static_cast<HostGraphAsyncJob *>(runtime->take_host_orch_job());
+    if (job == nullptr) return 0;
+    runtime->set_host_orch_job(job);
+    return job->open_run_gate() ? 0 : -1;
+}
 
 extern "C" int release_async_host_graph_pipeline(Runtime *runtime) {
     if (runtime == nullptr) return -1;

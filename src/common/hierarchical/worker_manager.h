@@ -18,7 +18,8 @@
  *
  * Each WorkerThread encodes `(callable digest, config, args_blob)` into a
  * pre-forked child's shared-memory mailbox, signals TASK_READY, and
- * spin-polls TASK_DONE. The child process loop (Python) reads the
+ * observes TASK_ACCEPTED after native KernelLaunch, then spin-polls TASK_DONE.
+ * The child process loop (Python) reads the
  * digest, resolves it to a child-local slot, and runs that slot on its
  * `ChipWorker` (NEXT_LEVEL) or registered Python callable (SUB) in its
  * own address space.
@@ -74,6 +75,9 @@ enum class MailboxState : int32_t {
     // PLATFORM_STREAM_SYNC_TIMEOUT_MS budget (issue #897).
     INIT_READY = 6,
     INIT_FAILED = 7,
+    // Native a2a3 publishes this only after both AICore and AICPU launches
+    // succeed. Completion and mailbox reuse still require TASK_DONE.
+    TASK_ACCEPTED = 8,
 };
 
 // Sized so the args region can hold any TaskArgs the runtime itself accepts

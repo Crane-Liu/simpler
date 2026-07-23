@@ -64,6 +64,10 @@ extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
 
 namespace {
 
+thread_local unsigned g_pipeline_slot = 0;
+thread_local volatile int32_t *g_task_accepted_state = nullptr;
+thread_local int32_t g_task_accepted_value = 0;
+
 HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     RuntimeTimeoutConfig order_defaults{
         PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
@@ -165,6 +169,27 @@ int DeviceRunnerBase::select_arena_bank(unsigned bank) {
     return 0;
 }
 
+int DeviceRunnerBase::select_pipeline_slot(unsigned slot) {
+    if (slot > 1) {
+        LOG_ERROR("pipeline slot %u is outside [0, 2)", slot);
+        return -1;
+    }
+    g_pipeline_slot = slot;
+    return 0;
+}
+
+int DeviceRunnerBase::set_task_accepted_state(volatile int32_t *state, int32_t accepted_value) {
+    g_task_accepted_state = state;
+    g_task_accepted_value = accepted_value;
+    return 0;
+}
+
+void DeviceRunnerBase::publish_task_accepted() {
+    if (g_task_accepted_state != nullptr) {
+        __atomic_store_n(g_task_accepted_state, g_task_accepted_value, __ATOMIC_RELEASE);
+    }
+}
+
 void *DeviceRunnerBase::allocate_tensor(std::size_t bytes) { return mem_alloc_.alloc(bytes); }
 
 void DeviceRunnerBase::free_tensor(void *dev_ptr) {
@@ -186,20 +211,22 @@ int DeviceRunnerBase::device_memset(void *dev_ptr, int value, std::size_t bytes)
 }
 
 void DeviceRunnerBase::get_retained_temp_buffer(void **addr, size_t *size) {
-    if (addr != nullptr) *addr = retained_temp_addr_;
-    if (size != nullptr) *size = retained_temp_size_;
+    if (addr != nullptr) *addr = retained_temp_addrs_[g_pipeline_slot];
+    if (size != nullptr) *size = retained_temp_sizes_[g_pipeline_slot];
 }
 
 void DeviceRunnerBase::set_retained_temp_buffer(void *addr, size_t size) {
-    retained_temp_addr_ = addr;
-    retained_temp_size_ = size;
+    retained_temp_addrs_[g_pipeline_slot] = addr;
+    retained_temp_sizes_[g_pipeline_slot] = size;
 }
 
 void DeviceRunnerBase::clear_temporary_buffer() {
-    if (retained_temp_addr_ != nullptr) {
-        mem_alloc_.free(retained_temp_addr_);
-        retained_temp_addr_ = nullptr;
-        retained_temp_size_ = 0;
+    for (size_t slot = 0; slot < retained_temp_addrs_.size(); ++slot) {
+        if (retained_temp_addrs_[slot] != nullptr) {
+            mem_alloc_.free(retained_temp_addrs_[slot]);
+            retained_temp_addrs_[slot] = nullptr;
+            retained_temp_sizes_[slot] = 0;
+        }
     }
 }
 
@@ -417,34 +444,30 @@ int DeviceRunnerBase::ensure_device_initialized() {
         return rc;
     }
 
-    bool aicpu_created_here = false;
-    bool aicore_created_here = false;
-    if (stream_aicpu_ == nullptr) {
-        rc = rtStreamCreate(&stream_aicpu_, 0);
-        if (rc != 0) {
-            LOG_ERROR("rtStreamCreate (AICPU) failed: %d", rc);
-            ACL_LOG_ERROR_DETAIL(rc);
-            return rc;
+    std::vector<rtStream_t *> created_here;
+    auto ensure_stream = [&](rtStream_t *stream, const char *name) -> int {
+        if (*stream != nullptr) return 0;
+        int create_rc = rtStreamCreate(stream, 0);
+        if (create_rc != 0) {
+            LOG_ERROR("rtStreamCreate (%s) failed: %d", name, create_rc);
+            ACL_LOG_ERROR_DETAIL(create_rc);
+            return create_rc;
         }
-        aicpu_created_here = true;
-    }
-    if (stream_aicore_ == nullptr) {
-        rc = rtStreamCreate(&stream_aicore_, 0);
-        if (rc != 0) {
-            LOG_ERROR("rtStreamCreate (AICore) failed: %d", rc);
-            ACL_LOG_ERROR_DETAIL(rc);
-            // Roll back only the AICPU stream we just created, not a
-            // pre-existing persistent one.
-            if (aicpu_created_here) {
-                rtStreamDestroy(stream_aicpu_);
-                stream_aicpu_ = nullptr;
-            }
-            return rc;
+        created_here.push_back(stream);
+        return 0;
+    };
+    if ((rc = ensure_stream(&stream_aicpu_, "AICPU slot 0")) != 0 ||
+        (rc = ensure_stream(&stream_aicore_, "AICore slot 0")) != 0 ||
+        (rc = ensure_stream(&stream_aicpu_bank1_, "AICPU slot 1")) != 0 ||
+        (rc = ensure_stream(&stream_aicore_bank1_, "AICore slot 1")) != 0) {
+        for (auto it = created_here.rbegin(); it != created_here.rend(); ++it) {
+            rtStreamDestroy(**it);
+            **it = nullptr;
         }
-        aicore_created_here = true;
+        return rc;
     }
-    if (aicpu_created_here || aicore_created_here) {
-        LOG_INFO_V0("DeviceRunner: device=%d set, streams created", device_id_);
+    if (!created_here.empty()) {
+        LOG_INFO_V0("DeviceRunner: device=%d set, two stream sets created", device_id_);
     }
 
     rc = ensure_binaries_loaded();
@@ -1078,6 +1101,14 @@ int DeviceRunnerBase::finalize_common() {
         capture(rtStreamDestroy(stream_aicore_));
         stream_aicore_ = nullptr;
     }
+    if (stream_aicpu_bank1_ != nullptr) {
+        capture(rtStreamDestroy(stream_aicpu_bank1_));
+        stream_aicpu_bank1_ = nullptr;
+    }
+    if (stream_aicore_bank1_ != nullptr) {
+        capture(rtStreamDestroy(stream_aicore_bank1_));
+        stream_aicore_bank1_ = nullptr;
+    }
 
     // Release the async-DMA provider (SDMA STARS streams + workspace) while RTS
     // is live, before the subclass device reset. Null unless the Worker was
@@ -1274,14 +1305,14 @@ int DeviceRunnerBase::resolve_block_dim(int requested_block_dim) {
     // auto branch skips validate so we don't pay the ACL syscalls twice.
     int resolved = requested_block_dim;
     if (resolved == 0) {
-        resolved = query_max_block_dim(stream_aicore_);
+        resolved = query_max_block_dim(run_stream_aicore());
         LOG_INFO_V0("block_dim auto-resolved to %d", resolved);
         if (resolved < 1) {
             LOG_ERROR("block_dim auto-resolved to invalid value %d", resolved);
             return -1;
         }
     } else {
-        int rc = validate_block_dim(stream_aicore_, resolved);
+        int rc = validate_block_dim(run_stream_aicore(), resolved);
         if (rc != 0) {
             return -1;
         }
@@ -1329,8 +1360,10 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
 }
 
 int DeviceRunnerBase::sync_run_streams() {
-    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
-    int rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, timeout_config_.stream_sync_timeout_ms);
+    rtStream_t aicpu_stream = run_stream_aicpu();
+    rtStream_t aicore_stream = run_stream_aicore();
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout AICPU pipeline slot %u ===", g_pipeline_slot);
+    int rc = aclrtSynchronizeStreamWithTimeout(aicpu_stream, timeout_config_.stream_sync_timeout_ms);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
@@ -1345,8 +1378,8 @@ int DeviceRunnerBase::sync_run_streams() {
         return rc;
     }
 
-    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, timeout_config_.stream_sync_timeout_ms);
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout AICore pipeline slot %u ===", g_pipeline_slot);
+    rc = aclrtSynchronizeStreamWithTimeout(aicore_stream, timeout_config_.stream_sync_timeout_ms);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
@@ -1361,6 +1394,14 @@ int DeviceRunnerBase::sync_run_streams() {
         return rc;
     }
     return 0;
+}
+
+rtStream_t DeviceRunnerBase::run_stream_aicpu() const {
+    return g_pipeline_slot == 0 ? stream_aicpu_ : stream_aicpu_bank1_;
+}
+
+rtStream_t DeviceRunnerBase::run_stream_aicore() const {
+    return g_pipeline_slot == 0 ? stream_aicore_ : stream_aicore_bank1_;
 }
 
 void DeviceRunnerBase::read_device_wall_ns() {

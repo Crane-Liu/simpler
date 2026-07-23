@@ -314,6 +314,28 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
     }
 }
 
+int select_pipeline_slot_ctx(DeviceContextHandle ctx, unsigned pipeline_slot) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->select_pipeline_slot(pipeline_slot);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int select_arena_bank_ctx(DeviceContextHandle ctx, unsigned arena_bank) {
+    if (ctx == NULL || arena_bank > 1) return -1;
+    return 0;
+}
+
+int set_task_accepted_state_ctx(DeviceContextHandle ctx, volatile int32_t *state, int32_t accepted_value) {
+    // Sim has no asynchronous KernelLaunch boundary. Keep the ABI uniform;
+    // TASK_DONE remains its completion signal.
+    (void)state;
+    (void)accepted_value;
+    return ctx == NULL ? -1 : 0;
+}
+
 int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return -1;
     try {

@@ -60,6 +60,42 @@ enum {
     PTO_RUNTIME_ERR_UNSUPPORTED = -2,
 };
 
+enum {
+    PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
+    PTO_PIPELINE_MAX_RESOURCES = 8,
+    PTO_PIPELINE_MAX_SLOTS = 2,
+};
+
+typedef enum PipelineResourceClass {
+    PTO_PIPELINE_FILL_MEM = 0,
+    PTO_PIPELINE_REUSE_MEM = 1,
+    PTO_PIPELINE_EXEC_HANDLE = 2,
+} PipelineResourceClass;
+
+typedef enum PipelineResourceKind {
+    PTO_PIPELINE_GM_HEAP = 0,
+    PTO_PIPELINE_GM_SM = 1,
+    PTO_PIPELINE_RUNTIME_IMAGE = 2,
+    PTO_PIPELINE_TASK_ARGS = 3,
+    PTO_PIPELINE_AICPU_STREAM = 4,
+    PTO_PIPELINE_AICORE_STREAM = 5,
+} PipelineResourceKind;
+
+typedef struct PipelineResource {
+    uint32_t kind;
+    uint32_t resource_class;
+    size_t bytes_per_slot;
+} PipelineResource;
+
+/** Runtime-owned declaration of resources crossing KernelLaunch. */
+typedef struct PipelineContract {
+    uint32_t abi_version;
+    uint32_t resource_count;
+    uint32_t pipeline_slots;
+    uint32_t arena_banks;
+    PipelineResource resources[PTO_PIPELINE_MAX_RESOURCES];
+} PipelineContract;
+
 /* Per-stage run timing is no longer returned. The platform emits it as
  * `[STRACE]` log markers (host stages + the AICPU device-phase breakdown,
  * gated on SIMPLER_HOST_STRACE) — parse with simpler_setup.tools.strace_timing.
@@ -68,6 +104,9 @@ enum {
 /* ===========================================================================
  * Public API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
+
+/** Return this runtime's immutable pipeline resource declaration. Optional. */
+const PipelineContract *get_pipeline_contract(void);
 
 /**
  * Create a new device context (heap-allocated DeviceRunner).
@@ -208,7 +247,12 @@ int simpler_run(
 /** Select the arena bank used by subsequent calls on the current thread. */
 int select_arena_bank_ctx(DeviceContextHandle ctx, unsigned arena_bank);
 
-/** Bind one request and start its Host work without launching Device S. */
+/** Select the per-thread pipeline slot independently from arena banking. */
+int select_pipeline_slot_ctx(DeviceContextHandle ctx, unsigned pipeline_slot);
+
+/** Register the mailbox state word that receives the post-KernelLaunch ACK. */
+int set_task_accepted_state_ctx(DeviceContextHandle ctx, volatile int32_t *state, int32_t accepted_value);
+
 /**
  * Drop the prepared state for `callable_id` and release the per-id share of
  * the device orch SO buffer. The buffer itself is freed only when its

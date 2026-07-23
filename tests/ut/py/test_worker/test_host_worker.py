@@ -123,19 +123,23 @@ def _chip_payload_shm(callable_obj: ChipCallable) -> SharedMemory:
     return shm
 
 
-@pytest.mark.parametrize(("runtime", "expected_workers"), [("tensormap_and_ringbuffer", 1), ("host_build_graph", 2)])
-def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch, runtime, expected_workers):
+@pytest.mark.parametrize(("runtime", "expected_slots"), [("tensormap_and_ringbuffer", 2), ("host_build_graph", 2)])
+def test_chip_process_loop_inits_one_worker_with_runtime_slots(monkeypatch, runtime, expected_slots):
     events: list[tuple] = []
 
     class FakeChipWorker:
+        pipeline_slot_count = expected_slots
+
         def init(self, device_id, bins, *, log_level, log_info_v, prewarm_config=None, enable_sdma=False):
             events.append(("init", device_id, bins, log_level, log_info_v, prewarm_config, enable_sdma))
 
         def finalize(self) -> None:
             events.append(("finalize",))
 
-    def fake_run_chip_main_loop(cw, *_args, chip_platform, chip_runtime, prepared=None, run_workers=None):
-        events.append(("main_loop", cw, chip_platform, chip_runtime, len(run_workers or [cw])))
+    def fake_run_chip_main_loop(
+        cw, *_args, chip_platform, chip_runtime, prepared=None, run_workers=None, pipeline_slots=1
+    ):
+        events.append(("main_loop", cw, chip_platform, chip_runtime, len(run_workers or [cw]), pipeline_slots))
 
     monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
     monkeypatch.setattr(worker_mod, "_run_chip_main_loop", fake_run_chip_main_loop)
@@ -157,11 +161,11 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch, runtime, expect
         shm.close()
         shm.unlink()
 
-    assert [event[0] for event in events].count("init") == expected_workers
-    main_loop_index = expected_workers
+    assert [event[0] for event in events].count("init") == 1
+    main_loop_index = 1
     assert events[main_loop_index][0] == "main_loop"
-    assert events[main_loop_index][2:] == ("a2a3", runtime, expected_workers)
-    assert events[main_loop_index + 1 :] == [("finalize",)] * expected_workers
+    assert events[main_loop_index][2:] == ("a2a3", runtime, 1, expected_slots)
+    assert events[main_loop_index + 1 :] == [("finalize",)]
 
 
 def _chip_digest(callable_obj: ChipCallable, *, platform: str = "", runtime: str = "") -> bytes:

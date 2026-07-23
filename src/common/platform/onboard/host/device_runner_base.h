@@ -38,6 +38,7 @@
 
 #include <runtime/rt.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -136,6 +137,13 @@ public:
 
     /** Select the pooled-arena bank used by HostApi calls on this thread. */
     int select_arena_bank(unsigned bank);
+
+    /** Select this caller thread's per-run pipeline resource slot. */
+    int select_pipeline_slot(unsigned slot);
+
+    /** Bind and publish the mailbox ACK associated with this caller thread. */
+    int set_task_accepted_state(volatile int32_t *state, int32_t accepted_value);
+    void publish_task_accepted();
 
     /**
      * Return the pooled GM heap / PTO2 SM / runtime arena base pointer.
@@ -679,6 +687,9 @@ protected:
      */
     int sync_run_streams();
 
+    rtStream_t run_stream_aicpu() const;
+    rtStream_t run_stream_aicore() const;
+
     /**
      * Pull the device wall (ns) back from `device_wall_dev_ptr_` and
      * cache it on `device_wall_ns_`. D2H copy failure is a soft warn —
@@ -873,11 +884,10 @@ protected:
     host::LoadAicpuOp load_aicpu_op_;
 
     MemoryAllocator mem_alloc_;
-    // Retained temporary buffer slot for TRB device-arg staging (see HostApi
-    // get/set_retained_temp_buffer). Just a remembered {addr, size} reused
-    // across runs and freed in finalize; the grow/pack logic lives in trb bind.
-    void *retained_temp_addr_ = nullptr;
-    std::size_t retained_temp_size_ = 0;
+    // Two retained TaskArg staging buffers. TMR selects one by pipeline slot;
+    // its large arena remains independently single-banked REUSE_MEM.
+    std::array<void *, 2> retained_temp_addrs_{{nullptr, nullptr}};
+    std::array<std::size_t, 2> retained_temp_sizes_{{0, 0}};
     DeviceArena gm_heap_arena_;
     DeviceArena gm_sm_arena_;
     DeviceArena runtime_arena_pool_;
@@ -909,6 +919,8 @@ protected:
     // `finalize()`. `nullptr` before init.
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
+    rtStream_t stream_aicpu_bank1_{nullptr};
+    rtStream_t stream_aicore_bank1_{nullptr};
     KernelArgsHelper kernel_args_;
 
     // Platform-level device phase buffer: device-resident

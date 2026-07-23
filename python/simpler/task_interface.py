@@ -1037,6 +1037,16 @@ class ChipWorker:
                 self._identity_registry.clear()
                 self._live_handles.clear()
 
+    @property
+    def pipeline_slot_count(self) -> int:
+        """Pipeline depth declared by the initialized runtime."""
+        return int(self._impl.pipeline_slot_count)
+
+    @property
+    def arena_bank_count(self) -> int:
+        """Number of independently filled runtime arena banks."""
+        return int(self._impl.arena_bank_count)
+
     def _allocate_slot_locked(self) -> int:
         for slot_id in range(MAX_REGISTERED_CALLABLE_IDS):
             if slot_id not in self._callable_registry:
