@@ -510,7 +510,7 @@ materialize_streaming_host_graph_range(PTO2Runtime *source, PTO2Runtime *target,
     PTO2SharedMemoryRingHeader &target_ring = target->orchestrator.sm_header->ring;
     int32_t source_total = source_ring.fc.current_task_index.load(std::memory_order_acquire);
     if (range->task_begin < 0 || range->task_end <= range->task_begin || range->task_end > source_total ||
-        static_cast<uint64_t>(range->task_end - range->task_begin) >= target_ring.task_window_size ||
+        static_cast<uint64_t>(range->task_end) >= target_ring.task_window_size ||
         target->orchestrator.ring.task_allocator.task_head() != range->task_begin) {
         LOG_ERROR(
             "host-orch: invalid streaming range [%d,%d), source_total=%d target_head=%d window=%" PRIu64,
@@ -520,8 +520,6 @@ materialize_streaming_host_graph_range(PTO2Runtime *source, PTO2Runtime *target,
         return false;
     }
 
-    PTO2DepListPool &target_dep_pool = target->scheduler.ring_sched_state.dep_pool;
-    range->dep_begin = target_dep_pool.top;
     range->inline_completed = 0;
 
     for (int32_t task_id = range->task_begin; task_id < range->task_end; ++task_id) {
@@ -542,104 +540,39 @@ materialize_streaming_host_graph_range(PTO2Runtime *source, PTO2Runtime *target,
         std::memcpy(&target_task, source_slot.task, sizeof(target_task));
         std::memcpy(&target_payload, source_slot.payload, sizeof(target_payload));
 
-        int32_t fanin_count = target_payload.fanin_actual_count;
-        if (fanin_count > PTO2_FANIN_INLINE_CAP) {
+        if (target_payload.fanin_count < 0 || target_payload.fanin_count > PTO2_MAX_FANIN) {
             LOG_ERROR(
-                "host-orch: streaming task %d has fanin %d > inline cap %d", task_id, fanin_count, PTO2_FANIN_INLINE_CAP
+                "host-orch: streaming task %d has invalid fanin count %d", task_id, target_payload.fanin_count
             );
             return false;
         }
-        for (int32_t i = 0; i < fanin_count; ++i) {
-            PTO2TaskSlotState *source_producer = target_payload.fanin_inline_slot_states[i];
-            if (source_producer == nullptr || source_producer->task == nullptr) {
-                LOG_ERROR("host-orch: task %d has an invalid fanin producer", task_id);
-                return false;
-            }
-            int32_t producer_id = static_cast<int32_t>(source_producer->task->task_id.local());
+        for (int32_t i = 0; i < target_payload.fanin_count; ++i) {
+            int32_t producer_id = target_payload.fanin_local_ids[i];
             if (producer_id < 0 || producer_id >= task_id) {
                 LOG_ERROR("host-orch: task %d has invalid producer id %d", task_id, producer_id);
                 return false;
             }
-            target_payload.fanin_inline_slot_states[i] = &target_ring.get_slot_state_by_task_id(producer_id);
         }
-        target_payload.fanin_spill_pool = &target->orchestrator.ring.fanin_pool;
         target_payload.dispatch_fanin.store(0, std::memory_order_relaxed);
 
         PTO2TaskState task_state = source_slot.task_state.load(std::memory_order_acquire);
         target_slot.reset_for_reuse();
         target_slot.bind_buffers(&target_payload, &target_task);
+        target_slot.last_consumer_local_id = source_slot.last_consumer_local_id;
         target_slot.task_state.store(task_state, std::memory_order_relaxed);
-        target_slot.fanin_refcount.store(0, std::memory_order_relaxed);
-        target_slot.fanin_count = 1;  // publication gate
         target_slot.active_mask = source_slot.active_mask;
         target_slot.allow_early_resolve = false;
-        target_slot.lifecycle_flags.store(
-            task_state >= PTO2_TASK_COMPLETED ? PTO2_COMPLETION_DONE : PTO2_LIFECYCLE_FLAGS_NONE,
-            std::memory_order_relaxed
-        );
         target_slot.total_required_subtasks = source_slot.total_required_subtasks;
         target_slot.logical_block_num = source_slot.logical_block_num;
-        if (task_state >= PTO2_TASK_COMPLETED) range->inline_completed++;
-    }
-
-    // Rebuild only same-epoch fanout. Cross-epoch ordering is represented by
-    // the completion-before-commit protocol, so an already executed producer
-    // is never patched with a late consumer edge.
-    for (int32_t producer_id = range->task_begin; producer_id < range->task_end; ++producer_id) {
-        PTO2TaskSlotState &source_producer = source_ring.get_slot_state_by_task_id(producer_id);
-        for (PTO2DepListEntry *source_edge = source_producer.fanout_head; source_edge != nullptr;
-             source_edge = source_edge->next) {
-            if (source_edge->slot_state == nullptr || source_edge->slot_state->task == nullptr) {
-                LOG_ERROR("host-orch: producer %d has an invalid fanout edge", producer_id);
-                return false;
-            }
-            int32_t consumer_id = static_cast<int32_t>(source_edge->slot_state->task->task_id.local());
-            if (consumer_id < range->task_begin || consumer_id >= range->task_end) continue;
-            if (producer_id >= consumer_id) {
-                LOG_ERROR("host-orch: invalid internal dependency %d -> %d", producer_id, consumer_id);
-                return false;
-            }
-            PTO2DepListEntry *target_edge = target_dep_pool.alloc();
-            if (target_edge == nullptr) return false;
-            PTO2TaskSlotState &target_producer = target_ring.get_slot_state_by_task_id(producer_id);
-            PTO2TaskSlotState &target_consumer = target_ring.get_slot_state_by_task_id(consumer_id);
-            target_edge->slot_state = &target_consumer;
-            target_edge->next = target_producer.fanout_head;
-            target_producer.fanout_head = target_edge;
-            target_producer.fanout_count++;
-            target_consumer.fanin_count++;
-        }
-    }
-    range->dep_end = target_dep_pool.top;
-    for (int32_t task_id = range->task_begin; task_id < range->task_end; ++task_id) {
-        target_ring.get_slot_state_by_task_id(task_id).dep_pool_mark = range->dep_end;
+        uint8_t completed = source_ring.completion_flags[source_ring.get_slot_by_task_id(task_id)].load(
+            std::memory_order_acquire
+        );
+        target_ring.completion_flags[alloc.slot].store(completed, std::memory_order_relaxed);
+        if (completed != 0 || task_state >= PTO2_TASK_COMPLETED) range->inline_completed++;
     }
 
     target->orchestrator.inline_completed_tasks += static_cast<uint64_t>(range->inline_completed);
-    target->orchestrator.sm_header->graph_output_ptr.store(
-        source->orchestrator.sm_header->graph_output_ptr.load(std::memory_order_acquire), std::memory_order_relaxed
-    );
-    target->orchestrator.sm_header->graph_output_size.store(
-        source->orchestrator.sm_header->graph_output_size.load(std::memory_order_acquire), std::memory_order_relaxed
-    );
     return true;
-}
-
-static int32_t count_streaming_internal_edges(PTO2Runtime *source, const PTO2HostGraphEpochRange &range) {
-    if (source == nullptr || source->orchestrator.sm_header == nullptr) return -1;
-    PTO2SharedMemoryRingHeader &ring = source->orchestrator.sm_header->ring;
-    int64_t edge_count = 0;
-    for (int32_t producer_id = range.task_begin; producer_id < range.task_end; ++producer_id) {
-        PTO2TaskSlotState &producer = ring.get_slot_state_by_task_id(producer_id);
-        for (PTO2DepListEntry *edge = producer.fanout_head; edge != nullptr; edge = edge->next) {
-            if (edge->slot_state == nullptr || edge->slot_state->task == nullptr) return -1;
-            int32_t consumer_id = static_cast<int32_t>(edge->slot_state->task->task_id.local());
-            if (consumer_id >= range.task_begin && consumer_id < range.task_end) {
-                if (++edge_count > INT32_MAX) return -1;
-            }
-        }
-    }
-    return static_cast<int32_t>(edge_count);
 }
 
 static bool materialize_host_graph_ranges(
@@ -697,6 +630,10 @@ static bool materialize_host_graph_ranges(
                     &target_ring.slot_states[target_slot], &source_ring.slot_states[source_slot],
                     sizeof(PTO2TaskSlotState)
                 );
+                target_ring.completion_flags[target_slot].store(
+                    source_ring.completion_flags[source_slot].load(std::memory_order_acquire),
+                    std::memory_order_relaxed
+                );
             }
         }
         expected_begin = range.task_end;
@@ -723,7 +660,7 @@ int32_t run_host_orchestration(
 
     DeviceArena source_arena;
     PTO2RuntimeArenaLayout source_layout =
-        runtime_reserve_layout(source_arena, eff_task_window_sizes, eff_heap_sizes, layout.dep_pool_capacities);
+        runtime_reserve_layout(source_arena, eff_task_window_sizes, eff_heap_sizes);
     if (source_layout.arena_size != layout.arena_size || source_layout.off_runtime != layout.off_runtime ||
         source_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("host-orch: failed to create an equivalent source arena for epoch capture");
@@ -750,7 +687,6 @@ int32_t run_host_orchestration(
     source_rt->orchestrator.wire_arena_pointers(source_layout.orch, source_arena, &source_rt->scheduler);
     source_rt->scheduler.sm_header = source_rt->orchestrator.sm_header;
     source_rt->scheduler.ring_sched_state.ring = &source_rt->orchestrator.sm_header->ring;
-    source_rt->scheduler.ring_sched_state.dep_pool.error_code_ptr = &source_rt->orchestrator.sm_header->orch_error_code;
 
     // Initialize the host SM header (ring flow control) so submit_task can run.
     PTO2SharedMemoryHandle source_sm_handle;
@@ -950,7 +886,7 @@ public:
         }
 
         PTO2RuntimeArenaLayout target_layout =
-            runtime_reserve_layout(target_arena_, task_window_sizes_, heap_sizes_, layout_.dep_pool_capacities);
+            runtime_reserve_layout(target_arena_, task_window_sizes_, heap_sizes_);
         if (target_layout.arena_size != layout_.arena_size || target_layout.off_runtime != layout_.off_runtime ||
             target_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
             LOG_ERROR("host-orch: async target arena layout mismatch or allocation failure");
@@ -1150,15 +1086,8 @@ private:
             return false;
         }
 
-        const PTO2HostGraphEpochRange &released = published_ranges_[static_cast<size_t>(epoch - 1)];
-        PTO2SharedMemoryRingHeader &ring = target_sm_handle_.header->ring;
-        ring.fc.last_task_alive.store(released.task_end, std::memory_order_release);
-        target_rt_->scheduler.ring_sched_state.dep_pool.advance_tail(released.dep_end);
         target_reclaimed_epoch_ = epoch;
-        LOG_INFO_V9(
-            "host-orch: reclaimed target through epoch=%" PRIu64 " tasks<%d deps<%d", epoch, released.task_end,
-            released.dep_end
-        );
+        LOG_INFO_V9("host-orch: epoch metadata slot is reusable through epoch=%" PRIu64, epoch);
         return true;
     }
 
@@ -1169,32 +1098,14 @@ private:
         return wait_for_device_epoch(field_offset, epoch, kind) && reclaim_target_through(epoch);
     }
 
-    bool ensure_target_capacity(PTO2Runtime *source, const PTO2HostGraphEpochRange &range, size_t epoch_index) {
+    bool ensure_target_capacity(const PTO2HostGraphEpochRange &range) {
         PTO2TaskAllocator &allocator = target_rt_->orchestrator.ring.task_allocator;
-        PTO2DepListPool &dep_pool = target_rt_->scheduler.ring_sched_state.dep_pool;
         int32_t task_count = range.task_end - range.task_begin;
-        int32_t edge_count = count_streaming_internal_edges(source, range);
-        if (task_count <= 0 || task_count >= allocator.window_size() || edge_count < 0 ||
-            edge_count > dep_pool.capacity) {
+        if (task_count <= 0 || range.task_begin != allocator.task_head() || range.task_end >= allocator.window_size()) {
             LOG_ERROR(
-                "host-orch: epoch cannot fit target storage (tasks=%d/%d edges=%d/%d)", task_count,
-                allocator.window_size(), edge_count, dep_pool.capacity
-            );
-            return false;
-        }
-
-        auto has_capacity = [&]() {
-            int32_t active_tasks = allocator.task_head() - allocator.task_tail();
-            int32_t active_deps = dep_pool.top - dep_pool.tail;
-            return active_tasks + task_count < allocator.window_size() && active_deps + edge_count <= dep_pool.capacity;
-        };
-        if (has_capacity()) return true;
-        if (epoch_index == 0 || !wait_and_reclaim_target(epoch_index, "storage-free")) return false;
-        if (!has_capacity()) {
-            LOG_ERROR(
-                "host-orch: target storage remains full after reclaim (tasks=%d+%d/%d deps=%d+%d/%d)",
-                allocator.task_head() - allocator.task_tail(), task_count, allocator.window_size(),
-                dep_pool.top - dep_pool.tail, edge_count, dep_pool.capacity
+                "host-orch: epoch cannot fit whole-graph target storage "
+                "(range=[%d,%d) target_head=%d window=%d)",
+                range.task_begin, range.task_end, allocator.task_head(), allocator.window_size()
             );
             return false;
         }
@@ -1204,7 +1115,7 @@ private:
     bool stage_epoch(const PTO2HostGraphEpochRange &range, size_t epoch_index) {
         const int32_t task_count = range.task_end - range.task_begin;
         PTO2SharedMemoryRingHeader &ring = target_sm_handle_.header->ring;
-        if (task_count <= 0 || static_cast<uint64_t>(task_count) >= ring.task_window_size) {
+        if (task_count <= 0 || range.task_begin < 0 || static_cast<uint64_t>(range.task_end) >= ring.task_window_size) {
             LOG_ERROR(
                 "host-orch: invalid streaming task range size=%d window=%" PRIu64, task_count, ring.task_window_size
             );
@@ -1214,9 +1125,9 @@ private:
         char attrs[192];
         std::snprintf(
             attrs, sizeof(attrs),
-            "epoch=%zu slot=%zu task_begin=%d task_end=%d tasks=%d dep_begin=%d dep_end=%d final=%d", epoch_index + 1,
+            "epoch=%zu slot=%zu task_begin=%d task_end=%d tasks=%d final=%d", epoch_index + 1,
             epoch_index % static_cast<size_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT), range.task_begin, range.task_end,
-            task_count, range.dep_begin, range.dep_end, range.final_epoch
+            task_count, range.final_epoch
         );
         STRACE_A("simpler_run.host_orch.epoch.stage_upload", attrs);
 
@@ -1247,18 +1158,14 @@ private:
         auto stage_task_run = [&](int32_t first_slot, int32_t run_count) {
             std::vector<uint8_t> payload_image(static_cast<size_t>(run_count) * sizeof(PTO2TaskPayload));
             std::vector<uint8_t> slot_image(static_cast<size_t>(run_count) * sizeof(PTO2TaskSlotState));
+            std::vector<uint8_t> completion_image(static_cast<size_t>(run_count));
             for (int32_t i = 0; i < run_count; ++i) {
                 PTO2TaskPayload payload_copy;
                 PTO2TaskSlotState slot_copy;
                 std::memcpy(&payload_copy, &ring.task_payloads[first_slot + i], sizeof(payload_copy));
                 std::memcpy(&slot_copy, &ring.slot_states[first_slot + i], sizeof(slot_copy));
-                if (payload_copy.fanin_actual_count > PTO2_FANIN_INLINE_CAP) return false;
-                for (int32_t fanin = 0; fanin < payload_copy.fanin_actual_count; ++fanin) {
-                    if (!relocate_target_pointer(payload_copy.fanin_inline_slot_states[fanin])) return false;
-                }
-                payload_copy.fanin_spill_pool = nullptr;
-                if (!relocate_target_pointer(slot_copy.task) || !relocate_target_pointer(slot_copy.payload) ||
-                    !relocate_target_pointer(slot_copy.fanout_head)) {
+                if (payload_copy.fanin_count < 0 || payload_copy.fanin_count > PTO2_MAX_FANIN) return false;
+                if (!relocate_target_pointer(slot_copy.task) || !relocate_target_pointer(slot_copy.payload)) {
                     return false;
                 }
                 std::memcpy(
@@ -1268,6 +1175,8 @@ private:
                 std::memcpy(
                     slot_image.data() + static_cast<size_t>(i) * sizeof(slot_copy), &slot_copy, sizeof(slot_copy)
                 );
+                completion_image[static_cast<size_t>(i)] =
+                    ring.completion_flags[first_slot + i].load(std::memory_order_acquire);
             }
 
             size_t descriptor_bytes = static_cast<size_t>(run_count) * sizeof(PTO2TaskDescriptor);
@@ -1285,6 +1194,10 @@ private:
                        device_sm_bytes + sm_offsets.slot_states +
                            static_cast<size_t>(first_slot) * sizeof(PTO2TaskSlotState),
                        slot_image.data(), slot_image.size()
+                   ) == 0 &&
+                   api_->copy_to_device(
+                       device_sm_bytes + sm_offsets.completion_flags + static_cast<size_t>(first_slot),
+                       completion_image.data(), completion_image.size()
                    ) == 0;
         };
         int32_t staged_tasks = 0;
@@ -1300,39 +1213,6 @@ private:
             staged_tasks += run_count;
         }
 
-        PTO2DepListPool &dep_pool = target_rt_->scheduler.ring_sched_state.dep_pool;
-        int32_t dep_count = range.dep_end - range.dep_begin;
-        if (dep_count > 0) {
-            int32_t dep_slot = range.dep_begin % dep_pool.capacity;
-            std::vector<PTO2DepListEntry> dep_image(static_cast<size_t>(dep_count));
-            for (int32_t i = 0; i < dep_count; ++i) {
-                dep_image[static_cast<size_t>(i)] = dep_pool.base[(range.dep_begin + i) % dep_pool.capacity];
-                if (!relocate_target_pointer(dep_image[static_cast<size_t>(i)].slot_state) ||
-                    !relocate_target_pointer(dep_image[static_cast<size_t>(i)].next)) {
-                    return false;
-                }
-            }
-            char *device_arena_bytes = static_cast<char *>(device_arena_);
-            int32_t first_count = std::min(dep_count, dep_pool.capacity - dep_slot);
-            int32_t second_count = dep_count - first_count;
-            bool dep_staged = api_->copy_to_device(
-                                  device_arena_bytes + layout_.sched.off_dep_pool_entries +
-                                      static_cast<size_t>(dep_slot) * sizeof(PTO2DepListEntry),
-                                  dep_image.data(), static_cast<size_t>(first_count) * sizeof(PTO2DepListEntry)
-                              ) == 0;
-            if (dep_staged && second_count > 0) {
-                dep_staged =
-                    api_->copy_to_device(
-                        device_arena_bytes + layout_.sched.off_dep_pool_entries, dep_image.data() + first_count,
-                        static_cast<size_t>(second_count) * sizeof(PTO2DepListEntry)
-                    ) == 0;
-            }
-            if (!dep_staged) {
-                LOG_ERROR("host-orch: failed to stage dependency range [%d,%d)", range.dep_begin, range.dep_end);
-                return false;
-            }
-        }
-
         PTO2HostGraphEpochControl &control = target_sm_handle_.header->host_graph_epochs;
         size_t control_slot = epoch_index % static_cast<size_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT);
         PTO2HostGraphEpochSlot &epoch_slot = control.slots[control_slot];
@@ -1340,22 +1220,12 @@ private:
         epoch_slot.range = range;
 
         int32_t current_task_index = range.task_end;
-        uint64_t graph_output_ptr = target_sm_handle_.header->graph_output_ptr.load(std::memory_order_relaxed);
-        uint64_t graph_output_size = target_sm_handle_.header->graph_output_size.load(std::memory_order_relaxed);
         size_t epoch_slot_offset = offsetof(PTO2SharedMemoryHeader, host_graph_epochs) +
                                    offsetof(PTO2HostGraphEpochControl, slots) +
                                    control_slot * sizeof(PTO2HostGraphEpochSlot);
         if (api_->copy_to_device(
                 pto2_sm_layout::ring_current_task_index_addr(device_sm_), &current_task_index,
                 sizeof(current_task_index)
-            ) != 0 ||
-            api_->copy_to_device(
-                device_sm_bytes + offsetof(PTO2SharedMemoryHeader, graph_output_ptr), &graph_output_ptr,
-                sizeof(graph_output_ptr)
-            ) != 0 ||
-            api_->copy_to_device(
-                device_sm_bytes + offsetof(PTO2SharedMemoryHeader, graph_output_size), &graph_output_size,
-                sizeof(graph_output_size)
             ) != 0 ||
             api_->copy_to_device(device_sm_bytes + epoch_slot_offset, &epoch_slot, sizeof(epoch_slot)) != 0) {
             LOG_ERROR("host-orch: failed to stage epoch metadata");
@@ -1384,7 +1254,7 @@ private:
             !wait_and_reclaim_target(publish_epoch - PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT, "slot-free")) {
             return false;
         }
-        if (!ensure_target_capacity(source, *range, epoch_index)) return false;
+        if (!ensure_target_capacity(*range)) return false;
 
         char attrs[160];
         std::snprintf(
@@ -1775,7 +1645,7 @@ extern "C" int bind_callable_to_runtime_impl(
     int64_t t_prebuilt_start = _now_ms();
     DeviceArena layout_probe;
     PTO2RuntimeArenaLayout layout =
-        runtime_reserve_layout(layout_probe, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities);
+        runtime_reserve_layout(layout_probe, eff_task_window_sizes, eff_heap_sizes);
 
     int64_t t_setup_start = _now_ms();
     if (api->setup_static_arena(total_heap_size, sm_size, layout.arena_size) != 0) {

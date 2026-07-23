@@ -452,17 +452,21 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     schedulers_started = true;
                 }
 
-                // The complete graph image is visible before host_publish_epoch.
-                // Start scheduler threads before opening every publication gate so
-                // they can dispatch roots while this thread releases the remaining
-                // task range. device_release_epoch only lets Host build the next
-                // source graph; target storage reuse still waits
-                // device_buffer_free_epoch.
+                // Classify the newly published range against the monotonic
+                // completion flags. Cross-epoch consumers wait on the first
+                // incomplete producer and are reclassified when it completes.
                 for (int32_t task_id = slot.range.task_begin; task_id < slot.range.task_end; ++task_id) {
                     PTO2TaskSlotState &task_slot = header->ring.get_slot_state_by_task_id(task_id);
                     if (task_slot.task_state.load(std::memory_order_acquire) >= PTO2_TASK_COMPLETED) continue;
-                    task_slot.payload->dispatch_fanin.fetch_add(1, std::memory_order_relaxed);
-                    rt->scheduler.release_fanin_and_check_ready(task_slot);
+                    int32_t fanin_state = rt->scheduler.classify_fanin_state(&task_slot);
+                    if (fanin_state < 0) {
+                        rt->scheduler.push_ready_routed(&task_slot);
+                    } else {
+                        rt->scheduler.register_wake(
+                            &header->ring.get_slot_state_by_task_id(task_slot.payload->fanin_local_ids[fanin_state]),
+                            &task_slot
+                        );
+                    }
                 }
                 if (slot.range.final_epoch == 0) continue;
 
