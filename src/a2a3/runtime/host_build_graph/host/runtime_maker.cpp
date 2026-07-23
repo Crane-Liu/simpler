@@ -559,7 +559,8 @@ materialize_streaming_host_graph_range(PTO2Runtime *source, PTO2Runtime *target,
         target_slot.last_consumer_local_id = source_slot.last_consumer_local_id;
         target_slot.task_state.store(task_state, std::memory_order_relaxed);
         target_slot.active_mask = source_slot.active_mask;
-        target_slot.allow_early_resolve = false;
+        target_slot.task_attrs = source_slot.task_attrs;
+        target_slot.task_attrs.set_early_resolve(false);
         target_slot.total_required_subtasks = source_slot.total_required_subtasks;
         target_slot.logical_block_num = source_slot.logical_block_num;
         uint8_t completed =
