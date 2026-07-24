@@ -564,6 +564,11 @@ int DeviceRunner::launch_run(Runtime &runtime, int num_aicore, int launch_aicpu_
         return rc;
     }
 
+    // Both kernels are now enqueued successfully. Publish launch acceptance
+    // before reap_run synchronizes either stream; mailbox ownership remains
+    // with the current WorkerThread until TASK_DONE.
+    publish_task_accepted();
+
     return 0;
 }
 

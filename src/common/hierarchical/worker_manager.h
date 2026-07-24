@@ -72,6 +72,9 @@ enum class MailboxState : int32_t {
     // PLATFORM_STREAM_SYNC_TIMEOUT_MS budget (issue #897).
     INIT_READY = 6,
     INIT_FAILED = 7,
+    // A2A3 onboard publishes this after both device kernel launches succeed.
+    // The endpoint still owns the mailbox until TASK_DONE.
+    TASK_ACCEPTED = 8,
 };
 
 // Sized so the args region can hold any TaskArgs the runtime itself accepts
@@ -201,7 +204,8 @@ public:
     virtual ~WorkerEndpoint() = default;
 
     virtual const WorkerEndpointCaps &caps() const = 0;
-    virtual WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch) = 0;
+    virtual WorkerCompletion
+    run(Ring *ring, const WorkerDispatch &dispatch, const std::function<void()> &on_accept) = 0;
 
     virtual void shutdown_child() {}
     virtual uint64_t control_malloc(size_t size);
@@ -252,7 +256,7 @@ public:
     LocalMailboxEndpoint(int32_t worker_id, void *mailbox);
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
-    WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch) override;
+    WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch, const std::function<void()> &on_accept) override;
 
     void shutdown_child() override;
     uint64_t control_malloc(size_t size) override;
@@ -346,7 +350,8 @@ public:
     // on_complete(completion) is called (in the WorkerThread) after each
     // endpoint run().
     void start(
-        Ring *ring, const std::function<void(WorkerCompletion)> &on_complete, std::unique_ptr<WorkerEndpoint> endpoint
+        Ring *ring, const std::function<void(WorkerCompletion)> &on_complete,
+        const std::function<void(WorkerDispatch)> &on_accept, std::unique_ptr<WorkerEndpoint> endpoint
     );
 
     // Enqueue a dispatch for the worker. Non-blocking.
@@ -436,6 +441,7 @@ private:
     Ring *ring_{nullptr};
     std::unique_ptr<WorkerEndpoint> endpoint_;
     std::function<void(WorkerCompletion)> on_complete_;
+    std::function<void(WorkerDispatch)> on_accept_;
 
     std::thread thread_;
     std::queue<WorkerDispatch> queue_;
@@ -445,7 +451,7 @@ private:
     std::atomic<bool> idle_{true};
 
     void loop();
-    WorkerCompletion dispatch_process(WorkerDispatch d);
+    WorkerCompletion dispatch_process(WorkerDispatch d, const std::function<void()> &on_accept);
 };
 
 // =============================================================================
@@ -455,6 +461,7 @@ private:
 class WorkerManager {
 public:
     using OnCompleteFn = std::function<void(WorkerCompletion)>;
+    using OnAcceptFn = std::function<void(WorkerDispatch)>;
 
     // Register a worker. `mailbox` is a MAILBOX_SIZE-byte MAP_SHARED
     // region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
@@ -464,7 +471,7 @@ public:
     void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
     void add_sub(void *mailbox);
 
-    void start(Ring *ring, const OnCompleteFn &on_complete);
+    void start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept = {});
     void stop();
 
     WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;

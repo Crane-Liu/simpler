@@ -466,6 +466,29 @@ TEST_F(OrchestratorFixture, OneTaskRunCompletesAfterConsumption) {
     orch.release_run(run_id);
 }
 
+TEST_F(OrchestratorFixture, GroupAcceptanceFencePrecedesCompletionFence) {
+    auto args = single_tensor_args(0x8050, TensorArgType::OUTPUT);
+    auto result = orch.submit_next_level_group(C(80), {args, args}, cfg, {0, 1});
+
+    orch.close_run_submission(run_id);
+    EXPECT_FALSE(orch.run_accepted(run_id));
+    EXPECT_FALSE(orch.run_done(run_id));
+
+    orch.mark_task_accepted(result.task_slot);
+    EXPECT_FALSE(orch.run_accepted(run_id));
+    EXPECT_FALSE(orch.run_done(run_id));
+
+    orch.mark_task_accepted(result.task_slot);
+    EXPECT_TRUE(orch.run_accepted(run_id));
+    EXPECT_FALSE(orch.run_done(run_id));
+    EXPECT_NO_THROW(orch.wait_run_accepted(run_id));
+
+    S(result.task_slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+    EXPECT_TRUE(orch.on_consumed(result.task_slot));
+    EXPECT_TRUE(orch.run_done(run_id));
+    orch.release_run(run_id);
+}
+
 TEST_F(OrchestratorFixture, SequentialRunsHaveDistinctIdsAndErrorsDoNotLeak) {
     auto failed_task = orch.submit_next_level(C(81), single_tensor_args(0x8100, TensorArgType::OUTPUT), cfg, 0);
     orch.report_task_error(failed_task.task_slot, "run one failed");

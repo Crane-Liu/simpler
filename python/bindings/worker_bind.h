@@ -360,6 +360,12 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("run_id")
         )
         .def(
+            "_wait_run_accepted", &Orchestrator::wait_run_accepted, nb::arg("run_id"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Block until every dispatch in one closed run has been launch-accepted."
+        )
+        .def("_run_accepted", &Orchestrator::run_accepted, nb::arg("run_id"))
+        .def(
             "_wait_run", &Orchestrator::wait_run, nb::arg("run_id"), nb::call_guard<nb::gil_scoped_release>(),
             "Block until one run is terminal and raise only that run's error."
         )

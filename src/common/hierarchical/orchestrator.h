@@ -120,6 +120,8 @@ public:
     RunId begin_run();
     void close_run_submission(RunId run_id);
     void fail_run_submission(RunId run_id, std::exception_ptr error = nullptr);
+    void wait_run_accepted(RunId run_id);
+    bool run_accepted(RunId run_id) const;
     void wait_run(RunId run_id);
     bool wait_run_for(RunId run_id, double timeout_seconds);
     bool run_done(RunId run_id) const;
@@ -147,6 +149,11 @@ public:
 
     // Attach a scheduler/endpoint failure to the task's originating run.
     void report_task_error(TaskSlot slot, const std::string &message);
+
+    // Called once per endpoint dispatch after its launch has been accepted.
+    // This advances only the run's launch fence; task completion remains
+    // driven by Scheduler::worker_done and TASK_DONE.
+    void mark_task_accepted(TaskSlot slot);
 
     // Called by Scheduler (via Worker) when a task becomes CONSUMED:
     // erases TensorMap entries, releases the allocator slot (and implicitly
@@ -181,9 +188,12 @@ private:
     std::shared_ptr<RunState> get_run(RunId run_id) const;
     std::shared_ptr<RunState> current_building_run() const;
     static void finish_run_if_ready(const std::shared_ptr<RunState> &run);
+    static bool acceptance_ready(const std::shared_ptr<RunState> &run);
     static bool is_terminal(RunPhase phase);
     void increment_run_tasks(RunId run_id);
     void decrement_run_tasks(RunId run_id);
+    void increment_run_accepts(RunId run_id, int32_t count);
+    void decrement_run_accepts(RunId run_id);
     void record_run_error(RunId run_id, std::exception_ptr error);
 
     // Slot state lives in the Ring; the pointer stays stable for the

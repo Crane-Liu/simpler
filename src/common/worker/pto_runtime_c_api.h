@@ -247,6 +247,9 @@ int simpler_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config
 );
 
+/** Bind a host mailbox state word for launch acceptance publication. Optional. */
+int set_task_accepted_state_ctx(DeviceContextHandle ctx, volatile int32_t *state, int32_t accepted_value);
+
 /**
  * Drop the prepared state for `callable_id` and release the per-id share of
  * the device orch SO buffer. The buffer itself is freed only when its

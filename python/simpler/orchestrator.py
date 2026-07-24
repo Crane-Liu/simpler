@@ -563,6 +563,12 @@ class Orchestrator:
     def _fail_run_submission(self, run_id: int) -> None:
         self._o._fail_run_submission(run_id)
 
+    def _wait_run_accepted(self, run_id: int) -> None:
+        self._o._wait_run_accepted(run_id)
+
+    def _run_accepted(self, run_id: int) -> bool:
+        return bool(self._o._run_accepted(run_id))
+
     def _wait_run(self, run_id: int) -> None:
         self._o._wait_run(run_id)
 

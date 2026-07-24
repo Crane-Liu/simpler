@@ -1595,6 +1595,26 @@ class TestRunHandle:
         with pytest.raises(KeyboardInterrupt):
             handle._wait_for_serialization()
 
+    def test_launch_acceptance_does_not_finalize_run(self):
+        class FakeWorker:
+            def __init__(self):
+                self.accepted_runs = []
+
+            def _wait_run_handle_accepted(self, run_id):
+                self.accepted_runs.append(run_id)
+
+        worker = FakeWorker()
+        handle = RunHandle(cast(Worker, worker), 7, (object(),))
+
+        handle._wait_for_acceptance()
+        handle._wait_for_acceptance()
+
+        assert worker.accepted_runs == [7]
+        assert handle._launch_accepted
+        assert not handle._terminal
+        assert handle._run_id == 7
+        assert handle._keepalive is not None
+
     def test_done_query_cannot_race_native_run_release(self):
         done_entered = threading.Event()
         done_release = threading.Event()

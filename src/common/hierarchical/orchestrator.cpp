@@ -34,6 +34,11 @@ void Orchestrator::init(
 
 bool Orchestrator::is_terminal(RunPhase phase) { return phase == RunPhase::COMPLETED || phase == RunPhase::FAILED; }
 
+bool Orchestrator::acceptance_ready(const std::shared_ptr<RunState> &run) {
+    return run->submission_closed && (run->pending_accepts.load(std::memory_order_acquire) == 0 ||
+                                      is_terminal(run->phase.load(std::memory_order_acquire)));
+}
+
 std::shared_ptr<RunState> Orchestrator::get_run(RunId run_id) const {
     std::lock_guard<std::mutex> lk(runs_mu_);
     auto it = runs_.find(run_id);
@@ -98,6 +103,7 @@ void Orchestrator::close_run_submission(RunId run_id) {
             run->phase.store(RunPhase::EXECUTING, std::memory_order_release);
         }
     }
+    run->completion_cv.notify_all();
     finish_run_if_ready(run);
 }
 
@@ -119,7 +125,22 @@ void Orchestrator::fail_run_submission(RunId run_id, std::exception_ptr error) {
             run->phase.store(RunPhase::EXECUTING, std::memory_order_release);
         }
     }
+    run->completion_cv.notify_all();
     finish_run_if_ready(run);
+}
+
+void Orchestrator::wait_run_accepted(RunId run_id) {
+    auto run = get_run(run_id);
+    std::unique_lock<std::mutex> lk(run->completion_mu);
+    run->completion_cv.wait(lk, [&run] {
+        return acceptance_ready(run);
+    });
+}
+
+bool Orchestrator::run_accepted(RunId run_id) const {
+    auto run = get_run(run_id);
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    return acceptance_ready(run);
 }
 
 void Orchestrator::wait_run(RunId run_id) {
@@ -194,6 +215,18 @@ void Orchestrator::decrement_run_tasks(RunId run_id) {
     if (remaining == 0) finish_run_if_ready(run);
 }
 
+void Orchestrator::increment_run_accepts(RunId run_id, int32_t count) {
+    if (count <= 0) throw std::logic_error("Orchestrator: run acceptance count must be positive");
+    get_run(run_id)->pending_accepts.fetch_add(count, std::memory_order_relaxed);
+}
+
+void Orchestrator::decrement_run_accepts(RunId run_id) {
+    auto run = get_run(run_id);
+    int32_t remaining = run->pending_accepts.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (remaining < 0) throw std::logic_error("Orchestrator: run acceptance count underflow");
+    if (remaining == 0) run->completion_cv.notify_all();
+}
+
 void Orchestrator::record_run_error(RunId run_id, std::exception_ptr error) {
     if (!error) return;
     auto run = get_run(run_id);
@@ -204,6 +237,11 @@ void Orchestrator::record_run_error(RunId run_id, std::exception_ptr error) {
 void Orchestrator::report_task_error(TaskSlot slot, const std::string &message) {
     TaskSlotState &task = slot_state(slot);
     record_run_error(task.run_id, std::make_exception_ptr(std::runtime_error(message)));
+}
+
+void Orchestrator::mark_task_accepted(TaskSlot slot) {
+    TaskSlotState &task = slot_state(slot);
+    decrement_run_accepts(task.run_id);
 }
 
 uint64_t Orchestrator::malloc(int worker_id, size_t size) {
@@ -458,6 +496,7 @@ SubmitResult Orchestrator::submit_impl(
 
     if (scope_ref > 0) scope_->register_task(slot);
     increment_run_tasks(run->id);
+    increment_run_accepts(run->id, s.group_size());
 
     if (poisoned_by_failed_producer) {
         if (poison_message.empty()) poison_message = "producer task failed";

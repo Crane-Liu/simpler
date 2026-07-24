@@ -162,6 +162,7 @@ private:
                     dispatched.push_back({callable_hash0, tensor_key});
                 }
                 is_running.store(true, std::memory_order_release);
+                write_state(MailboxState::TASK_ACCEPTED);
 
                 {
                     std::unique_lock<std::mutex> lk(run_mu);
@@ -219,8 +220,9 @@ public:
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
 
-    WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch) override {
+    WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch, const std::function<void()> &on_accept) override {
         (void)ring;
+        on_accept();
         WorkerCompletion completion;
         completion.task_slot = dispatch.task_slot;
         completion.group_index = dispatch.group_index;
@@ -285,9 +287,15 @@ struct SchedulerFixture : public ::testing::Test {
 
         mock_worker.start();
         manager.add_next_level(mock_worker.mailbox_ptr());
-        manager.start(&allocator, [this](WorkerCompletion completion) {
-            sched.worker_done(std::move(completion));
-        });
+        manager.start(
+            &allocator,
+            [this](WorkerCompletion completion) {
+                sched.worker_done(std::move(completion));
+            },
+            [this](WorkerDispatch dispatch) {
+                orch.mark_task_accepted(dispatch.task_slot);
+            }
+        );
         rq_next_level.reset(manager.next_level_worker_ids());
         orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level, &manager, [this] {
             sched.notify_ready();
@@ -391,6 +399,25 @@ TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
 
     mock_worker.complete();
     wait_consumed(slot);
+}
+
+TEST_F(SchedulerFixture, LaunchAcceptancePrecedesTaskCompletion) {
+    auto args = single_tensor_args(0xACCE, TensorArgType::OUTPUT);
+    auto result = orch.submit_next_level(C(43), args, cfg, 0);
+    orch.close_run_submission(run_id);
+
+    mock_worker.wait_running();
+    ASSERT_TRUE(mock_worker.is_running.load(std::memory_order_acquire));
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (!orch.run_accepted(run_id) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(orch.run_accepted(run_id));
+    EXPECT_FALSE(orch.run_done(run_id));
+
+    mock_worker.complete();
+    wait_consumed(result.task_slot);
+    EXPECT_NO_THROW(orch.wait_run(run_id));
 }
 
 TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {

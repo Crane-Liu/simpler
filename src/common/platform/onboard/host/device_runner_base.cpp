@@ -1439,3 +1439,19 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run() {
         scope_stats_collector_.write_jsonl(output_prefix_);
     }
 }
+namespace {
+thread_local volatile int32_t *g_task_accepted_state = nullptr;
+thread_local int32_t g_task_accepted_value = 0;
+}  // namespace
+
+int DeviceRunnerBase::set_task_accepted_state(volatile int32_t *state, int32_t accepted_value) {
+    g_task_accepted_state = state;
+    g_task_accepted_value = accepted_value;
+    return 0;
+}
+
+void DeviceRunnerBase::publish_task_accepted() const {
+    if (g_task_accepted_state != nullptr) {
+        __atomic_store_n(g_task_accepted_state, g_task_accepted_value, __ATOMIC_RELEASE);
+    }
+}

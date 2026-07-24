@@ -206,6 +206,7 @@ _CONTROL_DONE = 5
 # deadline aborts startup with a bounded error instead of an unbounded spin.
 _INIT_READY = 6
 _INIT_FAILED = 7
+_TASK_ACCEPTED = 8
 
 # Startup readiness bound. A child that neither reports INIT_READY/INIT_FAILED
 # nor exits within this window is treated as hung and startup is aborted.
@@ -1450,7 +1451,14 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                     # it in Python is N×40B of avoidable work and a permanent
                     # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
                     # is the source of truth.
-                    cw._impl.run_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
+                    cw._impl.run_from_blob(
+                        cid,
+                        mailbox_addr + _OFF_TASK_ARGS_BLOB,
+                        _MAILBOX_ARGS_CAPACITY,
+                        cfg,
+                        state_addr,
+                        _TASK_ACCEPTED,
+                    )
                 except Exception as e:  # noqa: BLE001
                     code = 1
                     msg = _format_exc(f"chip_process dev={device_id}", e)
@@ -1897,6 +1905,7 @@ class RunHandle:
         self._resources = resources if resources is not None else _RunResources()
         self._cv = threading.Condition()
         self._wait_in_progress = False
+        self._launch_accepted = False
         self._terminal = False
         self._error: BaseException | None = None
 
@@ -1909,6 +1918,7 @@ class RunHandle:
         handle._resources = _RunResources()
         handle._cv = threading.Condition()
         handle._wait_in_progress = False
+        handle._launch_accepted = True
         handle._terminal = True
         handle._error = None
         return handle
@@ -1979,6 +1989,7 @@ class RunHandle:
             self._error = error
             self._run_id = None
             self._keepalive = None
+            self._launch_accepted = True
             self._terminal = True
             self._wait_in_progress = False
             self._cv.notify_all()
@@ -1996,6 +2007,30 @@ class RunHandle:
         except Exception:
             # The result remains cached for this handle's public wait/result.
             pass
+
+    def _wait_for_acceptance(self) -> None:
+        """Wait until this run's dispatches have crossed their launch boundary."""
+        with self._cv:
+            while not self._terminal and self._wait_in_progress:
+                self._cv.wait()
+            if self._terminal or self._launch_accepted:
+                return
+            self._wait_in_progress = True
+            run_id = self._run_id
+
+        assert run_id is not None
+        try:
+            self._worker._wait_run_handle_accepted(run_id)
+        except BaseException:
+            with self._cv:
+                self._wait_in_progress = False
+                self._cv.notify_all()
+            raise
+
+        with self._cv:
+            self._launch_accepted = True
+            self._wait_in_progress = False
+            self._cv.notify_all()
 
 
 def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_leader: bool = False) -> None:
@@ -5812,8 +5847,9 @@ class Worker:
         ``args``  : TaskArgs (optional)
         ``config``: CallConfig (optional, default-constructed if None)
 
-        Only one live device run is admitted: a later submission waits for the
-        previous handle's fence and cleanup before building its DAG.
+        Graph construction remains serialized. A later submission waits only
+        until prior dispatches are launch-accepted; completion and per-run
+        resource cleanup remain owned by each returned handle.
         """
         with self._operation_lease("submit"):
             return self._submit_locked(callable, args, config)
@@ -5840,13 +5876,12 @@ class Worker:
             return RunHandle._completed(self)
 
         with self._submit_mu:
-            # Cleanup is Worker-global while only one live device run is
-            # admitted. Drain prior handles before a new callback can mutate
-            # those resources; errors remain attached only to their origin.
+            # Graph callbacks are serialized, but accepted runs may remain live:
+            # their Python resources are isolated in each RunHandle.
             with self._hierarchical_start_cv:
                 prior_handles = tuple(self._accepted_run_handles)
             for handle in prior_handles:
-                handle._wait_for_serialization()
+                handle._wait_for_acceptance()
             return self._submit_l3_locked(callable, args, cfg)
 
     def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
@@ -5890,6 +5925,10 @@ class Worker:
     def _run_handle_done(self, run_id: int) -> bool:
         assert self._orch is not None
         return self._orch._run_done(run_id)
+
+    def _wait_run_handle_accepted(self, run_id: int) -> None:
+        assert self._orch is not None
+        self._orch._wait_run_accepted(run_id)
 
     def _wait_run_handle(self, run_id: int, timeout: float | None) -> bool:
         assert self._orch is not None
