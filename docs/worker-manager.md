@@ -246,6 +246,12 @@ validation-only staging and defer native prepare until the predecessor is
 polled and finalized. Neither path launches or accepts the successor before
 FIFO activation.
 
+HBG opts into concurrent preparation using its two lease-selected
+`HOST_PER_RUN` banks. Preparation binds the successor and creates its fresh
+AICore stream in the inactive bank while leaving the active bank immutable.
+A frame that arrives before any active claim publishes validation-only and may
+gain its native token later without another mailbox state transition.
+
 Activation is sticky on the parent side: FIFO promotion may be observed before
 the child reaches `FRAME_STAGED`. The endpoint records that permission and
 publishes `ACTIVATE` only by a compare/exchange from the matching
@@ -255,8 +261,8 @@ later frame cannot bypass an earlier eligible dispatch.
 Task-frame publication briefly shares the base control mutex so it has a
 defined order relative to a control request. Once published, ordinary controls
 may run while the device task is active. Registry-mutating controls are
-deferred until the active native run is finalized; final unregister also waits
-for every published frame using that digest to retire.
+deferred until active and backend-prepared native state is finalized; final
+unregister also waits for every published frame using that digest to retire.
 
 Each task frame is bound to its pipeline lease slot and carries a protocol
 trailer with `{run_id, slot_id, generation, dispatch_id}`. Parent and child

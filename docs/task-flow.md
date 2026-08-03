@@ -383,6 +383,14 @@ in its leased slot while the predecessor is active. Otherwise native prepare is
 deferred until the predecessor has polled complete and finalized. In both cases
 the successor remains unlaunched and unaccepted until FIFO activation.
 
+`host_build_graph` advertises this capability because each lease selects an
+independent `HOST_PER_RUN` arena bank. Once the predecessor owns the active
+claim, the child binds the successor into the inactive bank and provisions its
+fresh AICore stream before publishing `FRAME_STAGED`. The active bank remains
+immutable, and launch still waits for predecessor completion and finalization.
+Diagnostics retain validation-only staging because their collectors are
+runner-global.
+
 The scheduler stages only the first eligible single NEXT_LEVEL task from the
 prepared FIFO successor. Tasks from the active run use only the active lane, so
 the second frame cannot create same-device execution overlap. Prepared groups
@@ -397,7 +405,8 @@ the launch fence. A terminal pre-launch failure may conservatively retire the
 run-level acceptance waiter, but it does not set the frame's acceptance word.
 The parent clears that word only immediately before reusing an `IDLE` frame.
 Control commands continue to use a separate base frame, so they cannot
-overwrite either staged task frame.
+overwrite either staged task frame. Registry mutation is deferred while an
+active or backend-prepared token still owns runtime state.
 
 #### TRB temporary buffer
 
