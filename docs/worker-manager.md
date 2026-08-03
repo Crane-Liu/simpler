@@ -223,7 +223,7 @@ A two-frame `LocalMailboxEndpoint` advertises `supports_frame_staging` and is
 driven through `submit_progress`, `activate_progress`, and `poll_progress`.
 The owning `WorkerThread` is the only parent-side progress owner. The child also
 uses one `run_two_frame_loop`; it services the separate control base, stages
-both task frames, and owns the one native-run lifecycle.
+both task frames, and owns the bounded active/prepared native lifecycles.
 
 The ordinary active dispatch and the staged successor use distinct initial
 states:
@@ -238,12 +238,13 @@ successor: IDLE -> PREPARE_READY -> FRAME_STAGED -> ACTIVATE
 
 `FRAME_STAGED` means the child validated the frame identity and arguments,
 resolved the callable digest, rewrote any mapped host addresses, and retained
-an immutable snapshot. It does **not** mean that the runtime-specific native
-run is prepared. While one native run is active, the successor remains at
-`FRAME_STAGED`. Only after activation and after the predecessor is polled and
-finalized does the child call native `prepare`, `launch`, `poll`, and
-`finalize` for the successor. This preserves the current one-unfinished-native-
-run contract.
+an immutable snapshot. It does not by itself say whether the runtime-specific
+native run is prepared. A backend with the explicit concurrent-prepare
+capability may prepare one non-diagnostic successor in a distinct leased slot
+while the predecessor is active. Unsupported backends and diagnostic runs keep
+validation-only staging and defer native prepare until the predecessor is
+polled and finalized. Neither path launches or accepts the successor before
+FIFO activation.
 
 Activation is sticky on the parent side: FIFO promotion may be observed before
 the child reaches `FRAME_STAGED`. The endpoint records that permission and

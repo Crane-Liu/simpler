@@ -21,7 +21,7 @@ _VECTOR_KERNELS = "../vector_example/kernels/aiv"
 _SLOT = 0
 _GENERATION = 1
 _SIZE = 128 * 128
-_CHAIN_LENGTH = 64
+_CHAIN_LENGTH = 512
 
 
 @scene_test(level=2, runtime="host_build_graph")
@@ -72,7 +72,7 @@ class TestNativeRunLifecycle(SceneTestCase):
 
         spans = list(parse_spans(capfd.readouterr().err.splitlines()))
         invocations = [inv for inv in group_invocations(spans) if "simpler_run" in inv.by_name()]
-        assert len(invocations) == 3, "abandoned, direct, and blocking runs must each emit one trace invocation"
+        assert len(invocations) == 4, "abandoned, direct, blocking, and handle runs must each emit one invocation"
 
         common_depths = {
             "simpler_run": 0,
@@ -100,7 +100,7 @@ class TestNativeRunLifecycle(SceneTestCase):
             for name in expected_depths.keys() - {"simpler_run", "simpler_run.runner_run.device_wall"}:
                 stage = by_name[name]
                 assert root.ts <= stage.ts <= stage.ts + stage.dur <= root_end
-        assert launched_count == 2
+        assert launched_count == 3
 
     def _run_and_validate_l2(  # noqa: PLR0913
         self,
@@ -122,6 +122,8 @@ class TestNativeRunLifecycle(SceneTestCase):
         chip_worker = worker._chip_worker
         assert chip_worker is not None
         chip_worker._register_callable_at_slot(_SLOT, callable_obj)
+        private_slot_registered = True
+        public_handle = None
         native_run = None
         try:
             test_args = self.generate_args(case["params"])
@@ -134,9 +136,9 @@ class TestNativeRunLifecycle(SceneTestCase):
                 _SLOT, chip_args, _SLOT, _GENERATION, config=config
             )
             first_run = native_run
-            assert chip_worker.run_stream_set_create_count == stream_count_before_prepare
+            assert chip_worker.run_stream_set_create_count == stream_count_before_prepare + 1
             assert torch.count_nonzero(test_args.out) == 0, "prepare crossed the device launch fence"
-            with pytest.raises(RuntimeError, match="unfinished native run|owns the runner"):
+            with pytest.raises(RuntimeError, match="unfinished native run|owns the runner|active predecessor"):
                 chip_worker._prepare_native_run_with_pipeline_lease(_SLOT, chip_args, 1, _GENERATION, config=config)
             with pytest.raises(RuntimeError, match="unregister_callable failed"):
                 chip_worker._unregister_slot(_SLOT)
@@ -181,13 +183,33 @@ class TestNativeRunLifecycle(SceneTestCase):
             self.compute_golden(second_golden, case["params"])
             chip_worker._run_slot(_SLOT, second_chip_args, config=config)
             _compare_outputs(second_args, second_golden, second_output_names, self.RTOL, self.ATOL)
+
+            chip_worker._unregister_slot(_SLOT)
+            private_slot_registered = False
+            public_handle = worker.register(callable_obj)
+            async_args = self.generate_args(case["params"])
+            async_chip_args, async_output_names = _build_chip_task_args(
+                async_args, self.CALLABLE["orchestration"]["signature"]
+            )
+            async_golden = async_args.clone()
+            self.compute_golden(async_golden, case["params"])
+            run_handle = worker.submit(public_handle, args=async_chip_args, config=config)
+            assert not run_handle._terminal, "direct L2 submit returned a pre-completed compatibility handle"
+            assert torch.count_nonzero(async_args.out) == 0, "direct L2 submit waited through device completion"
+            run_handle.wait(30.0)
+            _compare_outputs(async_args, async_golden, async_output_names, self.RTOL, self.ATOL)
+            worker.unregister(public_handle)
+            public_handle = None
         finally:
             if native_run is not None:
                 try:
                     chip_worker._finalize_native_run(native_run)
                 except Exception:
                     pass
-            chip_worker._unregister_slot(_SLOT)
+            if public_handle is not None:
+                worker.unregister(public_handle)
+            elif private_slot_registered:
+                chip_worker._unregister_slot(_SLOT)
 
 
 if __name__ == "__main__":

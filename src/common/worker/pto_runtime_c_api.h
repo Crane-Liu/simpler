@@ -334,6 +334,13 @@ int simpler_prepare_run(
 );
 
 /**
+ * Optional onboard capability: non-diagnostic preparation may overlap the
+ * execution claim held by a run in another pipeline slot. Backends opt in;
+ * the common implementation defaults to depth-one preparation.
+ */
+int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
+
+/**
  * Launch a prepared run. Returns only after the platform has published its
  * real kernel-launch marker, or after execution terminates before that marker.
  */
@@ -360,6 +367,11 @@ int select_pipeline_slot_ctx(DeviceContextHandle ctx, uint32_t slot_id);
 
 /** Select the HOST_PER_RUN arena bank used by the next synchronous run. */
 int select_arena_bank_ctx(DeviceContextHandle ctx, uint32_t bank_id);
+
+/** Attach optional L3 identity metadata to the current thread's next native prepare. */
+int set_native_run_identity_ctx(
+    DeviceContextHandle ctx, uint64_t run_id, uint64_t generation, uint64_t dispatch_id, uint64_t run_epoch
+);
 
 /**
  * Committed GM heap base of one arena bank, or 0 when that bank has never been

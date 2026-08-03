@@ -349,7 +349,15 @@ blocking composition of those phases. `prepare` constructs and binds the
 per-run `Runtime` without crossing the device launch fence; `launch` returns
 after the backend has actually submitted its execution; `finalize` owns
 validation, copy-back, DFX, and Runtime destruction. One runner still permits
-only one unfinished native run, including a prepared-but-not-launched run.
+one device-launch owner. A backend that explicitly advertises concurrent native
+preparation may additionally own one distinct-slot, prepared-but-unlaunched
+successor. Backends without that capability and diagnostic configurations keep
+the depth-one native lifecycle.
+
+Direct L2 `Worker.submit()` composes the same phases asynchronously: it returns
+after launch instead of device completion, and its `RunHandle` drives the
+ordered wait/finalize handoff. At depth two the second handle may own a prepared
+successor; a third submission backpressures before preparing or reusing a slot.
 
 #### Two-frame endpoint staging lane
 
@@ -357,7 +365,8 @@ A direct A2/A3 chip endpoint with a negotiated depth of at least two uses two
 task frames and advertises `supports_frame_staging`. One `WorkerThread` owns
 both frames and drives them through a non-blocking progress interface; the
 child process likewise has one loop that services control traffic, both task
-frames, and the single native-run lifecycle. There is no thread per frame.
+frames, and the bounded active/prepared native lifecycles. There is no thread
+per frame.
 
 The active and successor paths are:
 
@@ -367,11 +376,12 @@ IDLE -> PREPARE_READY -> FRAME_STAGED -> ACTIVATE -> TASK_LAUNCHED
                                                -> TASK_DONE | TASK_FAILED
 ```
 
-`FRAME_STAGED` means only that the child validated and owns an immutable frame
-snapshot. It is distinct from both an L3 run in `RunPhase::PREPARED` and a
-runtime-specific `ChipWorkerNativeRun` in its prepared phase. While an active
-native run exists, the successor remains at `FRAME_STAGED`; native prepare is
-deferred until the predecessor has polled complete and finalized.
+`FRAME_STAGED` means the child validated and owns an immutable frame snapshot;
+the mailbox state does not distinguish validation-only staging from completed
+native preparation. A capable backend may prepare a non-diagnostic successor
+in its leased slot while the predecessor is active. Otherwise native prepare is
+deferred until the predecessor has polled complete and finalized. In both cases
+the successor remains unlaunched and unaccepted until FIFO activation.
 
 The scheduler stages only the first eligible single NEXT_LEVEL task from the
 prepared FIFO successor. Tasks from the active run use only the active lane, so
