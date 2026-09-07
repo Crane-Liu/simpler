@@ -15,10 +15,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import torch
-
 import benchmark
-
+import torch
 
 DUAL_PATH = Path(__file__).with_name("benchmark_dual.py")
 DUAL_SPEC = importlib.util.spec_from_file_location("benchmark_dual", DUAL_PATH)
@@ -46,9 +44,7 @@ def main() -> int:
         )
     golden = {
         "seq_lens": torch.full((2, 16), 3457, dtype=torch.int32),
-        "slot_mapping": torch.stack(
-            (torch.arange(432, 448, dtype=torch.int32) * 128,) * 2
-        ),
+        "slot_mapping": torch.stack((torch.arange(432, 448, dtype=torch.int32) * 128,) * 2),
     }
     benchmark._update_slot(slots[0], golden, 0)
     assert torch.all(slots[1]["block_table"].view(16, 32)[:, 27] == -1)

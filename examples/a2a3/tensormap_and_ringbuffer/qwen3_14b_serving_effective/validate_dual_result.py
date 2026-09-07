@@ -18,7 +18,6 @@ from collections import Counter
 from pathlib import Path
 
 from safetensors.torch import load_file
-
 from trace_effective import invocation_rows, parse_spans
 
 
@@ -29,8 +28,7 @@ def _require(condition: bool, message: str) -> None:
 
 def _full_output_sha(first_tokens: list[int], token_rows: list[list[int]]) -> str:
     per_request = [
-        [int(first_tokens[batch])] + [int(row[batch]) for row in token_rows]
-        for batch in range(len(first_tokens))
+        [int(first_tokens[batch])] + [int(row[batch]) for row in token_rows] for batch in range(len(first_tokens))
     ]
     payload = json.dumps(per_request, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
@@ -50,13 +48,9 @@ def main() -> int:
     scenario = benchmark["scenario"]
     _require(benchmark["correctness"]["all_runs_valid"], "benchmark correctness failed")
     _require(scenario["mode"] == "dual", "result is not dual-slot")
-    _require(
-        scenario["warmup_runs"] == 0 and scenario["measured_runs"] == 1, "expected 0+1"
-    )
+    _require(scenario["warmup_runs"] == 0 and scenario["measured_runs"] == 1, "expected 0+1")
     _require(scenario["decode_dispatches"] == args.steps, "decode step count mismatch")
-    _require(
-        run["valid"] and len(run["token_rows"]) == args.steps, "incomplete token rows"
-    )
+    _require(run["valid"] and len(run["token_rows"]) == args.steps, "incomplete token rows")
 
     rows = invocation_rows(parse_spans(args.result / "run.log"))
     _require(len(rows) == args.steps, "native dispatch count mismatch")
@@ -102,9 +96,7 @@ def main() -> int:
         fixture_manifest = json.loads((args.fixture / "manifest.json").read_text())
         metadata = load_file(str(args.fixture / fixture_manifest["metadata"]["path"]))
         golden_manifest = json.loads(args.golden_manifest.read_text())
-        full_output_sha = _full_output_sha(
-            metadata["first_generated_token_ids"].tolist(), run["token_rows"]
-        )
+        full_output_sha = _full_output_sha(metadata["first_generated_token_ids"].tolist(), run["token_rows"])
         _require(
             full_output_sha == golden_manifest["full_128_output_token_ids_sha256"],
             "full output token SHA differs from golden",
@@ -122,19 +114,11 @@ def main() -> int:
         "prepare_only_after_first": True,
         "device_runner_serial": True,
         "full_128_output_token_ids_sha256": full_output_sha,
-        "rts_completion_interval_ms": trace["official_metrics"][
-            "rts_completion_interval_ms"
-        ]["pooled_steady_stats"],
-        "runner_run_ms": trace["official_metrics"]["runner_run_ms"][
-            "pooled_steady_stats"
-        ],
+        "rts_completion_interval_ms": trace["official_metrics"]["rts_completion_interval_ms"]["pooled_steady_stats"],
+        "runner_run_ms": trace["official_metrics"]["runner_run_ms"]["pooled_steady_stats"],
         "effective_ms": effective,
-        "effective_over_50ms_count": sum(
-            float(row["effective_ms"]) > 50.0 for row in rows[steady_skip:]
-        ),
-        "effective_over_70ms_count": sum(
-            float(row["effective_ms"]) > 70.0 for row in rows[steady_skip:]
-        ),
+        "effective_over_50ms_count": sum(float(row["effective_ms"]) > 50.0 for row in rows[steady_skip:]),
+        "effective_over_70ms_count": sum(float(row["effective_ms"]) > 70.0 for row in rows[steady_skip:]),
     }
     output = args.result / "dual_validation.json"
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")

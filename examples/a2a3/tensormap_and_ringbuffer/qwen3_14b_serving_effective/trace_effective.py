@@ -19,7 +19,6 @@ import statistics
 from dataclasses import dataclass
 from pathlib import Path
 
-
 _STRACE_RE = re.compile(
     r"\[STRACE\]\s+v=(?P<version>\d+)\s+pid=(?P<pid>\d+)\s+tid=(?P<tid>\d+)\s+"
     r"inv=(?P<inv>\d+)\s+hid=(?P<hid>[0-9a-fA-F]+)\s+depth=(?P<depth>\d+)\s+"
@@ -43,9 +42,7 @@ class Span:
 def _parse_attrs(text: str | None) -> dict[str, str]:
     if not text:
         return {}
-    return {
-        match.group("key"): match.group("value") for match in _ATTR_RE.finditer(text)
-    }
+    return {match.group("key"): match.group("value") for match in _ATTR_RE.finditer(text)}
 
 
 def parse_spans(log_path: Path) -> list[Span]:
@@ -127,11 +124,7 @@ def invocation_rows(spans: list[Span]) -> list[dict[str, float | int | bool]]:
         seen_dispatches.add(dispatch_id)
         invocation = spans_by_inv[root.inv]
         node_dispatch = _span_by_suffix(invocation, "node.dispatch")
-        attrs = (
-            root.attrs
-            if node_dispatch is None
-            else {**node_dispatch.attrs, **root.attrs}
-        )
+        attrs = root.attrs if node_dispatch is None else {**node_dispatch.attrs, **root.attrs}
         effective = _required_duration(invocation, ".runner_run.device_wall.sched")
         rows.append(
             {
@@ -140,14 +133,11 @@ def invocation_rows(spans: list[Span]) -> list[dict[str, float | int | bool]]:
                 "generation": int(attrs.get("generation", -1)),
                 "prepare_only": attrs.get("prepare_only", "0") == "1",
                 "root_start_ns": root.timestamp_ns,
-                "root_completion_ns": root.timestamp_ns
-                + round(root.duration_ms * 1_000_000),
+                "root_completion_ns": root.timestamp_ns + round(root.duration_ms * 1_000_000),
                 "chip_run_lifecycle_ms": root.duration_ms,
                 "runner_run_ms": _required_duration(invocation, ".runner_run"),
                 "effective_ms": effective,
-                "device_wall_ms": _required_duration(
-                    invocation, ".runner_run.device_wall"
-                ),
+                "device_wall_ms": _required_duration(invocation, ".runner_run.device_wall"),
                 "args_ms": _required_duration(invocation, ".bind.args"),
                 "validate_ms": _required_duration(invocation, ".validate"),
             }
@@ -186,23 +176,13 @@ def summarize_campaign(
         steady_rows = run_rows[steady_skip:]
         dispatches = [int(row["dispatch_id"]) for row in run_rows]
         completions = [int(row["root_completion_ns"]) for row in run_rows]
-        if any(
-            current <= previous for previous, current in zip(dispatches, dispatches[1:])
-        ):
-            raise ValueError(
-                f"run {run_index + 1} dispatch ids are not strictly increasing"
-            )
-        if any(
-            current <= previous
-            for previous, current in zip(completions, completions[1:])
-        ):
-            raise ValueError(
-                f"run {run_index + 1} root completions are not strictly increasing"
-            )
+        if any(current <= previous for previous, current in zip(dispatches, dispatches[1:])):
+            raise ValueError(f"run {run_index + 1} dispatch ids are not strictly increasing")
+        if any(current <= previous for previous, current in zip(completions, completions[1:])):
+            raise ValueError(f"run {run_index + 1} root completions are not strictly increasing")
 
         interval_values = [
-            (completions[index] - completions[index - 1]) / 1_000_000.0
-            for index in range(steady_skip, steps)
+            (completions[index] - completions[index - 1]) / 1_000_000.0 for index in range(steady_skip, steps)
         ]
         metric_stats = {"rts_completion_interval_ms": _stats(interval_values)}
         pooled["rts_completion_interval_ms"].extend(interval_values)
@@ -226,12 +206,12 @@ def summarize_campaign(
         )
 
     official = {}
-    for metric in pooled:
+    for metric, values in pooled.items():
         run_means = [float(run["metrics"][metric]["mean"]) for run in run_summaries]
         official[metric] = {
             "run_means": run_means,
             "run_mean_stats": _stats(run_means),
-            "pooled_steady_stats": _stats(pooled[metric]),
+            "pooled_steady_stats": _stats(values),
         }
 
     return {
@@ -283,9 +263,7 @@ def main() -> int:
         steady_skip=args.steady_skip,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    args.output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 
 

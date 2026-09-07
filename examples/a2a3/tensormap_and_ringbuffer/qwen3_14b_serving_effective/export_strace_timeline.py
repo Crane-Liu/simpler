@@ -15,8 +15,23 @@ import argparse
 import json
 from collections import Counter
 from pathlib import Path
+from typing import TypedDict
 
 from trace_effective import Span, parse_spans
+
+
+class TraceEventBase(TypedDict):
+    name: str
+    ph: str
+    pid: int
+    tid: int
+    args: dict[str, object]
+
+
+class TraceEvent(TraceEventBase, total=False):
+    cat: str
+    ts: float
+    dur: float
 
 
 def _event(
@@ -26,7 +41,7 @@ def _event(
     pid: int,
     timestamp_ns: int,
     args: dict[str, object],
-) -> dict[str, object]:
+) -> TraceEvent:
     return {
         "name": span.name,
         "cat": category,
@@ -45,7 +60,7 @@ def export(log_path: Path, output_dir: Path) -> dict[str, object]:
     for span in spans:
         by_inv.setdefault((span.pid, span.inv), []).append(span)
 
-    events: list[dict[str, object]] = []
+    events: list[TraceEvent] = []
     for pid in sorted({span.pid for span in spans}):
         for output_pid, name in (
             (pid, f"Simpler Host pid={pid}"),
@@ -67,11 +82,7 @@ def export(log_path: Path, output_dir: Path) -> dict[str, object]:
     host_count = 0
     for (pid, inv), group in by_inv.items():
         host_runner = next(
-            (
-                span
-                for span in group
-                if span.name.endswith(".runner_run") and span.attrs.get("clk") != "dev"
-            ),
+            (span for span in group if span.name.endswith(".runner_run") and span.attrs.get("clk") != "dev"),
             None,
         )
         for span in group:

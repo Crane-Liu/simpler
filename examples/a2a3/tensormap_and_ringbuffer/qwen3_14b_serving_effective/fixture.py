@@ -15,13 +15,13 @@ import argparse
 import hashlib
 import json
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import torch
 from safetensors.torch import load_file
-
 
 SCHEMA_NAME = "serving-tmr-standalone-fixture-v1"
 EXPECTED_METADATA = {
@@ -64,9 +64,7 @@ def _condition_matches(value: Any, schema: dict[str, Any]) -> bool:
     return True
 
 
-def _validate_json_schema(
-    value: Any, schema: dict[str, Any], path: str = "manifest"
-) -> None:
+def _validate_json_schema(value: Any, schema: dict[str, Any], path: str = "manifest") -> None:
     expected_type = schema.get("type")
     if expected_type is not None and not _json_type_matches(value, expected_type):
         raise ValueError(f"{path} must have JSON type {expected_type}")
@@ -111,11 +109,7 @@ def _verify_sums(root: Path) -> dict[Path, str]:
         if relative_path in expected:
             raise ValueError(f"duplicate SHA256SUMS path: {relative_path}")
         expected[relative_path] = digest
-    actual = {
-        path.relative_to(root)
-        for path in root.rglob("*")
-        if path.is_file() and path.name != "SHA256SUMS"
-    }
+    actual = {path.relative_to(root) for path in root.rglob("*") if path.is_file() and path.name != "SHA256SUMS"}
     if set(expected) != actual:
         raise ValueError(
             f"SHA256SUMS file set mismatch: missing={sorted(actual - set(expected))} "
@@ -147,15 +141,11 @@ class Fixture:
 
     def require_executable(self) -> None:
         if self.metadata_only:
-            raise RuntimeError(
-                "metadata-only fixture cannot allocate device state or execute"
-            )
+            raise RuntimeError("metadata-only fixture cannot allocate device state or execute")
 
     def iter_kv_shards(self, kind: str) -> Iterator[tuple[int, Path, str]]:
         self.require_executable()
-        entries = [
-            entry for entry in self.manifest["kv_shards"] if entry["kind"] == kind
-        ]
+        entries = [entry for entry in self.manifest["kv_shards"] if entry["kind"] == kind]
         for entry in sorted(entries, key=lambda item: int(item["layer"])):
             yield int(entry["layer"]), self.root / entry["path"], entry["tensor"]
 
@@ -219,9 +209,7 @@ class Fixture:
         rows = num_layers * num_pages * num_kv_heads * page_size
         used_page_ids = self.metadata["used_page_ids"].to(torch.long)
         host = torch.zeros((rows, head_dim), dtype=torch.bfloat16)
-        host_layers = host.view(
-            num_layers, num_pages, num_kv_heads, page_size, head_dim
-        )
+        host_layers = host.view(num_layers, num_pages, num_kv_heads, page_size, head_dim)
         entries = list(self.iter_kv_shards(kind))
         if [layer for layer, _, _ in entries] != list(range(num_layers)):
             raise ValueError(f"{kind} KV shards do not cover every layer")
@@ -235,9 +223,7 @@ class Fixture:
         return runtime.alloc_tensor(tuple(host.shape), host.dtype, init=host)
 
 
-def _validate_metadata(
-    manifest: dict[str, Any], metadata: dict[str, torch.Tensor]
-) -> None:
+def _validate_metadata(manifest: dict[str, Any], metadata: dict[str, torch.Tensor]) -> None:
     expected_names = set(EXPECTED_METADATA) | {"used_page_ids", "allocated_page_ids"}
     if set(metadata) != expected_names:
         raise ValueError("metadata tensor names do not match fixture schema v1")
@@ -254,9 +240,7 @@ def _validate_metadata(
     num_pages = int(layout["num_pages"])
     page_size = int(layout["page_size"])
     block_table = metadata["block_table"]
-    allocated = sorted(
-        {int(value) for value in block_table.flatten().tolist() if value >= 0}
-    )
+    allocated = sorted({int(value) for value in block_table.flatten().tolist() if value >= 0})
     if allocated != metadata["allocated_page_ids"].tolist():
         raise ValueError("allocated_page_ids differs from block_table")
     if not allocated or allocated[0] < 0 or allocated[-1] >= num_pages:
@@ -264,13 +248,7 @@ def _validate_metadata(
 
     prompt_tokens = int(manifest["prompt_tokens"])
     used_blocks_per_row = math.ceil(prompt_tokens / page_size)
-    used = sorted(
-        {
-            int(value)
-            for value in block_table[:, :used_blocks_per_row].flatten().tolist()
-            if value >= 0
-        }
-    )
+    used = sorted({int(value) for value in block_table[:, :used_blocks_per_row].flatten().tolist() if value >= 0})
     if used != metadata["used_page_ids"].tolist():
         raise ValueError("used_page_ids differs from the prompt block mapping")
     if len(used) != int(layout["used_page_count"]):
@@ -290,15 +268,11 @@ def _validate_metadata(
         torch.full((16,), prompt_tokens, dtype=torch.int32),
     ):
         raise ValueError("tokens_used_after_prefill is inconsistent with the prompt")
-    if not torch.equal(
-        metadata["prompt_token_ids"], metadata["prompt_token_ids"][0].repeat(16, 1)
-    ):
+    if not torch.equal(metadata["prompt_token_ids"], metadata["prompt_token_ids"][0].repeat(16, 1)):
         raise ValueError("batch prompt rows must be identical")
 
 
-def load_fixture(
-    root: Path, expected_versions: dict[str, str] | None = None
-) -> Fixture:
+def load_fixture(root: Path, expected_versions: dict[str, str] | None = None) -> Fixture:
     root = root.resolve()
     fixture_sums = _verify_sums(root)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
@@ -334,10 +308,7 @@ def load_fixture(
             raise ValueError(f"full fixture must contain {expected_shards} KV shards")
         for entry in manifest["kv_shards"]:
             path = root / entry["path"]
-            if (
-                path.stat().st_size != int(entry["bytes"])
-                or fixture_sums.get(Path(entry["path"])) != entry["sha256"]
-            ):
+            if path.stat().st_size != int(entry["bytes"]) or fixture_sums.get(Path(entry["path"])) != entry["sha256"]:
                 raise ValueError(f"KV shard checksum mismatch: {entry['path']}")
         fixture.verify_artifact_and_golden()
     return fixture
@@ -358,9 +329,7 @@ def main() -> int:
                 "schema": fixture.manifest["schema"],
                 "metadata_only": fixture.metadata_only,
                 "used_page_count": len(fixture.metadata["used_page_ids"]),
-                "decode_dispatches_remaining": fixture.manifest[
-                    "decode_dispatches_remaining"
-                ],
+                "decode_dispatches_remaining": fixture.manifest["decode_dispatches_remaining"],
             },
             sort_keys=True,
         )

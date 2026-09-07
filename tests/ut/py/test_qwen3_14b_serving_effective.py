@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 import torch
 
-
 CASE_DIR = (
     Path(__file__).resolve().parents[3]
     / "examples"
@@ -34,12 +33,8 @@ def _load_module(name: str, path: Path):
 
 
 benchmark = _load_module("qwen3_14b_tmr_benchmark", CASE_DIR / "benchmark.py")
-benchmark_dual = _load_module(
-    "qwen3_14b_tmr_benchmark_dual", CASE_DIR / "benchmark_dual.py"
-)
-trace_effective = _load_module(
-    "qwen3_14b_tmr_trace_effective", CASE_DIR / "trace_effective.py"
-)
+benchmark_dual = _load_module("qwen3_14b_tmr_benchmark_dual", CASE_DIR / "benchmark_dual.py")
+trace_effective = _load_module("qwen3_14b_tmr_trace_effective", CASE_DIR / "trace_effective.py")
 
 
 def _slot() -> dict[str, torch.Tensor]:
@@ -99,8 +94,10 @@ def test_trace_summary_uses_steady_completion_intervals(tmp_path: Path) -> None:
         common = f"[STRACE] v=1 pid=1 tid=1 inv={inv} hid=abc depth=2"
         lines.extend(
             [
-                f"{common} name=chip.run ts={timestamp} dur=40000000 dispatch_id={inv} slot_id=0 generation={inv} prepare_only=0",
-                f"{common} name=node.dispatch ts={timestamp} dur=1 dispatch_id={inv} slot_id=0 generation={inv} prepare_only=0",
+                f"{common} name=chip.run ts={timestamp} dur=40000000 "
+                f"dispatch_id={inv} slot_id=0 generation={inv} prepare_only=0",
+                f"{common} name=node.dispatch ts={timestamp} dur=1 "
+                f"dispatch_id={inv} slot_id=0 generation={inv} prepare_only=0",
                 f"{common} name=chip.run.runner_run ts={timestamp} dur=39000000",
                 f"{common} name=chip.run.runner_run.device_wall ts={timestamp} dur=38000000",
                 f"{common} name=chip.run.runner_run.device_wall.sched ts={timestamp} dur=37000000",
@@ -112,14 +109,10 @@ def test_trace_summary_uses_steady_completion_intervals(tmp_path: Path) -> None:
     log.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     rows = trace_effective.invocation_rows(trace_effective.parse_spans(log))
-    summary = trace_effective.summarize_campaign(
-        rows, warmup_runs=0, measured_runs=1, steps=2, steady_skip=1
-    )
+    summary = trace_effective.summarize_campaign(rows, warmup_runs=0, measured_runs=1, steps=2, steady_skip=1)
 
     assert summary["dispatch_contract"]["total"] == 2
-    assert summary["official_metrics"]["rts_completion_interval_ms"][
-        "pooled_steady_stats"
-    ]["mean"] == pytest.approx(40.0)
-    assert summary["official_metrics"]["effective_ms"]["pooled_steady_stats"][
-        "mean"
-    ] == pytest.approx(37.0)
+    assert summary["official_metrics"]["rts_completion_interval_ms"]["pooled_steady_stats"]["mean"] == pytest.approx(
+        40.0
+    )
+    assert summary["official_metrics"]["effective_ms"]["pooled_steady_stats"]["mean"] == pytest.approx(37.0)

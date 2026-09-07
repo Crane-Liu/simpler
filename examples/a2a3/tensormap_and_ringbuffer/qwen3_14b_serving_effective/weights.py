@@ -12,12 +12,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import torch
 from safetensors import safe_open
-
 
 NUM_LAYERS = 40
 HEAD_DIM = 128
@@ -97,17 +96,11 @@ def iter_kernel_weights(model_dir: Path) -> Iterator[tuple[str, torch.Tensor]]:
 
     embed = reader.load("model.embed_tokens.weight").to(torch.bfloat16).contiguous()
     if embed.shape[0] < PADDED_VOCAB:
-        padding = torch.zeros(
-            (PADDED_VOCAB - embed.shape[0], HIDDEN), dtype=embed.dtype
-        )
+        padding = torch.zeros((PADDED_VOCAB - embed.shape[0], HIDDEN), dtype=embed.dtype)
         embed = torch.cat((embed, padding), dim=0).contiguous()
     yield "embed_weight", embed
 
-    lm_name = (
-        "lm_head.weight"
-        if "lm_head.weight" in reader.weight_map
-        else "model.embed_tokens.weight"
-    )
+    lm_name = "lm_head.weight" if "lm_head.weight" in reader.weight_map else "model.embed_tokens.weight"
     lm_head = reader.load(lm_name).to(torch.bfloat16).contiguous()
     if lm_head.shape[0] < PADDED_VOCAB:
         padding = lm_head[:1].expand(PADDED_VOCAB - lm_head.shape[0], -1).clone()

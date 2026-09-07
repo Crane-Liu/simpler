@@ -23,7 +23,6 @@ from typing import Any
 
 import torch
 
-
 BATCH = 16
 STEPS = 127
 SAMPLED_IDS_PAD = 8
@@ -75,25 +74,17 @@ def _shared_slot_state(fixture: Any) -> list[dict[str, torch.Tensor]]:
     for _ in range(2):
         slots.append(
             {
-                "seq_lens": fixture.metadata["seq_lens_after_first_token"]
-                .clone()
-                .share_memory_(),
+                "seq_lens": fixture.metadata["seq_lens_after_first_token"].clone().share_memory_(),
                 "block_table": block_table.clone().share_memory_(),
                 "initial_block_table": block_table.clone(),
-                "slot_mapping": fixture.metadata["next_slot_mapping"]
-                .clone()
-                .share_memory_(),
-                "sampled_ids_host": torch.zeros(
-                    (BATCH, SAMPLED_IDS_PAD), dtype=torch.int32
-                ).share_memory_(),
+                "slot_mapping": fixture.metadata["next_slot_mapping"].clone().share_memory_(),
+                "sampled_ids_host": torch.zeros((BATCH, SAMPLED_IDS_PAD), dtype=torch.int32).share_memory_(),
             }
         )
     return slots
 
 
-def _update_slot(
-    slot: dict[str, torch.Tensor], golden: dict[str, torch.Tensor], step: int
-) -> None:
+def _update_slot(slot: dict[str, torch.Tensor], golden: dict[str, torch.Tensor], step: int) -> None:
     slot["seq_lens"].copy_(golden["seq_lens"][step])
     slot["slot_mapping"].copy_(golden["slot_mapping"][step])
     positions = slot["seq_lens"] - 1
@@ -164,11 +155,7 @@ def _run_sequence(
     def submit(step: int):
         slot_id = 0 if mode == "single" else step % 2
         _update_slot(slots[slot_id], golden, step)
-        token_input = (
-            resident["initial_tokens"]
-            if step == 0
-            else _sampled_value(resident, step - 1, mode)
-        )
+        token_input = resident["initial_tokens"] if step == 0 else _sampled_value(resident, step - 1, mode)
         values = {
             **resident["weights"],
             **slots[slot_id],
@@ -195,7 +182,7 @@ def _run_sequence(
             row = read_sampled_ids(slot_id, step)
             token_rows.append(row)
     else:
-        pending = []
+        pending: list[tuple[int, int, Any]] = []
         completed = []
         for step in range(min(2, steps)):
             slot_id, handle = submit(step)
@@ -210,19 +197,17 @@ def _run_sequence(
                 next_slot, next_handle = submit(next_step)
                 pending.append((next_step, next_slot, next_handle))
                 next_step += 1
-        token_rows.extend(
-            read_sampled_ids(slot_id, step) for step, slot_id in completed
-        )
+        token_rows.extend(read_sampled_ids(slot_id, step) for step, slot_id in completed)
 
-    expected = golden["decode_output_token_ids"][:steps].tolist()
+    expected: list[list[int]] = golden["decode_output_token_ids"][:steps].tolist()
     if token_rows != expected:
-        for step, (actual, wanted) in enumerate(zip(token_rows, expected, strict=True)):
+        if len(token_rows) != len(expected):
+            raise RuntimeError("golden token sequence length mismatch")
+        for step, (actual, wanted) in enumerate(zip(token_rows, expected)):
             if actual != wanted:
                 raise RuntimeError(f"golden token mismatch at decode step {step}")
         raise RuntimeError("golden token sequence mismatch")
-    intervals = [
-        (right - left) * 1000.0 for left, right in zip(completions, completions[1:])
-    ]
+    intervals = [(right - left) * 1000.0 for left, right in zip(completions, completions[1:])]
     return {
         "wall_s": time.perf_counter() - started,
         "completion_intervals_ms": intervals,
@@ -235,9 +220,7 @@ def main() -> int:
     args = _parse_args()
     if args.qualification_steps is not None:
         if args.profile_only or not 1 <= args.qualification_steps <= STEPS:
-            raise ValueError(
-                "qualification_steps must be in [1, 127] and cannot profile"
-            )
+            raise ValueError("qualification_steps must be in [1, 127] and cannot profile")
         args.warmup_runs = 0
         args.measured_runs = 1
         args.inter_run_wait = 0.0
@@ -255,12 +238,8 @@ def main() -> int:
         raise FileExistsError(args.output_dir)
     args.output_dir.mkdir(parents=True)
 
-    fixture_module = _load_module(
-        args.fixture_module.resolve(), "_serving_effective_fixture"
-    )
-    weights_module = _load_module(
-        args.weights_module.resolve(), "_serving_effective_weights"
-    )
+    fixture_module = _load_module(args.fixture_module.resolve(), "_serving_effective_fixture")
+    weights_module = _load_module(args.weights_module.resolve(), "_serving_effective_weights")
     fixture = fixture_module.load_fixture(
         args.fixture,
         expected_versions=None,
@@ -274,27 +253,23 @@ def main() -> int:
     if args.artifact_work_dir.exists():
         raise FileExistsError(args.artifact_work_dir)
     shutil.copytree(artifact_source, args.artifact_work_dir)
-    decode_dir = (
-        args.artifact_work_dir / artifact_manifest["programs"]["decode"]["path"]
-    )
+    decode_dir = args.artifact_work_dir / artifact_manifest["programs"]["decode"]["path"]
     distributed_meta = json.loads((decode_dir / "distributed_meta.json").read_text())
     param_names = [_base_name(param["name"]) for param in distributed_meta["params"]]
     if len(param_names) not in {25, 26}:
         raise ValueError(f"unsupported decode ABI with {len(param_names)} parameters")
     sampled_ids_host_abi = "sampled_ids_host" in param_names
 
-    from pypto.ir.distributed_compiled_program import (
+    from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415 -- hardware-only dependency
         DistributedCompiledProgram,
         DistributedConfig,
     )
-    from pypto.runtime import RunConfig
+    from pypto.runtime import RunConfig  # noqa: PLC0415 -- hardware-only dependency
 
     distributed = DistributedConfig(
         device_ids=[args.device_id],
         runtime="tensormap_and_ringbuffer",
-        aicpu_thread_num=int(
-            distributed_meta["distributed_config"]["aicpu_thread_num"]
-        ),
+        aicpu_thread_num=int(distributed_meta["distributed_config"]["aicpu_thread_num"]),
     )
     compiled = DistributedCompiledProgram.from_dir(
         decode_dir,
@@ -313,20 +288,12 @@ def main() -> int:
     with compiled.prepare(config=run_config) as rt:
         device_weights = {}
         for name, host in weights_module.iter_kernel_weights(args.model_dir.resolve()):
-            device_weights[name] = rt.alloc_tensor(
-                tuple(host.shape), host.dtype, init=host
-            )
+            device_weights[name] = rt.alloc_tensor(tuple(host.shape), host.dtype, init=host)
             del host
             gc.collect()
-        rope_cos_host, rope_sin_host = weights_module.rope_tables(
-            args.model_dir.resolve()
-        )
-        rope_cos = rt.alloc_tensor(
-            tuple(rope_cos_host.shape), rope_cos_host.dtype, init=rope_cos_host
-        )
-        rope_sin = rt.alloc_tensor(
-            tuple(rope_sin_host.shape), rope_sin_host.dtype, init=rope_sin_host
-        )
+        rope_cos_host, rope_sin_host = weights_module.rope_tables(args.model_dir.resolve())
+        rope_cos = rt.alloc_tensor(tuple(rope_cos_host.shape), rope_cos_host.dtype, init=rope_cos_host)
+        rope_sin = rt.alloc_tensor(tuple(rope_sin_host.shape), rope_sin_host.dtype, init=rope_sin_host)
         del rope_cos_host, rope_sin_host
         k_cache = fixture.allocate_kv(rt, "key")
         v_cache = fixture.allocate_kv(rt, "value")
@@ -339,17 +306,12 @@ def main() -> int:
             "out": (
                 rt.alloc_tensor((BATCH, PADDED_VOCAB), torch.float32)
                 if args.mode == "single"
-                else [
-                    rt.alloc_tensor((BATCH, PADDED_VOCAB), torch.float32)
-                    for _ in range(2)
-                ]
+                else [rt.alloc_tensor((BATCH, PADDED_VOCAB), torch.float32) for _ in range(2)]
             ),
             "next_hidden": (
                 rt.alloc_tensor((BATCH, HIDDEN), torch.bfloat16)
                 if args.mode == "single"
-                else [
-                    rt.alloc_tensor((BATCH, HIDDEN), torch.bfloat16) for _ in range(2)
-                ]
+                else [rt.alloc_tensor((BATCH, HIDDEN), torch.bfloat16) for _ in range(2)]
             ),
             "initial_tokens": rt.alloc_tensor((BATCH, SAMPLED_IDS_PAD), torch.int32),
             "sampled": [
@@ -390,8 +352,7 @@ def main() -> int:
             if args.profile_only
             else "formal_performance"
         ),
-        "official_performance": not args.profile_only
-        and args.qualification_steps is None,
+        "official_performance": not args.profile_only and args.qualification_steps is None,
         "scenario": {
             "runtime": "tensormap_and_ringbuffer",
             "mode": args.mode,
@@ -414,10 +375,7 @@ def main() -> int:
         "runs": runs,
         "correctness": {
             "all_runs_valid": all(run["valid"] for run in runs),
-            "cross_run_tokens_identical": len(
-                {json.dumps(run["token_rows"]) for run in runs}
-            )
-            == 1,
+            "cross_run_tokens_identical": len({json.dumps(run["token_rows"]) for run in runs}) == 1,
             "golden_tokens_identical": True,
         },
     }

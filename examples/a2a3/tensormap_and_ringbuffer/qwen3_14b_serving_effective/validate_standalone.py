@@ -68,9 +68,7 @@ def main() -> int:
         raise ValueError("artifact SHA256SUMS differs from the frozen stack manifest")
 
     fixture_module = _load_module(args.fixture_module.resolve())
-    fixture = fixture_module.load_fixture(
-        args.fixture.resolve(), expected_versions=None
-    )
+    fixture = fixture_module.load_fixture(args.fixture.resolve(), expected_versions=None)
     fixture.require_executable()
     fixture.verify_external_inputs(args.model_dir.resolve())
     golden = fixture.load_golden()
@@ -89,10 +87,7 @@ def main() -> int:
     if len(params) != 25 or "sampled_ids" not in params or "sampled_ids_host" in params:
         raise ValueError("expected the compare1_compat 25-parameter decode ABI")
     config = decode_meta["distributed_config"]
-    if (
-        config["runtime"] != "tensormap_and_ringbuffer"
-        or config["aicpu_thread_num"] != 4
-    ):
+    if config["runtime"] != "tensormap_and_ringbuffer" or config["aicpu_thread_num"] != 4:
         raise ValueError("decode runtime configuration differs from compare1_compat")
 
     result = {
