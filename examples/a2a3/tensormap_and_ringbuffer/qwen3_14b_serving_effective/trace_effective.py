@@ -182,10 +182,12 @@ def summarize_campaign(
             raise ValueError(f"run {run_index + 1} root completions are not strictly increasing")
 
         interval_values = [
-            (completions[index] - completions[index - 1]) / 1_000_000.0 for index in range(steady_skip, steps)
+            (completions[index] - completions[index - 1]) / 1_000_000.0 for index in range(max(1, steady_skip), steps)
         ]
-        metric_stats = {"rts_completion_interval_ms": _stats(interval_values)}
-        pooled["rts_completion_interval_ms"].extend(interval_values)
+        metric_stats = {}
+        if interval_values:
+            metric_stats["rts_completion_interval_ms"] = _stats(interval_values)
+            pooled["rts_completion_interval_ms"].extend(interval_values)
         for metric in latency_metrics:
             values = [float(row[metric]) for row in steady_rows]
             metric_stats[metric] = _stats(values)
@@ -207,6 +209,8 @@ def summarize_campaign(
 
     official = {}
     for metric, values in pooled.items():
+        if not values:
+            continue
         run_means = [float(run["metrics"][metric]["mean"]) for run in run_summaries]
         official[metric] = {
             "run_means": run_means,

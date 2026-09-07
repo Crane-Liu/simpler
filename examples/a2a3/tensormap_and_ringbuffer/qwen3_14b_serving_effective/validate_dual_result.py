@@ -54,6 +54,11 @@ def main() -> int:
 
     rows = invocation_rows(parse_spans(args.result / "run.log"))
     _require(len(rows) == args.steps, "native dispatch count mismatch")
+    dispatch_ids = [int(row["dispatch_id"]) for row in rows]
+    _require(
+        all(current == previous + 1 for previous, current in zip(dispatch_ids, dispatch_ids[1:])),
+        "native dispatch IDs are not contiguous",
+    )
     expected_slots = [index % 2 for index in range(args.steps)]
     actual_slots = [int(row["slot_id"]) for row in rows]
     _require(actual_slots == expected_slots, "native slots do not strictly alternate")
@@ -114,12 +119,14 @@ def main() -> int:
         "prepare_only_after_first": True,
         "device_runner_serial": True,
         "full_128_output_token_ids_sha256": full_output_sha,
-        "rts_completion_interval_ms": trace["official_metrics"]["rts_completion_interval_ms"]["pooled_steady_stats"],
         "runner_run_ms": trace["official_metrics"]["runner_run_ms"]["pooled_steady_stats"],
         "effective_ms": effective,
         "effective_over_50ms_count": sum(float(row["effective_ms"]) > 50.0 for row in rows[steady_skip:]),
         "effective_over_70ms_count": sum(float(row["effective_ms"]) > 70.0 for row in rows[steady_skip:]),
     }
+    rts_metric = trace["official_metrics"].get("rts_completion_interval_ms")
+    if rts_metric is not None:
+        result["rts_completion_interval_ms"] = rts_metric["pooled_steady_stats"]
     output = args.result / "dual_validation.json"
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps(result, indent=2, sort_keys=True))

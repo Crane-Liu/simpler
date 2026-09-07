@@ -77,6 +77,7 @@ def _shared_slot_state(fixture: Any) -> list[dict[str, torch.Tensor]]:
                 "seq_lens": fixture.metadata["seq_lens_after_first_token"].clone().share_memory_(),
                 "block_table": block_table.clone().share_memory_(),
                 "initial_block_table": block_table.clone(),
+                "page_size": torch.tensor(int(fixture.manifest["physical_layout"]["page_size"])),
                 "slot_mapping": fixture.metadata["next_slot_mapping"].clone().share_memory_(),
                 "sampled_ids_host": torch.zeros((BATCH, SAMPLED_IDS_PAD), dtype=torch.int32).share_memory_(),
             }
@@ -84,16 +85,25 @@ def _shared_slot_state(fixture: Any) -> list[dict[str, torch.Tensor]]:
     return slots
 
 
-def _update_slot(slot: dict[str, torch.Tensor], golden: dict[str, torch.Tensor], step: int) -> None:
+def _update_slot(
+    slot: dict[str, torch.Tensor],
+    golden: dict[str, torch.Tensor],
+    step: int,
+) -> None:
     slot["seq_lens"].copy_(golden["seq_lens"][step])
     slot["slot_mapping"].copy_(golden["slot_mapping"][step])
     positions = slot["seq_lens"] - 1
-    if not torch.equal(slot["slot_mapping"].remainder(128), positions.remainder(128)):
+    page_size = int(slot["page_size"])
+    if not torch.equal(
+        slot["slot_mapping"].remainder(page_size),
+        positions.remainder(page_size),
+    ):
         raise RuntimeError(f"slot mapping offset mismatch at decode step {step}")
-    logical_blocks = positions.div(128, rounding_mode="floor")
-    page_ids = slot["slot_mapping"].div(128, rounding_mode="floor")
+    logical_blocks = positions.div(page_size, rounding_mode="floor")
+    page_ids = slot["slot_mapping"].div(page_size, rounding_mode="floor")
+    block_table_stride = slot["block_table"].numel() // BATCH
     for row in range(BATCH):
-        slot["block_table"][row * 32 + int(logical_blocks[row])] = page_ids[row]
+        slot["block_table"][row * block_table_stride + int(logical_blocks[row])] = page_ids[row]
     slot["sampled_ids_host"].zero_()
 
 
