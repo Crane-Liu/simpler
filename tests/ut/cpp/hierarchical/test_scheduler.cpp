@@ -2182,6 +2182,72 @@ TEST_F(ProgressSchedulerFixture, SuccessorStagesButActivatesOnlyAfterFifoPromoti
     if (orchestrator.run_done(second_run)) orchestrator.release_run(second_run);
 }
 
+TEST_F(ProgressSchedulerFixture, ReadySuccessorCannotExecuteBeforePendingPredecessorTail) {
+    auto wait_for_activation_progress = [this] {
+        for (int pass = 0; pass < 2; ++pass) {
+            const uint64_t before = scheduler.dispatch_round_count();
+            scheduler.notify_ready();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (scheduler.dispatch_round_count() <= before) {
+                if (std::chrono::steady_clock::now() >= deadline) return false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            // Dispatch requests activation; the following loop's progress
+            // delivers it. The mutex brackets each entire dispatch pass.
+            std::scoped_lock lock(scheduler.loop_mutex());
+        }
+        return true;
+    };
+    const RunId first_run = orchestrator.begin_run();
+    const auto first =
+        orchestrator.submit_next_level(C(81), single_tensor_args(0x8100, TensorArgType::OUTPUT), config, 0);
+    auto tail_args = single_tensor_args(0x8200, TensorArgType::OUTPUT);
+    tail_args.add_dep_wait(first);
+    const auto tail = orchestrator.submit_next_level(C(82), tail_args, config, 0);
+    orchestrator.close_run_submission(first_run);
+    ASSERT_TRUE(endpoint0->wait_submitted(1));
+    EXPECT_EQ(allocator.slot_state(tail.task_slot)->state.load(), TaskState::PENDING);
+
+    const RunId second_run = orchestrator.begin_run();
+    const auto successor =
+        orchestrator.submit_next_level(C(83), single_tensor_args(0x8200, TensorArgType::INPUT), config, 1);
+    orchestrator.close_run_submission(second_run);
+    ASSERT_TRUE(endpoint1->wait_submitted(1));
+    const auto staged = endpoint1->submitted().front();
+    EXPECT_EQ(staged.task_slot, successor.task_slot);
+    ASSERT_TRUE(staged.prepare_only);
+    ASSERT_TRUE(wait_for_activation_progress());
+    EXPECT_EQ(orchestrator.dispatchable_run_id(), first_run);
+    EXPECT_FALSE(endpoint1->wait_activated(second_run, std::chrono::milliseconds(0)));
+
+    const auto first_dispatch = endpoint0->submitted().front();
+    EXPECT_EQ(first_dispatch.task_slot, first.task_slot);
+    endpoint0->emit(WorkerProgressKind::ACCEPTED, first_dispatch);
+    endpoint0->emit(WorkerProgressKind::COMPLETED, first_dispatch);
+    ASSERT_TRUE(endpoint0->wait_submitted(2));
+    const auto tail_dispatch = endpoint0->submitted().back();
+    EXPECT_EQ(tail_dispatch.task_slot, tail.task_slot);
+    EXPECT_FALSE(tail_dispatch.prepare_only);
+    endpoint0->emit(WorkerProgressKind::ACCEPTED, tail_dispatch);
+    ASSERT_TRUE(wait_for_activation_progress());
+    ASSERT_TRUE(orchestrator.run_accepted(first_run));
+    EXPECT_FALSE(orchestrator.run_done(first_run));
+    EXPECT_EQ(orchestrator.dispatchable_run_id(), first_run);
+    EXPECT_FALSE(endpoint1->wait_activated(second_run, std::chrono::milliseconds(0)));
+
+    endpoint0->emit(WorkerProgressKind::COMPLETED, tail_dispatch);
+    ASSERT_TRUE(endpoint1->wait_activated(second_run));
+    EXPECT_TRUE(orchestrator.run_done(first_run));
+    EXPECT_EQ(orchestrator.dispatchable_run_id(), second_run);
+    endpoint1->emit(WorkerProgressKind::ACCEPTED, staged);
+    endpoint1->emit(WorkerProgressKind::COMPLETED, staged);
+    ASSERT_TRUE(orchestrator.wait_run_for(second_run, 3.0));
+    EXPECT_FALSE(orchestrator.run_failed(first_run));
+    EXPECT_FALSE(orchestrator.run_failed(second_run));
+    orchestrator.release_run(first_run);
+    orchestrator.release_run(second_run);
+}
+
 // A diagnostics config once took the active FIFO lane instead of the prepared
 // one, because collector setup wrote runner-global state during preparation.
 // That state is now built and reset under the execution claim, so a diagnostic

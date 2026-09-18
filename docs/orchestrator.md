@@ -123,6 +123,20 @@ enqueued and before stream synchronization, with endpoints lacking an earlier
 signal falling back to completion — but it no longer gates the next callback.
 Each run still owns its completion error, keepalives, and cleanup independently.
 
+`close_run_submission()` closes task declarations; tasks may still be PENDING
+or READY. A second `begin_run()` is rejected while construction remains open,
+but the executing FIFO head can dispatch tasks before its callback returns.
+An eligible successor may be sent to its endpoint with `prepare_only` while
+the predecessor executes. Closing submission or accepting every predecessor
+task does not activate that successor: the current FIFO advances only when
+the predecessor becomes terminal. A successor promoted while its callback is
+still open may then execute its ready tasks.
+
+Python direct-control calls inside a callback must precede its first task
+submission and wait for that run to hold the FIFO head. Ownerless control
+requires the Worker's control reservation and quiescence. Device-touching
+run cleanup additionally retains its ordered-cleanup barrier until published.
+
 Remote L3 submit adds two hidden pieces of metadata: final eligible worker-id
 sets and optional `RemoteTaskArgsSidecar` entries aligned by tensor index.
 Python `RemoteCallable` handles supply callable eligibility, and

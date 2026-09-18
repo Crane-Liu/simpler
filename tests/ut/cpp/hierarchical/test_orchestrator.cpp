@@ -205,6 +205,26 @@ TEST(ReadyQueueTest, UnscopedAccessPreservesRunInsertionOrder) {
     EXPECT_TRUE(queue.empty());
 }
 
+TEST(ReadyQueueTest, EmptyPartitionDoesNotReserveAFutureRunPosition) {
+    ReadyQueue queue;
+    queue.push(7, 70);
+    TaskSlot slot = INVALID_SLOT;
+    ASSERT_TRUE(queue.try_pop(slot));
+    EXPECT_EQ(slot, 70);
+    queue.push(8, 80);
+    queue.push(7, 71);
+
+    // Unscoped access follows nonempty partition insertion order. Scoped
+    // access selects the active run even when its partition was re-created.
+    ASSERT_TRUE(queue.try_front(slot));
+    EXPECT_EQ(slot, 80);
+    ASSERT_TRUE(queue.try_pop(7, slot));
+    EXPECT_EQ(slot, 71);
+    ASSERT_TRUE(queue.try_pop(slot));
+    EXPECT_EQ(slot, 80);
+    EXPECT_TRUE(queue.empty());
+}
+
 TEST_F(OrchestratorFixture, IndependentTaskIsImmediatelyReady) {
     auto a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level(C(42), a, cfg, 0);
@@ -1130,6 +1150,7 @@ TEST_F(OrchestratorFixture, ReleasedLeaseMakesTheRunUndispatchable) {
 }
 
 TEST_F(OrchestratorFixture, FifoHeadCanExecuteWhileGraphConstructionIsOpen) {
+    EXPECT_THROW(orch.begin_run(), std::logic_error);
     EXPECT_TRUE(orch.can_dispatch_run(run_id));
     auto task = orch.submit_next_level(C(89), single_tensor_args(0x8900, TensorArgType::OUTPUT), cfg, 0);
 
@@ -1139,6 +1160,7 @@ TEST_F(OrchestratorFixture, FifoHeadCanExecuteWhileGraphConstructionIsOpen) {
     S(task.task_slot).state.store(TaskState::COMPLETED, std::memory_order_release);
     ASSERT_TRUE(orch.on_consumed(task.task_slot));
     EXPECT_FALSE(orch.run_done(run_id));
+    EXPECT_THROW(orch.begin_run(), std::logic_error);
 
     orch.close_run_submission(run_id);
     EXPECT_TRUE(orch.run_done(run_id));
