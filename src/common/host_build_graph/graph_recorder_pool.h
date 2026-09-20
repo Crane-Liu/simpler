@@ -108,7 +108,7 @@ public:
             return false;
         }
         PendingJob &pending = jobs_[job_tail_];
-        pending.function = std::move(next);
+        pending.function.swap(next);
         pending.args = &args;
         pending.owner = owner;
         job_tail_ = (job_tail_ + 1) % kJobCapacity;
@@ -256,7 +256,8 @@ private:
                 });
                 if (stopping_ && job_count_ == 0) return;
                 PendingJob &pending = jobs_[job_head_];
-                current.function = std::move(pending.function);
+                // The queue slot releases its closure before the job can finish.
+                current.function.swap(pending.function);
                 current.args = pending.args;
                 current.owner = pending.owner;
                 pending.args = nullptr;
