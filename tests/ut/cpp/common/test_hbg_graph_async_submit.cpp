@@ -15,6 +15,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <future>
+#include <memory>
 #include <cstdint>
 #include <mutex>
 #include <set>
@@ -223,12 +225,12 @@ GraphAsyncRecordingState &test_pool() {
     return pool;
 }
 
-bool fake_graph_record_start(RuntimeContext *, const GraphTaskArgs &args, void *job) {
+bool fake_graph_record_start(RuntimeContext *rt, const GraphTaskArgs &args, void *job) {
     auto *record = static_cast<std::function<void(const GraphTaskArgs &)> *>(job);
-    return test_pool().start(args, std::move(*record));
+    return test_pool().start(args, std::move(*record), rt);
 }
 
-void fake_graph_record_wait(RuntimeContext *) { test_pool().wait(); }
+void fake_graph_record_wait(RuntimeContext *rt) { test_pool().wait(rt); }
 
 const RuntimeOps kFakeOps = {
     .scope_begin = fake_scope_begin,
@@ -284,6 +286,93 @@ TEST(HbgGraphAsyncSubmit, PrewarmedRecorderPoolGrowsPastThePrewarmedCount) {
     EXPECT_TRUE(all_entered) << "every Graph recording must start before any one of them finishes";
     EXPECT_EQ(worker_ids.size(), static_cast<size_t>(kGraphCount))
         << "a concurrent miss past the prewarmed count must grow the pool instead of queueing";
+}
+
+TEST(HbgGraphAsyncSubmit, OwnerWaitIncludesClosureDestructionAcrossReuse) {
+    GraphAsyncRecordingState pool;
+    GraphTaskArgs args;
+    int owner = 0;
+    struct Capture {
+        explicit Capture(std::shared_future<void> release) :
+            released(std::move(release)) {}
+        ~Capture() {
+            destroying.set_value();
+            EXPECT_EQ(released.wait_for(kHandshakeTimeout), std::future_status::ready);
+        }
+        std::promise<void> destroying;
+        std::shared_future<void> released;
+    };
+    for (int round = 0; round < 2; ++round) {
+        SCOPED_TRACE(round);
+        std::promise<void> release;
+        auto capture = std::make_shared<Capture>(release.get_future().share());
+        auto destroying = capture->destroying.get_future();
+        const bool queued = pool.start(args, [capture = std::move(capture)](const GraphTaskArgs &) {}, &owner);
+        EXPECT_TRUE(queued);
+        EXPECT_EQ(destroying.wait_for(kHandshakeTimeout), std::future_status::ready);
+        std::promise<void> wait_entered;
+        auto waiting = std::async(std::launch::async, [&]() {
+            wait_entered.set_value();
+            pool.wait(&owner);
+        });
+        EXPECT_EQ(wait_entered.get_future().wait_for(kHandshakeTimeout), std::future_status::ready);
+        const auto status = waiting.wait_for(std::chrono::milliseconds(100));
+        release.set_value();
+        waiting.get();
+        EXPECT_EQ(status, std::future_status::timeout);
+    }
+}
+
+TEST(HbgGraphAsyncSubmit, OwnerWaitCountsQueuedJobsAndExcludesRejectedJobs) {
+    GraphAsyncRecordingState pool;
+    GraphTaskArgs args;
+    int running_owner = 0, queued_owner = 0, rejected_owner = 0;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::array<std::promise<void>, GRAPH_MAX_DEFINITIONS> entered;
+    std::atomic<size_t> completed{0};
+    for (auto &signal : entered) {
+        EXPECT_TRUE(pool.start(
+            args,
+            [&signal, &released](const GraphTaskArgs &) {
+                signal.set_value();
+                released.wait();
+            },
+            &running_owner
+        ));
+    }
+    for (auto &signal : entered) {
+        EXPECT_EQ(signal.get_future().wait_for(kHandshakeTimeout), std::future_status::ready);
+    }
+    for (size_t i = 0; i < GRAPH_MAX_DEFINITIONS; ++i) {
+        EXPECT_TRUE(pool.start(
+            args,
+            [&](const GraphTaskArgs &) {
+                pool.wait(&queued_owner);
+                ++completed;
+            },
+            &queued_owner
+        ));
+    }
+    EXPECT_FALSE(pool.start(args, [](const GraphTaskArgs &) {}, &rejected_owner));
+    auto rejected_wait = std::async(std::launch::async, [&]() {
+        pool.wait(&rejected_owner);
+    });
+    std::promise<void> queued_wait_entered;
+    auto queued_wait = std::async(std::launch::async, [&]() {
+        queued_wait_entered.set_value();
+        pool.wait(&queued_owner);
+    });
+    const auto rejected_status = rejected_wait.wait_for(kHandshakeTimeout);
+    EXPECT_EQ(queued_wait_entered.get_future().wait_for(kHandshakeTimeout), std::future_status::ready);
+    const auto queued_status = queued_wait.wait_for(std::chrono::milliseconds(100));
+    release.set_value();
+    rejected_wait.get();
+    queued_wait.get();
+    pool.wait(&running_owner);
+    EXPECT_EQ(rejected_status, std::future_status::ready);
+    EXPECT_EQ(queued_status, std::future_status::timeout);
+    EXPECT_EQ(completed.load(), GRAPH_MAX_DEFINITIONS);
 }
 
 TEST(HbgGraphAsyncSubmit, FourDistinctGraphMissesDoNotInsertAnIntermediateCommit) {

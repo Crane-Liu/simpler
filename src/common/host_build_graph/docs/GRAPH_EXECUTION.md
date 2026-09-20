@@ -430,8 +430,11 @@ Definition's `required_heap`, patches the task descriptor and the shell's
 Definition address, and lets the image be prepared. That wait is on recording
 *state*, not on the recorder pool: a job returns from `graph_end` before its own
 captures are destroyed, so the host orchestration entry's scope guard joins the
-pool separately, on both normal return and exception unwinding, before the build
-state those jobs borrow goes out of scope. A scope transition is deliberately
+jobs belonging to this bind's `RuntimeContext` separately, on both normal return
+and exception unwinding, before the build state those jobs borrow goes out of
+scope. Completion includes capture destruction. An independent bind can finish
+while another bind's recorder is still running; both continue to share the pool's
+worker and queue capacity. A scope transition is deliberately
 not a barrier either: the main thread has already submitted the outer Graph shell
 into that scope, while scopes executed by a recording thread are no-ops on the
 real scope stack.

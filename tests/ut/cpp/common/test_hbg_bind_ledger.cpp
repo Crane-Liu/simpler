@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_set>
@@ -1094,6 +1095,47 @@ TEST_F(HbgBindLedgerTest, ThrowingBindDrainsRecordersBeforeReleasingBuildState) 
     // A later bind can use the same runtime after the failed build is drained.
     eps_ = {empty_orch_entry, empty_orch_bind};
     EXPECT_EQ(bind(runtime, args, nullptr, 0), 0);
+}
+
+TEST_F(HbgBindLedgerTest, BindDrainsItsRecordersWithoutJoiningAnotherRuntime) {
+    for (bool throws : {false, true}) {
+        SCOPED_TRACE(throws);
+        RecordingLifetime recording;
+        recording.throw_from_entry = throws;
+        auto recording_scope = enter_recording(recording);
+        Runtime runtime;
+        init_runtime(runtime);
+        auto runtime_cleanup = cleanup_runtime(runtime);
+        ChipStorageTaskArgs args;
+        RuntimeContext other{};
+        GraphTaskArgs boundary;
+        std::promise<void> entered, release;
+        auto released = release.get_future().share();
+        std::function<void(const GraphTaskArgs &)> job = [&](const GraphTaskArgs &) {
+            entered.set_value();
+            released.wait();
+        };
+        ASSERT_TRUE(graph_record_start_impl(&other, boundary, &job));
+        auto job_cleanup = RAIIScopeGuard([&]() {
+            release.set_value();
+            graph_record_wait_impl(&other);
+        });
+        ASSERT_EQ(entered.get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        auto binding = std::async(std::launch::async, [&]() {
+            if (throws) {
+                EXPECT_THROW(bind(runtime, args, nullptr, 0), std::runtime_error);
+            } else {
+                EXPECT_EQ(bind(runtime, args, nullptr, 0), 0);
+            }
+            EXPECT_EQ(recording.wait_calls, 1);
+        });
+        const auto status = binding.wait_for(std::chrono::seconds(5));
+        release.set_value();
+        graph_record_wait_impl(&other);
+        job_cleanup.dismiss();
+        binding.get();
+        EXPECT_EQ(status, std::future_status::ready) << "bind waited for another runtime's recorder";
+    }
 }
 
 TEST_F(HbgHostAccessContractTest, HostInputIsReadableDuringBindAndInoutWritesReachBothCopies) {

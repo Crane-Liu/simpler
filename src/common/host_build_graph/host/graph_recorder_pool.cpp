@@ -34,12 +34,12 @@ bool graph_recorder_prewarm() { return graph_recorder_pool().prewarm(); }
 // either way: the caller's std::function destructs on its own side.
 //
 // `args` is the in-flight entry's own boundary, which outlives every job that reads it
-// (graph_commit drains the pool before freeing an entry), so the pool forwards it by
+// (the bind or explicit commit drains that owner's jobs first), so the pool forwards it by
 // reference rather than copying it.
-bool graph_record_start_impl(RuntimeContext *, const GraphTaskArgs &args, void *job) {
+bool graph_record_start_impl(RuntimeContext *rt, const GraphTaskArgs &args, void *job) {
     if (job == nullptr) return false;
     auto *record = static_cast<std::function<void(const GraphTaskArgs &)> *>(job);
-    return graph_recorder_pool().start(args, std::move(*record));
+    return graph_recorder_pool().start(args, std::move(*record), rt);
 }
 
-void graph_record_wait_impl(RuntimeContext *) { graph_recorder_pool().wait(); }
+void graph_record_wait_impl(RuntimeContext *rt) { graph_recorder_pool().wait(rt); }

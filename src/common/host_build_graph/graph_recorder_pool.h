@@ -26,7 +26,7 @@
  * sound and are relied on here:
  *
  *   - No job outlives the bind that queued it. The host entry's scope guard
- *     drains the pool on both normal return and exception unwinding, before its
+ *     drains that bind's jobs on both normal return and exception unwinding, before its
  *     build state is released. A job's code cannot still be queued when the
  *     caller subsequently unregisters the callable and dlcloses its .so.
  *   - The runtime a job binds to is a plain global in its own .so
@@ -50,6 +50,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -87,11 +88,11 @@ public:
     // `args` is the in-flight entry's own boundary and is only forwarded, never copied:
     // the entry outlives every job that reads it. graph_commit frees an entry only once
     // every recording has left RECORDING, and the host orchestration entry's scope guard
-    // joins this pool before its build state is released. Const because that boundary is
+    // joins its own jobs before its build state is released. Const because that boundary is
     // shared -- the submitting thread compares later same-key submissions against it
     // while a worker records.
     template <typename Job>
-    bool start(const GraphTaskArgs &args, Job &&job) {
+    bool start(const GraphTaskArgs &args, Job &&job, const void *owner = nullptr) {
         std::function<void(const GraphTaskArgs &)> next;
         try {
             next = std::forward<Job>(job);
@@ -101,9 +102,15 @@ public:
 
         std::unique_lock<std::mutex> lock(mutex_);
         if (stopping_ || job_count_ == kJobCapacity) return false;
+        try {
+            if (owner != nullptr) ++pending_by_owner_[owner];
+        } catch (...) {
+            return false;
+        }
         PendingJob &pending = jobs_[job_tail_];
         pending.function = std::move(next);
         pending.args = &args;
+        pending.owner = owner;
         job_tail_ = (job_tail_ + 1) % kJobCapacity;
         job_count_++;
         const size_t desired_workers = std::min(kMaxWorkerCount, job_count_ + active_jobs_);
@@ -115,11 +122,14 @@ public:
             PendingJob &rollback = jobs_[job_tail_];
             rollback.function = {};
             rollback.args = nullptr;
+            finish_owner_locked(rollback.owner);
+            rollback.owner = nullptr;
             job_count_--;
             return false;
         }
         lock.unlock();
-        cv_.notify_one();
+        // Workers and owner-specific waiters share this condition variable.
+        cv_.notify_all();
         // graph_begin() has already installed the keyed in-flight entry and
         // submitted the zero-heap outer shell. Enqueuing the private job is
         // therefore the last dependency of the caller; graph_prepare() and the
@@ -127,15 +137,19 @@ public:
         return true;
     }
 
-    // Wait for every queued and running recording. A recording thread returns
+    // A non-null owner waits for its queued and running jobs, including closure
+    // destruction. The caller keeps the owner alive through its final drain;
+    // no submitting thread may enqueue more of that owner's jobs afterwards.
+    // A null owner drains the whole pool. A recording thread returns
     // immediately: it may reach this through rt_orchestration_done in a Graph body
     // and must never wait for its own job, nor for a sibling's — the sibling makes
     // progress independently and waiting on it would trade a recording thread for
     // nothing.
-    void wait() {
+    void wait(const void *owner = nullptr) {
         std::unique_lock<std::mutex> lock(mutex_);
         if (is_worker_thread_locked(std::this_thread::get_id())) return;
         cv_.wait(lock, [&]() {
+            if (owner != nullptr) return pending_by_owner_.find(owner) == pending_by_owner_.end();
             return job_count_ == 0 && active_jobs_ == 0;
         });
     }
@@ -185,7 +199,14 @@ private:
         std::function<void(const GraphTaskArgs &)> function;
         // The in-flight entry's boundary. Borrowed, not owned -- see start().
         const GraphTaskArgs *args{nullptr};
+        const void *owner{nullptr};
     };
+
+    void finish_owner_locked(const void *owner) {
+        if (owner == nullptr) return;
+        auto it = pending_by_owner_.find(owner);
+        if (--it->second == 0) pending_by_owner_.erase(it);
+    }
 
     bool is_worker_thread_locked(std::thread::id id) const {
         for (const std::thread &worker : workers_) {
@@ -237,7 +258,9 @@ private:
                 PendingJob &pending = jobs_[job_head_];
                 current.function = std::move(pending.function);
                 current.args = pending.args;
+                current.owner = pending.owner;
                 pending.args = nullptr;
+                pending.owner = nullptr;
                 job_head_ = (job_head_ + 1) % kJobCapacity;
                 job_count_--;
                 active_jobs_++;
@@ -247,6 +270,7 @@ private:
             {
                 std::scoped_lock lock(mutex_);
                 active_jobs_--;
+                finish_owner_locked(current.owner);
             }
             cv_.notify_all();
         }
@@ -275,6 +299,7 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::array<PendingJob, kJobCapacity> jobs_;
+    std::unordered_map<const void *, size_t> pending_by_owner_;
     size_t job_head_{0};
     size_t job_tail_{0};
     size_t job_count_{0};
