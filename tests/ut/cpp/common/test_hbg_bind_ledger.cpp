@@ -1196,6 +1196,24 @@ TEST_F(HbgHostAccessContractTest, ChildMemoryInputUsesItsCurrentDeviceBytesDurin
     EXPECT_EQ(device_bytes[0], 0x5a);
 }
 
+TEST_F(HbgHostAccessContractTest, PureHostOutputRejectsGetAndSet) {
+    for (bool write : {false, true}) {
+        SCOPED_TRACE(write);
+        access_.write = write;
+        access_.error = 0;
+        Runtime runtime;
+        init_runtime(runtime);
+        auto cleanup = cleanup_runtime(runtime);
+        std::vector<uint8_t> output(4, 0x39);
+        ChipStorageTaskArgs args;
+        args.add_tensor(host_tensor(output));
+        ArgDirection signature[] = {ArgDirection::OUT};
+        EXPECT_EQ(bind(runtime, args, signature, 1), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+        EXPECT_EQ(access_.error, SIMPLER_ERROR_INVALID_ARGS);
+        EXPECT_EQ(output, std::vector<uint8_t>(4, 0x39));
+    }
+}
+
 TEST_F(HbgHostAccessContractTest, SuccessorReadsPredecessorOutputAfterExplicitCopyback) {
     Runtime predecessor;
     init_runtime(predecessor);
