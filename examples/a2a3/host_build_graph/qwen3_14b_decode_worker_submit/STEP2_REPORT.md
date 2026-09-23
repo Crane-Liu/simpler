@@ -19,7 +19,9 @@ The log's whole-operator timestamp was unavailable (`wo_rc=-1000`); it does not
 provide a valid whole-operator ordering proof.
 
 The driver now forwards its depth setting to Worker, with a CPU configuration
-regression. Hardware validation of that change is pending. A real prefill fixture,
-checkpoint, generated full decode artifact and host-wrapper ABI audit are required
-for token-level autoregressive qualification. These tasks cannot establish those
-properties or a general Qwen capacity limit.
+regression. Hardware validation of that change is pending. The Qwen checkpoint,
+prompt contract, generated decode artifact, and host-wrapper ABI are recorded in
+`docs/qwen-step2-real-input-evidence.md`. A real prefill fixture with KV shards and
+sampled-token goldens, followed by device validation through the restored artifact
+bridge, is still required for token-level autoregressive qualification. These tasks
+cannot establish those properties or a general Qwen capacity limit.
