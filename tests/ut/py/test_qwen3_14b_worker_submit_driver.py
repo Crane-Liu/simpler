@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[3]
+DRIVER = ROOT / "examples/a2a3/host_build_graph/qwen3_14b_decode_worker_submit/main.py"
+
+
+def _load_driver():
+    spec = importlib.util.spec_from_file_location("_qwen_worker_submit_test_driver", DRIVER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeTaskArgs:
+    def __init__(self):
+        self.items = []
+
+    def add_tensor(self, tensor, tag):
+        self.items.append((tensor, tag))
+
+
+class _FakeBuffer:
+    def __init__(self, name):
+        self.name = name
+
+    def tensor(self, shape, dtype):
+        return self.name, tuple(shape), dtype
+
+
+def test_manifest_freezes_bounded_worker_submit_contract():
+    manifest = json.loads(
+        (ROOT / "examples/a2a3/host_build_graph/qwen3_14b_decode_worker_submit/workload_manifest.json").read_text()
+    )
+    assert manifest["model"] == "Qwen3-14B"
+    assert manifest["batch"] == 16
+    assert manifest["execution"] == {
+        "platform": "a2a3",
+        "runtime": "host_build_graph",
+        "worker_level": 3,
+        "endpoint": "single_local_chip",
+        "task_shape": "single_NEXT_LEVEL",
+        "depths": [1, 2],
+    }
+    assert manifest["kv_cache"]["address_space"] == "HOST"
+    assert manifest["kv_cache"]["mutable_per_run"] is True
+
+
+def test_task_args_preserve_signature_directions(monkeypatch):
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "TaskArgs", _FakeTaskArgs)
+    monkeypatch.setattr(driver, "torch_dtype_to_datatype", lambda dtype: SimpleNamespace(value=7))
+    specs = [
+        SimpleNamespace(name="input", shape=(2,), dtype="FLOAT32"),
+        SimpleNamespace(name="state", shape=(2,), dtype="FLOAT32"),
+        SimpleNamespace(name="output", shape=(2,), dtype="FLOAT32"),
+    ]
+    signature = [driver.ArgDirection.IN, driver.ArgDirection.INOUT, driver.ArgDirection.OUT]
+    common = {"input": _FakeBuffer("common-input")}
+    run = {"state": _FakeBuffer("run-state"), "output": _FakeBuffer("run-output")}
+
+    args = driver._task_args(specs, signature, common, run)
+
+    assert args.items == [
+        (("common-input", (2,), 7), driver.TensorArgType.INPUT),
+        (("run-state", (2,), 7), driver.TensorArgType.INOUT),
+        (("run-output", (2,), 7), driver.TensorArgType.OUTPUT_EXISTING),
+    ]
+
+
+@pytest.mark.parametrize("depth", [0, 3])
+def test_cli_rejects_runtime_depth_outside_bounded_range(depth):
+    driver = _load_driver()
+    with pytest.raises(SystemExit):
+        driver.parse_args(["--depth", str(depth)])
