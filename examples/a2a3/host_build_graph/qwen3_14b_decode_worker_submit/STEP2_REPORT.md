@@ -1,37 +1,36 @@
 # Qwen `Worker.submit` production-path evidence
 
-基线提交：`ee27950582c1a4c8a92dc9756264cb8ed6ec2f58`
-平台：A3 / CANN 9.0.0 / `host_build_graph` / 单本地 chip
-工作树：`codex/vllm-step2-qwen`
+Baseline commit: `ee27950582c1a4c8a92dc9756264cb8ed6ec2f58`
+Platform: A3 / CANN 9.0.0 / `host_build_graph` / one local chip
 
-## 已交付
+## Delivered
 
-- 固定 workload manifest：`workload_manifest.json`。
-- 新增 level-3 `Worker.submit` driver，使用 HOST-backed `Worker.create_buffer`。
-- 只读权重、rope、hidden 和 sequence metadata 在多个 run 间共享；KV cache 与 output 按 run 使用独立 buffer。
-- depth=1 和 depth=2 的 run handle、TaskArgs 方向和资源生命周期由同一 driver 组织。
-- Pure/fixture golden 路径比较 `out`、`k_cache` 和 `v_cache`。
+- Fixed workload manifest: `workload_manifest.json`.
+- Level-3 `Worker.submit` driver using HOST-backed `Worker.create_buffer`.
+- Read-only weights, rope tables, hidden state, and sequence metadata are shared across runs; KV cache and output use per-run buffers.
+- One driver owns the run handles, TaskArgs directions, and buffer lifetimes for depth 1 and depth 2.
+- Fixture golden validation compares `out`, `k_cache`, and `v_cache`.
 
-## 验证结果
+## Validation
 
-| 场景 | task | 结果 | 结论 |
-| --- | --- | --- | --- |
-| depth=1 smoke，跳过 golden | `task_20260922_214625_200553426315` | exit 0，设备 1 | L3 `Worker.submit`、A3 HBG、HOST tensor、单 NEXT_LEVEL 接线通过 |
-| depth=1 golden | `task_20260922_214915_21565905113` | exit 0，设备 1 | `out`、40 层 `k_cache`、`v_cache` 正确性基线通过 |
-| depth=2 smoke，跳过 golden | `task_20260922_215600_246694023753` | exit 1，设备 1 | run1 完成；run2 bind 时设备内存不足 |
+| Scenario                      | Task                                | Result           | Conclusion                                                                        |
+| ----------------------------- | ----------------------------------- | ---------------- | --------------------------------------------------------------------------------- |
+| Depth 1 smoke, golden skipped | `task_20260922_214625_200553426315` | exit 0, device 1 | Level-3 `Worker.submit`, A3 HBG, HOST tensor, and single NEXT_LEVEL wiring passed |
+| Depth 1 golden                | `task_20260922_214915_21565905113`  | exit 0, device 1 | `out`, 40-layer `k_cache`, and `v_cache` correctness baseline passed              |
+| Depth 2 smoke, golden skipped | `task_20260922_215600_246694023753` | exit 1, device 1 | Run 1 completed; run 2 ran out of device memory during bind                       |
 
-depth=2 的设备日志报告：
+The depth-2 device log reported:
 
 ```text
 rtMalloc failed: 207001 (ACL_ERROR_RT_MEMORY_ALLOCATION)
 Retained temp buffer grow failed: required bytes 40860165120
 ```
 
-run2 的失败发生在 runtime bind 的 retained temporary buffer 扩容阶段；run1 的设备边界和 completion 仍然有效。当前证据不支持把它归因为 Qwen token/KV 数据依赖、HOST accessor 冲突或 P4 身份错误。
+Run 2 failed while the runtime grew its retained temporary buffer; run 1 still reached its device boundary and completion. The evidence does not point to a Qwen token/KV dependency, HOST accessor conflict, or P4 identity error.
 
-## 能力矩阵与后续缺口
+## Capability matrix and follow-up gap
 
-- depth=1：当前 bounded A3 HBG / HOST / 单 NEXT_LEVEL 路径支持。
-- depth=2：当前 40 层 Qwen shape 受资源容量限制，不能在现有固定两槽和 retained-temp 策略下放行。
-- 该缺口属于步骤三的资源/背压/多代在途工作；本 PR 不修改 runtime admission、workspace 容量或回收策略，也不把失败伪装成串行成功。
-- A5、TMR、group/SUB、跨 endpoint、DEVICE tensor、动态 batch、真实 prefill KV 和完整 vLLM serving 仍未覆盖。
+- Depth 1: supported for the bounded A3 HBG / HOST / single NEXT_LEVEL path.
+- Depth 2: the fixed 40-layer Qwen shape exceeds the current resource capacity, so it cannot be admitted under the existing fixed-slot and retained-temp strategy.
+- This is a step-three resource, back-pressure, and multi-generation gap. This PR does not change runtime admission, workspace capacity, or reclamation, and it does not present the failed depth-2 run as a serial success.
+- A5, TMR, group/SUB, cross-endpoint, DEVICE tensor, dynamic batching, real prefill KV, and full vLLM serving remain outside this evidence.
