@@ -1,0 +1,42 @@
+{
+  "model": "Qwen3-14B",
+  "precision": "BF16",
+  "batch": 16,
+  "max_seq": 5500,
+  "decode_seq_len": 3500,
+  "decode_steps": 1,
+  "sampling": {
+    "method": "greedy",
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "ignore_eos": false
+  },
+  "fixture": {
+    "kind": "deterministic_decode_fixture",
+    "seed": 1234,
+    "prefill_kv": "synthetic_deterministic_snapshot",
+    "prompt_token_ids_sha256": null,
+    "status": "runtime_fixture_only"
+  },
+  "kv_cache": {
+    "layout": "paged_BSND",
+    "block_size": 128,
+    "address_space": "HOST",
+    "ownership": "driver_buffers",
+    "mutable_per_run": true
+  },
+  "execution": {
+    "platform": "a2a3",
+    "runtime": "host_build_graph",
+    "worker_level": 3,
+    "endpoint": "single_local_chip",
+    "task_shape": "single_NEXT_LEVEL",
+    "depths": [1, 2]
+  },
+  "comparison": {
+    "outputs": ["out", "k_cache", "v_cache"],
+    "token_output": "not_exposed_by_this_decode_callable",
+    "dtype_tolerance": {"rtol": 0.05, "atol": 0.1}
+  }
+}
