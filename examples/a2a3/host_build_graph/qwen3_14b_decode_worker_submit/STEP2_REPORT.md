@@ -1,36 +1,25 @@
-# Qwen `Worker.submit` production-path evidence
+# Qwen fixture execution evidence
 
-Baseline commit: `ee27950582c1a4c8a92dc9756264cb8ed6ec2f58`
-Platform: A3 / CANN 9.0.0 / `host_build_graph` / one local chip
+The recorded tasks used runtime baseline `ee27950582c1a4c8a92dc9756264cb8ed6ec2f58`,
+A3 device 1, and CANN 9.0.0. They used deterministic random tensors with replicated
+layer weights. The callable produces hidden output and KV updates; it has no
+embedding, LM head, or sampled-token output.
 
-## Delivered
+- `task_20260922_214625_200553426315`: one submission, golden skipped, exit 0.
+- `task_20260922_214915_21565905113`: one submission with hidden/KV golden, exit 0.
+- `task_20260922_215600_246694023753`: two submissions, golden skipped, exit 1.
+  The second bind requested 40,860,165,120 bytes of retained staging and failed
+  with allocation error 207001. The first run completed successfully.
 
-- Fixed workload manifest: `workload_manifest.json`.
-- Level-3 `Worker.submit` driver using HOST-backed `Worker.create_buffer`.
-- Read-only weights, rope tables, hidden state, and sequence metadata are shared across runs; KV cache and output use per-run buffers.
-- One driver owns the run handles, TaskArgs directions, and buffer lifetimes for depth 1 and depth 2.
-- Fixture golden validation compares `out`, `k_cache`, and `v_cache`.
+The driver used for these tasks did not pass `launch_depth` to Worker. All three
+therefore used the default launch depth of 1. The two-submission failure is
+prepared-successor staging evidence, not a depth-2 early-launch test. Its allocation
+size is approximately 38.05 GiB (40.86 GB), not a measured execution-scratch peak.
+The log's whole-operator timestamp was unavailable (`wo_rc=-1000`); it does not
+provide a valid whole-operator ordering proof.
 
-## Validation
-
-| Scenario | Task | Result | Conclusion |
-| -------- | ---- | ------ | ---------- |
-| Depth 1 smoke | `task_20260922_214625_200553426315` | exit 0 | Level-3 `Worker.submit` and single NEXT_LEVEL wiring passed |
-| Depth 1 golden | `task_20260922_214915_21565905113` | exit 0 | `out`, `k_cache`, and `v_cache` correctness passed |
-| Depth 2 smoke | `task_20260922_215600_246694023753` | exit 1 | Run 1 completed; run 2 ran out of device memory |
-
-The depth-2 device log reported:
-
-```text
-rtMalloc failed: 207001 (ACL_ERROR_RT_MEMORY_ALLOCATION)
-Retained temp buffer grow failed: required bytes 40860165120
-```
-
-Run 2 failed while the runtime grew its retained temporary buffer; run 1 still reached its device boundary and completion. The evidence does not point to a Qwen token/KV dependency, HOST accessor conflict, or P4 identity error.
-
-## Capability matrix and follow-up gap
-
-- Depth 1: supported for the bounded A3 HBG / HOST / single NEXT_LEVEL path.
-- Depth 2: the fixed 40-layer Qwen shape exceeds the current resource capacity, so it cannot be admitted under the existing fixed-slot and retained-temp strategy.
-- This is a step-three resource, back-pressure, and multi-generation gap. This PR does not change runtime admission, workspace capacity, or reclamation, and it does not present the failed depth-2 run as a serial success.
-- A5, TMR, group/SUB, cross-endpoint, DEVICE tensor, dynamic batching, real prefill KV, and full vLLM serving remain outside this evidence.
+The driver now forwards its depth setting to Worker, with a CPU configuration
+regression. Hardware validation of that change is pending. A real prefill fixture,
+checkpoint, generated full decode artifact and host-wrapper ABI audit are required
+for token-level autoregressive qualification. These tasks cannot establish those
+properties or a general Qwen capacity limit.

@@ -133,7 +133,14 @@ def run(device_ids, *, depth: int, seed: int, seq_len: int, skip_golden: bool, c
     if golden is not None:
         base._decode_golden(golden, n_layers=base.N_LAYERS)
 
-    worker = Worker(level=3, platform="a2a3", runtime=RUNTIME, device_ids=[int(device_ids[0])], num_sub_workers=0)
+    worker = Worker(
+        level=3,
+        platform="a2a3",
+        runtime=RUNTIME,
+        device_ids=[int(device_ids[0])],
+        num_sub_workers=0,
+        launch_depth=depth,
+    )
     chip_handle = worker.register(chip)
     worker.init()
     common = {}
