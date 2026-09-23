@@ -17,7 +17,10 @@ The generated artifact contains the complete orchestration C++/SO and kernel sou
 The builder regenerates the orchestration shared library with the current PyPTO runtime,
 then restores the source in-core payload byte-for-byte. Any content-addressed binary
 name or digest changes observed during assembly are retained in the manifest as
-`assembly_changed_incore_bins` provenance.
+`assembly_changed_incore_bins` provenance. The current `Worker.submit` bridge validates
+those frozen binary checksums and recompiles the verified C++ sources through Simpler's
+source-based callable compiler; it does not load the historical SO or binary payload
+into the Python process.
 
 ## Validation
 
