@@ -14,13 +14,13 @@ validated.
 
 ## Dependency matrix
 
-| Object                                                     | Prepare                                | Native submit                      | Required condition                                               |
-| ---------------------------------------------------------- | -------------------------------------- | ---------------------------------- | ---------------------------------------------------------------- |
-| Weights and rope tables                                    | Early and shared                       | Yes                                | Immutable HOST buffers remain alive                              |
-| Hidden state, sequence metadata, block table, slot mapping | Early and shared for this fixture      | Yes                                | Caller keeps the HOST buffers unchanged                          |
-| KV input/output                                            | Per run                                | Depth 2 only with distinct buffers | Previous producer is complete before reuse                       |
-| Decode output                                              | Per run                                | Yes                                | Host reads after the run handle completes                        |
-| Sampled token / request state                              | Not represented by this fused callable | Unsupported here                   | A real autoregressive adapter must wait for the preceding result |
+| Object | Prepare | Submit | Condition |
+| ------ | ------- | ------ | --------- |
+| Weights / rope | Early/shared | Yes | HOST buffers stay live |
+| Hidden / metadata | Early/shared | Yes | HOST buffers stay unchanged |
+| KV cache | Per run | Depth 2 | Separate buffers; prior run complete |
+| Output | Per run | Yes | Read after handle completion |
+| Token / request | Unsupported | Unsupported | Real adapter waits for prior result |
 
 The driver supports `--depth 1` and `--depth 2` only. Depth 2 submits both
 runs before waiting, then validates each run independently. On the fixed 40-layer

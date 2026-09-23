@@ -13,11 +13,11 @@ Platform: A3 / CANN 9.0.0 / `host_build_graph` / one local chip
 
 ## Validation
 
-| Scenario                      | Task                                | Result           | Conclusion                                                                        |
-| ----------------------------- | ----------------------------------- | ---------------- | --------------------------------------------------------------------------------- |
-| Depth 1 smoke, golden skipped | `task_20260922_214625_200553426315` | exit 0, device 1 | Level-3 `Worker.submit`, A3 HBG, HOST tensor, and single NEXT_LEVEL wiring passed |
-| Depth 1 golden                | `task_20260922_214915_21565905113`  | exit 0, device 1 | `out`, 40-layer `k_cache`, and `v_cache` correctness baseline passed              |
-| Depth 2 smoke, golden skipped | `task_20260922_215600_246694023753` | exit 1, device 1 | Run 1 completed; run 2 ran out of device memory during bind                       |
+| Scenario | Task | Result | Conclusion |
+| -------- | ---- | ------ | ---------- |
+| Depth 1 smoke | `task_20260922_214625_200553426315` | exit 0 | Level-3 `Worker.submit` and single NEXT_LEVEL wiring passed |
+| Depth 1 golden | `task_20260922_214915_21565905113` | exit 0 | `out`, `k_cache`, and `v_cache` correctness passed |
+| Depth 2 smoke | `task_20260922_215600_246694023753` | exit 1 | Run 1 completed; run 2 ran out of device memory |
 
 The depth-2 device log reported:
 
