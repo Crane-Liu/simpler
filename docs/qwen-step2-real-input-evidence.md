@@ -32,3 +32,8 @@ The focused CPU suite passed 34 tests covering the HBG adapter, artifact bridge,
 validator, slot lifetime, and Worker.submit driver. This evidence does not claim a
 real token-level decode: the prefill fixture, KV shards, and golden sampled-token
 sequence still need to be supplied before device qualification.
+
+
+## lcw external fixture bundle
+
+The authorized lcw workspace now contains `/data/sunkaixuan/lcw_subdir/qwen-serving-compatible/fixture-v2`. The checked-in `fixture.py` loader validates its manifest, 16x3338 metadata, 432 used pages, 80 KV shards, 127x16 golden tensors, artifact manifest, and nested SHA256SUMS before device allocation. The bundle provenance records that its prefill snapshot is real but its 16-row expansion and sampled-token golden are structural because the shared NPU decode path hit `FANIN_CAPACITY_EXCEEDED`. The bundle is therefore accepted for loader/layout/adapter validation; real token/KV correctness remains a hardware qualification gate.

@@ -93,3 +93,7 @@ A successful full run requires:
 The benchmark is a manual hardware entry point. Automated unit tests cover
 slot metadata isolation, HBG STRACE aggregation, artifact ABI validation, and
 source rewriting without requiring model weights or an NPU.
+
+## Worker.submit adapter
+
+`standalone_adapter.py` is the state boundary for a fixture-backed decode stream. It validates the sampled-token chain, advances `seq_lens`/`slot_mapping`/`block_table`, binds generated ABI buffers with explicit directions, and submits one `NEXT_LEVEL` callback per step. The caller waits for the returned `RunHandle`, reads the ABI-owned sampled output, and calls `complete_step` before requesting the next step. Synthetic hidden-state probes remain separate from this real-fixture adapter.

@@ -1,6 +1,6 @@
 # Qwen step-two workload contract
 
-Status: model, tokenizer/prompt contract, and generated decode artifact restored; the prefill fixture and KV/golden payload are still required for device execution.
+Status: model, tokenizer/prompt contract, generated decode artifact, and the standalone Worker.submit adapter are restored; the fixture is supplied as an external run input and its token-level hardware qualification remains a separate gate.
 
 ## Existing source of truth
 
@@ -48,7 +48,7 @@ The restored generated artifact has a 25-argument ABI, 40 in-core binaries, and 
 The checkpoint and prompt contract are recorded in `docs/qwen-step2-real-input-evidence.md`. The following values must still be supplied and recorded before the real workload is declared frozen:
 
 - CANN, torch-npu, vLLM/vLLM-Ascend, PyPTO, PyPTO-lib, and PTOAS versions;
-- fixture manifest SHA256, metadata SHA256, KV shard checksums, and golden output-token SHA256;
+- fixture manifest SHA256, metadata SHA256, KV shard checksums, and golden output-token SHA256; the current lcw external bundle is validated before use;
 - the device run evidence for the restored artifact and the selected 25-argument Worker adapter ABI.
 
-The current `qwen3_14b_decode_worker_submit` manifest is therefore an implementation probe. It must be replaced or extended with these concrete values before step two closes.
+The `qwen3_14b_decode_worker_submit` manifest remains a bounded synthetic hidden-state probe. The real-fixture path is now represented by `standalone_adapter.py` and must be run with the external fixture/artifact bundle before step two closes.

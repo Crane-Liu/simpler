@@ -67,8 +67,10 @@ The real fixture bridge still needs the authorized prefill snapshot, KV shards, 
 sampled-token golden rows. Those inputs are checked before a device run and retained
 with the artifact and model checksums.
 
+The reusable boundary is `examples/a2a3/host_build_graph/qwen3_14b_serving_effective/standalone_adapter.py`. `next_step()` validates and snapshots the next golden metadata row, `submit_step()` creates exactly one `Worker.submit` callback, and `complete_step()` consumes the sampled output only after the returned handle has completed. A second `next_step()` is rejected while a run is in flight, and a token mismatch leaves the stream in-flight so the caller cannot silently recycle its slot.
+
 ## Current conclusions
 
-- `fixture.py` defines the token, KV, block-table, slot-mapping, and golden-output contract, but the authorized workspace still lacks the fixture bytes.
+- `fixture.py` defines the token, KV, block-table, slot-mapping, and golden-output contract; the lcw workspace supplies an external bundle that passes structural validation, while real token/KV qualification remains hardware-gated.
 - The restored artifact bridge validates the 25-argument serving callable and preserves its in-core payload for the HBG adapter.
 - The remaining execution milestone is one real decode step through `Worker.submit`, followed by the full 127-dispatch golden run. Runtime admission and resource policy remain outside this phase.
