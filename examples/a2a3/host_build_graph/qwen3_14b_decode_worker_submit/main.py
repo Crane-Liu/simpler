@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """Run the Qwen3-14B decode callable through level-3 Worker.submit."""
 
 from __future__ import annotations
@@ -125,15 +133,20 @@ def run(device_ids, *, depth: int, seed: int, seq_len: int, skip_golden: bool, c
     if golden is not None:
         base._decode_golden(golden, n_layers=base.N_LAYERS)
 
-    worker = Worker(level=3, platform="a2a3", runtime=RUNTIME, device_ids=[int(device_ids[0])], num_sub_workers=0)
+    worker = Worker(
+        level=3,
+        platform="a2a3",
+        runtime=RUNTIME,
+        device_ids=[int(device_ids[0])],
+        num_sub_workers=0,
+        launch_depth=depth,
+    )
     chip_handle = worker.register(chip)
     worker.init()
     common = {}
     per_run = []
     try:
-        specs, signature, common, per_run = _build_host_buffers(
-            worker, base, depth=depth, seed=seed, seq_len=seq_len
-        )
+        specs, signature, common, per_run = _build_host_buffers(worker, base, depth=depth, seed=seed, seq_len=seq_len)
         config = base._build_config(
             {},
             enable_chip_swimlane=0,
