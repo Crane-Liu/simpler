@@ -12,7 +12,8 @@
     "kind": "deterministic_decode_fixture",
     "seed": 1234,
     "prefill_kv": "deterministic_random_kv",
-    "prompt_token_ids_sha256": null,
+    "prompt_token_ids_sha256": "8db4a9a6897a5ae237fd3806ce39b4d49a549f8faf2881d5ae5740d5e6be6bb9",
+    "prompt_sha256": "6b3e99d56ed58d58d98f149be7a68d2e454df2447414ac51f3f46da92adb9dfd",
     "status": "runtime_fixture_only",
     "weights": "seeded_random_layer0_replicated_40_times"
   },
@@ -36,6 +37,18 @@
     "hardware_qualified_launch_depths": [
       1
     ]
+  },
+  "prompt": {
+    "prompt_sha256": "6b3e99d56ed58d58d98f149be7a68d2e454df2447414ac51f3f46da92adb9dfd",
+    "prompt_token_count": 3338,
+    "prompt_token_ids_sha256": "8db4a9a6897a5ae237fd3806ce39b4d49a549f8faf2881d5ae5740d5e6be6bb9",
+    "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+  },
+  "model_checksums": {
+    "model_config_json_sha256": "e73c3664ca09b10a673fef0c22e8a6b456201d49bd4713c9691f775720e8857a",
+    "model_safetensors_index_json_sha256": "62d7ad35757bae5e7baa452cb1483178b7daa50e869e923226b8da10871f7ebc",
+    "model_tokenizer_json_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    "model_generation_config_json_sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
   },
   "comparison": {
     "outputs": [
