@@ -1,6 +1,6 @@
 # Qwen step-two execution and lifetime map
 
-Status: source audit complete. This map describes the existing real serving path and the adapter boundary needed to move it to Simpler `Worker.submit`.
+Status: model/prompt and generated artifact restored; the prefill fixture is still required. This map describes the real serving path and the adapter boundary needed to move it to Simpler `Worker.submit`.
 
 ## Existing real serving path
 
@@ -44,7 +44,8 @@ The single runner waits for every step before submitting the next step. The dual
 
 ## Current Worker.submit adapter boundary
 
-The existing step-two probe already demonstrates the outer path:
+The existing step-two probe demonstrates the outer path, and the restored artifact
+bridge now validates the generated 25-argument callable configuration:
 
 ```text
 Worker(level=3)
@@ -55,15 +56,19 @@ Worker(level=3)
   -> RunHandle.wait/result
 ```
 
-Its callable is the checked-in synthetic 20-argument Qwen fixture. The real serving artifact is different: it is an external generated `DistributedCompiledProgram` with a 25/26-argument ABI, a generated orchestration shared library, and precompiled in-core binaries. `compile_chip_callable_spec` cannot consume that directory directly. The next implementation must choose one explicit bridge:
+Its callable remains the checked-in synthetic 20-argument Qwen fixture for runtime smoke
+coverage. The restored serving artifact is an external generated `DistributedCompiledProgram`
+with a 25-argument ABI, a generated orchestration shared library, and 40 precompiled
+in-core binaries. `callable_bridge.py` validates that directory, preserves the child
+ABI and generated source paths, and records the runtime configuration for the Worker
+adapter. The bridge also accepts the 26-argument form with `sampled_ids_host`.
 
-1. build a `ChipCallable` from the artifact's orchestration and in-core binaries while preserving the artifact ABI; or
-2. regenerate the same callable through the repository's source-based `ChipCallable` path and prove byte/ABI equivalence to the serving artifact.
-
-The adapter must keep the external artifact and fixture checksums in its manifest. It must also express the `sampled_ids_host` result as a HOST output buffer when the 26-argument ABI is selected.
+The real fixture bridge still needs the authorized prefill snapshot, KV shards, and
+sampled-token golden rows. Those inputs are checked before a device run and retained
+with the artifact and model checksums.
 
 ## Current conclusions
 
-- The real post-prefill fixture already supplies the token, KV, block-table, slot-mapping, and golden-output contracts needed for step 2.
-- The current synthetic `Worker.submit` probe is useful for HOST buffer and run-lifetime validation but cannot close real Qwen correctness.
-- The first implementation task after review is the artifact/fixture bridge and a single real decode step through `Worker.submit`. Runtime admission and resource policy remain outside this phase.
+- `fixture.py` defines the token, KV, block-table, slot-mapping, and golden-output contract, but the authorized workspace still lacks the fixture bytes.
+- The restored artifact bridge validates the 25-argument serving callable and preserves its in-core payload for the HBG adapter.
+- The remaining execution milestone is one real decode step through `Worker.submit`, followed by the full 127-dispatch golden run. Runtime admission and resource policy remain outside this phase.

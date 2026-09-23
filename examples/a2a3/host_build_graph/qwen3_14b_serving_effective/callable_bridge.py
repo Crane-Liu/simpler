@@ -113,7 +113,10 @@ def inspect_artifact(root: Path) -> DecodeArtifact:
         if type(identifier) is not int or identifier < 0 or identifier in identifiers:
             raise ValueError("kernel function IDs must be unique non-negative integers")
         identifiers.add(identifier)
-        if f"incore_{identifier}.bin" not in manifest["source_incore_bins"]:
+        if not any(
+            name == f"incore_{identifier}.bin" or name.startswith(f"incore_{identifier}_")
+            for name in manifest["source_incore_bins"]
+        ):
             raise ValueError("kernel function ID has no verified in-core binary")
         if kernel.get("core_type") not in ("aic", "aiv"):
             raise ValueError("unsupported kernel core type")

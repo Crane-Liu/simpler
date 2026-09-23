@@ -1,6 +1,6 @@
 # Qwen step-two workload contract
 
-Status: source audit complete; the concrete external fixture and checkpoint artifact are still required before the contract can be frozen for execution.
+Status: model, tokenizer/prompt contract, and generated decode artifact restored; the prefill fixture and KV/golden payload are still required for device execution.
 
 ## Existing source of truth
 
@@ -41,17 +41,14 @@ The first decode input is the prefill fixture's `first_generated_token_ids`. The
 
 The real serving driver validates a caller-provided Qwen checkpoint, fixture, and generated decode artifact. The artifact builder accepts only the 25-argument compatibility ABI or the 26-argument ABI that adds `sampled_ids_host`. The required semantic arguments include `out`, `embed_weight`, `sampled_ids_in`, `sampled_ids`, and `next_hidden`; the exact order comes from the artifact's `distributed_meta.json`.
 
-The generated artifact must preserve the source orchestration shared library and every in-core binary by checksum. Its Definition must contain fewer than 1024 tasks per layer and invoke one recorded layer Definition 40 times per frame.
+The restored generated artifact has a 25-argument ABI, 40 in-core binaries, and a flat 40-layer orchestration. The HBG adapter rebuilds the orchestration shared library with the current runtime, restores the source in-core payload byte-for-byte, and records the seven assembly changes in its manifest. The flat source emits 279 tasks per frame; per-layer Definition artifacts remain supported when present. The verified HBG manifest and every copied metadata, source, shared-library, and in-core checksum are required before runtime use.
 
 ## Fields that remain unfrozen
 
-The repository does not contain the external fixture root or model checkpoint. The following values must be supplied and recorded before the real workload is declared frozen:
+The checkpoint and prompt contract are recorded in `docs/qwen-step2-real-input-evidence.md`. The following values must still be supplied and recorded before the real workload is declared frozen:
 
-- prompt token-ID SHA256;
-- tokenizer and model checkpoint identity plus file SHA256 values;
 - CANN, torch-npu, vLLM/vLLM-Ascend, PyPTO, PyPTO-lib, and PTOAS versions;
 - fixture manifest SHA256, metadata SHA256, KV shard checksums, and golden output-token SHA256;
-- generated artifact manifest, `distributed_meta.json`, orchestration shared-library, and in-core binary checksums;
-- the exact `sampled_ids_host` ABI selected for the Worker adapter.
+- the device run evidence for the restored artifact and the selected 25-argument Worker adapter ABI.
 
 The current `qwen3_14b_decode_worker_submit` manifest is therefore an implementation probe. It must be replaced or extended with these concrete values before step two closes.
