@@ -73,10 +73,44 @@ def _validate_param_names(param_names: list[str]) -> None:
 
 
 def _add_sample_dependency(path: Path) -> None:
-    """Order final RMSNorm, LM head, and greedy sampling tasks."""
+    """Order embedding, final RMSNorm, LM head, and greedy sampling tasks."""
     source = path.read_text(encoding="utf-8")
-    if "hbg_lm_head_tid" in source:
+    if "hbg_embed_tids" in source:
         return
+    embed_loop = re.search(
+        r"(?m)^(?P<indent>\s*)for \(int64_t b_inline2035 = 0; "
+        r"b_inline2035 < batch_inline2036; b_inline2035 \+= 1\) \{",
+        source,
+    )
+    if embed_loop is None:
+        raise RuntimeError("cannot locate generated token embedding loop")
+    source = (
+        source[: embed_loop.start()]
+        + f"{embed_loop.group('indent')}TaskId hbg_embed_tids[16]; for (int64_t i = 0; i < 16; ++i) hbg_embed_tids[i] = TaskId::invalid();\n"
+        + source[embed_loop.start() :]
+    )
+    embed_submit = "                rt_submit_aiv_task(0, params_t0);\n"
+    if source.count(embed_submit) != 1:
+        raise RuntimeError("cannot locate generated token embedding submission")
+    source = source.replace(
+        embed_submit,
+        "                TaskOutputTensors task_0_outs = rt_submit_aiv_task(0, params_t0);\n"
+        "                hbg_embed_tids[b_inline2035] = task_0_outs.task_id();\n",
+        1,
+    )
+    copy_marker = (
+        "                        params_t1.add_scalar(chunk_rows_inline1463);\n"
+        "                        params_t1.set_allow_early_resolve(true);\n"
+    )
+    if source.count(copy_marker) != 1:
+        raise RuntimeError("cannot locate generated copy_hidden submission")
+    copy_extra = (
+        "                        TaskId hbg_embed_deps[16];\n"
+        "                        uint32_t hbg_embed_dep_count = 0;\n"
+        "                        for (int64_t i = 0; i < batch_inline2036; ++i) hbg_embed_deps[hbg_embed_dep_count++] = hbg_embed_tids[i];\n"
+        "                        params_t1.set_dependencies(hbg_embed_deps, hbg_embed_dep_count);\n"
+    )
+    source = source.replace(copy_marker, copy_marker + copy_extra, 1)
     chunk_loop = re.search(
         r"(?m)^(?P<indent>\s*)for \(int64_t chunk_idx_inline\d+ = 0; "
         r"chunk_idx_inline\d+ < num_chunks_inline\d+; chunk_idx_inline\d+ \+= 1\) \{",
@@ -96,11 +130,7 @@ def _add_sample_dependency(path: Path) -> None:
     )
     if final_rms is None:
         raise RuntimeError("cannot locate generated final_rmsnorm task")
-    source = (
-        source[: final_rms.end()]
-        + f"{final_rms.group('indent')}hbg_final_rms_tid = {final_rms.group('task')}.task_id();\n"
-        + source[final_rms.end() :]
-    )
+    source = source[: final_rms.end()] + f"{final_rms.group('indent')}hbg_final_rms_tid = {final_rms.group('task')}.task_id();\n" + source[final_rms.end() :]
     lm_head = re.search(
         r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
         r"rt_submit_aic_task\(37, params_t36\);\n",
@@ -108,18 +138,13 @@ def _add_sample_dependency(path: Path) -> None:
     )
     if lm_head is None:
         raise RuntimeError("cannot locate generated lm_head task")
-    source = (
-        source[: lm_head.start()]
-        + f"{lm_head.group('indent')}params_t36.set_dependencies(&hbg_final_rms_tid, 1);\n"
-        + source[lm_head.start() :]
-    )
+    source = source[: lm_head.start()] + f"{lm_head.group('indent')}params_t36.set_dependencies(&hbg_final_rms_tid, 1);\n" + source[lm_head.start() :]
     lm_head = re.search(
         r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
         r"rt_submit_aic_task\(37, params_t36\);\n",
         source,
     )
-    assignment = f"{lm_head.group('indent')}hbg_lm_head_tid = {lm_head.group('task')}.task_id();\n"
-    source = source[: lm_head.end()] + assignment + source[lm_head.end() :]
+    source = source[: lm_head.end()] + f"{lm_head.group('indent')}hbg_lm_head_tid = {lm_head.group('task')}.task_id();\n" + source[lm_head.end() :]
     sample = re.search(
         r"(?m)^(?P<indent>\s*)params_t37\.add_scalar\((?P<row>[^)]+)\);\n"
         r"(?P=indent)rt_submit_aiv_task\(38, params_t37\);",
