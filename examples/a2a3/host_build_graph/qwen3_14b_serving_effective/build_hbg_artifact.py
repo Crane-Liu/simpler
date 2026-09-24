@@ -155,12 +155,10 @@ def _add_sample_dependency(path: Path) -> None:
     if final_rms is None:
         raise RuntimeError("cannot locate generated final_rmsnorm task")
     source = source[: final_rms.end()] + f"{final_rms.group('indent')}hbg_final_rms_tid = {final_rms.group('task')}.task_id();\n" + source[final_rms.end() :]
-    rms_marker = "params_t35.set_allow_early_resolve(true);
-"
+    rms_marker = "params_t35.set_allow_early_resolve(true);\n"
     if source.count(rms_marker) != 1:
         raise RuntimeError("cannot locate generated final RMSNorm config")
-    source = source.replace(rms_marker, rms_marker + "                params_t35.set_dependencies(&hbg_layer_tid, 1);
-", 1)
+    source = source.replace(rms_marker, rms_marker + "                params_t35.set_dependencies(&hbg_layer_tid, 1);\n", 1)
     lm_head = re.search(
         r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
         r"rt_submit_aic_task\(37, params_t36\);\n",
