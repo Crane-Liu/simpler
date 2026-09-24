@@ -75,7 +75,7 @@ def _validate_param_names(param_names: list[str]) -> None:
 def _add_sample_dependency(path: Path) -> None:
     """Order embedding, final RMSNorm, LM head, and greedy sampling tasks."""
     source = path.read_text(encoding="utf-8")
-    if "hbg_embed_tids" in source:
+    if "hbg_token_id_offsets" in source:
         return
     embed_loop = re.search(
         r"(?m)^(?P<indent>\s*)for \(int64_t b_inline2035 = 0; "
@@ -89,6 +89,29 @@ def _add_sample_dependency(path: Path) -> None:
         + f"{embed_loop.group('indent')}TaskId hbg_embed_tids[16]; for (int64_t i = 0; i < 16; ++i) hbg_embed_tids[i] = TaskId::invalid();\n"
         + source[embed_loop.start() :]
     )
+    token_embed_old = (
+        "                CoreTaskArgs params_t0;\n"
+        "                params_t0.add_input(ext_sampled_ids_in);\n"
+        "                params_t0.add_output(ext_next_hidden);\n"
+        "                params_t0.add_input(ext_embed_weight);\n"
+        "                params_t0.add_scalar(b_inline2035);\n"
+    )
+    token_embed_new = (
+        "                uint32_t hbg_token_id_offsets[2] = {static_cast<uint32_t>(b_inline2035), 0};\n"
+        "                uint32_t hbg_token_id_shapes[2] = {1, 8};\n"
+        "                TaskTensor hbg_token_id = ext_sampled_ids_in.view(hbg_token_id_shapes, hbg_token_id_offsets);\n"
+        "                uint32_t hbg_embed_out_offsets[2] = {static_cast<uint32_t>(b_inline2035), 0};\n"
+        "                uint32_t hbg_embed_out_shapes[2] = {1, 5120};\n"
+        "                TaskTensor hbg_embed_out = ext_next_hidden.view(hbg_embed_out_shapes, hbg_embed_out_offsets);\n"
+        "                CoreTaskArgs params_t0;\n"
+        "                params_t0.add_input(hbg_token_id);\n"
+        "                params_t0.add_output(hbg_embed_out);\n"
+        "                params_t0.add_input(ext_embed_weight);\n"
+        "                params_t0.add_scalar(0);\n"
+    )
+    if source.count(token_embed_old) != 1:
+        raise RuntimeError("cannot locate generated token embed args")
+    source = source.replace(token_embed_old, token_embed_new, 1)
     embed_submit = "                rt_submit_aiv_task(0, params_t0);\n"
     if source.count(embed_submit) != 1:
         raise RuntimeError("cannot locate generated token embedding submission")
