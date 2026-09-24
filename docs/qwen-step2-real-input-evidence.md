@@ -37,3 +37,10 @@ sequence still need to be supplied before device qualification.
 ## lcw external fixture bundle
 
 The authorized lcw workspace now contains `/data/sunkaixuan/lcw_subdir/qwen-serving-compatible/fixture-v2`. The checked-in `fixture.py` loader validates its manifest, 16x3338 metadata, 432 used pages, 80 KV shards, 127x16 golden tensors, artifact manifest, and nested SHA256SUMS before device allocation. The bundle provenance records that its prefill snapshot is real but its 16-row expansion and sampled-token golden are structural because the shared NPU decode path hit `FANIN_CAPACITY_EXCEEDED`. The bundle is therefore accepted for loader/layout/adapter validation; real token/KV correctness remains a hardware qualification gate.
+
+
+## Worker qualification evidence
+
+The real Worker adapter now uses child-device allocations for the generated HBG callable. A host-backed create_buffer is retained only for staging and readback; using it directly as a kernel argument caused an AICPU/FFTSPLUS fault. The adapter also allocates KV storage with the fixture's complete physical page count rather than deriving storage from the visible decode positions.
+
+The first device qualification reached successful kernel completion after this binding change. It returned sampled IDs, but they differed from the recovered historical golden rows. The fixture and artifact therefore remain structurally validated but token-level qualification is still pending provenance alignment.

@@ -74,3 +74,10 @@ The reusable boundary is `examples/a2a3/host_build_graph/qwen3_14b_serving_effec
 - `fixture.py` defines the token, KV, block-table, slot-mapping, and golden-output contract; the lcw workspace supplies an external bundle that passes structural validation, while real token/KV qualification remains hardware-gated.
 - The restored artifact bridge validates the 25-argument serving callable and preserves its in-core payload for the HBG adapter.
 - The remaining execution milestone is one real decode step through `Worker.submit`, followed by the full 127-dispatch golden run. Runtime admission and resource policy remain outside this phase.
+
+
+## Worker address-space qualification
+
+The real Worker(level=3) adapter binds the generated 25-argument HBG ABI to child-device allocations created with alloc_child_tensor. Host create_buffer objects carry the initial fixture and metadata values; the adapter transfers those values with H2D copies before the first dispatch and updates only the per-step metadata and sampled-token input between completed handles. The KV cache uses the full physical_layout.num_pages from the fixture manifest so block-table page IDs retain their physical address space.
+
+A one-step a3 hardware run reaches Worker.submit, completes the generated HBG callable, and returns sampled IDs without an AICPU/FFTSPLUS fault. The restored artifact and captured fixture still produce a token mismatch against the historical golden sequence, so the 127-step qualification remains blocked on artifact/KV provenance alignment. No depth-2 run is admitted until that token contract passes.
