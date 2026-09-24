@@ -538,7 +538,7 @@ def _outline_per_layer_definitions(orchestration_path: Path) -> int:
             "                        TaskTensor hbg_k_norm = ext_k_norm_weight.view(hbg_norm_shapes, hbg_k_norm_offsets);",
             f"                        TaskTensor hbg_graph_normed = {normed};",
             f"                        hbg_graph_normed.owner_task_id = {prev_normed}[0];",
-            f"                        TaskTensor hbg_input_rms = hbg_layer_view(ext_input_rms_weight, std::min<int64_t>({layer_index} + 1, 39), 1);",
+            "                        TaskTensor hbg_input_rms = ext_input_rms_weight;",
             f"                        TaskTensor hbg_wq = hbg_layer_view(ext_wq, {layer_index}, 5120);",
             f"                        TaskTensor hbg_wk = hbg_layer_view(ext_wk, {layer_index}, 5120);",
             f"                        TaskTensor hbg_wv = hbg_layer_view(ext_wv, {layer_index}, 5120);",
