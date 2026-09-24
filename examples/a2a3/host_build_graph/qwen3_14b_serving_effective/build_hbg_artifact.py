@@ -142,6 +142,7 @@ def _add_sample_dependency(path: Path) -> None:
     if chunk_loop is None:
         raise RuntimeError("cannot locate generated decode chunk loop")
     declaration = (
+        f"{chunk_loop.group('indent')}TaskId hbg_layer_tid = TaskId::invalid();\n"
         f"{chunk_loop.group('indent')}TaskId hbg_final_rms_tid = TaskId::invalid();\n"
         f"{chunk_loop.group('indent')}TaskId hbg_lm_head_tid = TaskId::invalid();\n"
     )
@@ -586,7 +587,9 @@ def _outline_per_layer_definitions(orchestration_path: Path) -> int:
             "                        layer_args.add_inout(ffts_workspace);",
             "                        layer_args.add_inout(hbg_bf16_scratch);",
             "                        layer_args.add_inout(hbg_fp32_scratch);",
-            "                        rt_submit_graph(+decode_layer_definition, layer_args);",
+            "                        if (hbg_layer_tid.is_valid()) layer_args.set_dependencies(&hbg_layer_tid, 1);",
+            "                        GraphSubmitResult hbg_layer_result = rt_submit_graph(+decode_layer_definition, layer_args);",
+            "                        hbg_layer_tid = hbg_layer_result.task_id;",
             f"                        {cur} = {layer_hidden};",
             f"                        {normed} = {next_normed};",
             "                    }",
