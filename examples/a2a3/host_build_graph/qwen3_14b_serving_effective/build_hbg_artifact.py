@@ -73,7 +73,7 @@ def _validate_param_names(param_names: list[str]) -> None:
 
 
 def _add_sample_dependency(path: Path) -> None:
-    """Order every greedy-sample task after the final LM-head write."""
+    """Order final RMSNorm, LM head, and greedy sampling tasks."""
     source = path.read_text(encoding="utf-8")
     if "hbg_lm_head_tid" in source:
         return
@@ -84,8 +84,23 @@ def _add_sample_dependency(path: Path) -> None:
     )
     if chunk_loop is None:
         raise RuntimeError("cannot locate generated decode chunk loop")
-    declaration = f"{chunk_loop.group('indent')}TaskId hbg_lm_head_tid = TaskId::invalid();\n"
+    declaration = (
+        f"{chunk_loop.group('indent')}TaskId hbg_final_rms_tid = TaskId::invalid();\n"
+        f"{chunk_loop.group('indent')}TaskId hbg_lm_head_tid = TaskId::invalid();\n"
+    )
     source = source[: chunk_loop.start()] + declaration + source[chunk_loop.start() :]
+    final_rms = re.search(
+        r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
+        r"rt_submit_aiv_task\(36, params_t35\);\n",
+        source,
+    )
+    if final_rms is None:
+        raise RuntimeError("cannot locate generated final_rmsnorm task")
+    source = (
+        source[: final_rms.end()]
+        + f"{final_rms.group('indent')}hbg_final_rms_tid = {final_rms.group('task')}.task_id();\n"
+        + source[final_rms.end() :]
+    )
     lm_head = re.search(
         r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
         r"rt_submit_aic_task\(37, params_t36\);\n",
@@ -93,6 +108,16 @@ def _add_sample_dependency(path: Path) -> None:
     )
     if lm_head is None:
         raise RuntimeError("cannot locate generated lm_head task")
+    source = (
+        source[: lm_head.start()]
+        + f"{lm_head.group('indent')}params_t36.set_dependencies(&hbg_final_rms_tid, 1);\n"
+        + source[lm_head.start() :]
+    )
+    lm_head = re.search(
+        r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
+        r"rt_submit_aic_task\(37, params_t36\);\n",
+        source,
+    )
     assignment = f"{lm_head.group('indent')}hbg_lm_head_tid = {lm_head.group('task')}.task_id();\n"
     source = source[: lm_head.end()] + assignment + source[lm_head.end() :]
     sample = re.search(
