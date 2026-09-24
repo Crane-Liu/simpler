@@ -142,7 +142,6 @@ def _add_sample_dependency(path: Path) -> None:
     if chunk_loop is None:
         raise RuntimeError("cannot locate generated decode chunk loop")
     declaration = (
-        f"{chunk_loop.group('indent')}TaskId hbg_layer_tid = TaskId::invalid();\n"
         f"{chunk_loop.group('indent')}TaskId hbg_final_rms_tid = TaskId::invalid();\n"
         f"{chunk_loop.group('indent')}TaskId hbg_lm_head_tid = TaskId::invalid();\n"
     )
@@ -155,10 +154,6 @@ def _add_sample_dependency(path: Path) -> None:
     if final_rms is None:
         raise RuntimeError("cannot locate generated final_rmsnorm task")
     source = source[: final_rms.end()] + f"{final_rms.group('indent')}hbg_final_rms_tid = {final_rms.group('task')}.task_id();\n" + source[final_rms.end() :]
-    rms_marker = "params_t35.set_allow_early_resolve(true);\n"
-    if source.count(rms_marker) != 1:
-        raise RuntimeError("cannot locate generated final RMSNorm config")
-    source = source.replace(rms_marker, rms_marker + "                params_t35.set_dependencies(&hbg_layer_tid, 1);\n", 1)
     lm_head = re.search(
         r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
         r"rt_submit_aic_task\(37, params_t36\);\n",
@@ -591,9 +586,7 @@ def _outline_per_layer_definitions(orchestration_path: Path) -> int:
             "                        layer_args.add_inout(ffts_workspace);",
             "                        layer_args.add_inout(hbg_bf16_scratch);",
             "                        layer_args.add_inout(hbg_fp32_scratch);",
-            "                        if (hbg_layer_tid.is_valid()) layer_args.set_dependencies(&hbg_layer_tid, 1);",
-            "                        GraphSubmitResult hbg_layer_result = rt_submit_graph(+decode_layer_definition, layer_args);",
-            "                        hbg_layer_tid = hbg_layer_result.task_id;",
+            "                        rt_submit_graph(+decode_layer_definition, layer_args);",
             f"                        {cur} = {layer_hidden};",
             f"                        {normed} = {next_normed};",
             "                    }",
