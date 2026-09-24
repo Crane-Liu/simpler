@@ -72,6 +72,45 @@ def _validate_param_names(param_names: list[str]) -> None:
         raise RuntimeError(f"sampled_ids_host does not match the {len(param_names)}-argument ABI")
 
 
+def _add_sample_dependency(path: Path) -> None:
+    """Order every greedy-sample task after the final LM-head write."""
+    source = path.read_text(encoding="utf-8")
+    if "hbg_lm_head_tid" in source:
+        return
+    chunk_loop = re.search(
+        r"(?m)^(?P<indent>\s*)for \(int64_t chunk_idx_inline\d+ = 0; "
+        r"chunk_idx_inline\d+ < num_chunks_inline\d+; chunk_idx_inline\d+ \+= 1\) \{",
+        source,
+    )
+    if chunk_loop is None:
+        raise RuntimeError("cannot locate generated decode chunk loop")
+    declaration = f"{chunk_loop.group('indent')}TaskId hbg_lm_head_tid = TaskId::invalid();\n"
+    source = source[: chunk_loop.start()] + declaration + source[chunk_loop.start() :]
+    lm_head = re.search(
+        r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
+        r"rt_submit_aic_task\(37, params_t36\);\n",
+        source,
+    )
+    if lm_head is None:
+        raise RuntimeError("cannot locate generated lm_head task")
+    assignment = f"{lm_head.group('indent')}hbg_lm_head_tid = {lm_head.group('task')}.task_id();\n"
+    source = source[: lm_head.end()] + assignment + source[lm_head.end() :]
+    sample = re.search(
+        r"(?m)^(?P<indent>\s*)params_t37\.add_scalar\((?P<row>[^)]+)\);\n"
+        r"(?P=indent)rt_submit_aiv_task\(38, params_t37\);",
+        source,
+    )
+    if sample is None:
+        raise RuntimeError("cannot locate generated greedy_sample submission")
+    replacement = (
+        f"{sample.group('indent')}params_t37.add_scalar({sample.group('row')});\n"
+        f"{sample.group('indent')}params_t37.set_dependencies(&hbg_lm_head_tid, 1);\n"
+        f"{sample.group('indent')}rt_submit_aiv_task(38, params_t37);"
+    )
+    source = source[: sample.start()] + replacement + source[sample.end() :]
+    path.write_text(source, encoding="utf-8")
+
+
 def _normalize_tensor_type(path: Path) -> int:
     source = path.read_text(encoding="utf-8")
     normalized, count = re.subn(r"\bTaskTensor\b", "Tensor", source)
@@ -511,6 +550,8 @@ def _adapt_child_callable(output_dir: Path, external_argument_count: int) -> dic
             raise
         definition_count = 0
         definition_record_replay = False
+    if definition_record_replay:
+        _add_sample_dependency(orchestration_path)
     _normalize_tensor_type(orchestration_path)
     for kernel_path in sorted((child / "kernels").rglob("*.cpp")):
         _normalize_tensor_type(kernel_path)
