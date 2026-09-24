@@ -153,7 +153,11 @@ def _add_sample_dependency(path: Path) -> None:
     )
     if final_rms is None:
         raise RuntimeError("cannot locate generated final_rmsnorm task")
-    source = source[: final_rms.end()] + f"{final_rms.group('indent')}hbg_final_rms_tid = {final_rms.group('task')}.task_id();\n" + source[final_rms.end() :]
+    source = (
+        source[: final_rms.end()]
+        + f"{final_rms.group('indent')}hbg_final_rms_tid = {final_rms.group('task')}.task_id();\n"
+        + source[final_rms.end() :]
+    )
     lm_head = re.search(
         r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
         r"rt_submit_aic_task\(37, params_t36\);\n",
@@ -161,13 +165,23 @@ def _add_sample_dependency(path: Path) -> None:
     )
     if lm_head is None:
         raise RuntimeError("cannot locate generated lm_head task")
-    source = source[: lm_head.start()] + f"{lm_head.group('indent')}params_t36.set_dependencies(&hbg_final_rms_tid, 1);\n" + source[lm_head.start() :]
+    source = (
+        source[: lm_head.start()]
+        + f"{lm_head.group('indent')}params_t36.set_dependencies(&hbg_final_rms_tid, 1);\n"
+        + source[lm_head.start() :]
+    )
     lm_head = re.search(
         r"(?m)^(?P<indent>\s*)TaskOutputTensors (?P<task>\w+) = "
         r"rt_submit_aic_task\(37, params_t36\);\n",
         source,
     )
-    source = source[: lm_head.end()] + f"{lm_head.group('indent')}hbg_lm_head_tid = {lm_head.group('task')}.task_id();\n" + source[lm_head.end() :]
+    if lm_head is None:
+        raise RuntimeError("cannot locate generated lm_head after dependency insertion")
+    source = (
+        source[: lm_head.end()]
+        + f"{lm_head.group('indent')}hbg_lm_head_tid = {lm_head.group('task')}.task_id();\n"
+        + source[lm_head.end() :]
+    )
     sample = re.search(
         r"(?m)^(?P<indent>\s*)params_t37\.add_scalar\((?P<row>[^)]+)\);\n"
         r"(?P=indent)rt_submit_aiv_task\(38, params_t37\);",
@@ -538,7 +552,7 @@ def _outline_per_layer_definitions(orchestration_path: Path) -> int:
             "                        TaskTensor hbg_k_norm = ext_k_norm_weight.view(hbg_norm_shapes, hbg_k_norm_offsets);",
             f"                        TaskTensor hbg_graph_normed = {normed};",
             f"                        hbg_graph_normed.owner_task_id = {prev_normed}[0];",
-            "                        TaskTensor hbg_input_rms = ext_input_rms_weight;",
+            f"                        TaskTensor hbg_input_rms = hbg_layer_view(ext_input_rms_weight, std::min<int64_t>({layer_index} + 1, 39), 1);",
             f"                        TaskTensor hbg_wq = hbg_layer_view(ext_wq, {layer_index}, 5120);",
             f"                        TaskTensor hbg_wk = hbg_layer_view(ext_wk, {layer_index}, 5120);",
             f"                        TaskTensor hbg_wv = hbg_layer_view(ext_wv, {layer_index}, 5120);",
@@ -618,17 +632,9 @@ def _adapt_child_callable(output_dir: Path, external_argument_count: int) -> dic
         raise RuntimeError("expected exactly one generated TMR child runtime binding")
     config_path.write_text(config.replace(old_runtime, new_runtime), encoding="utf-8")
     orchestration_path = child / "orchestration" / "decode_fwd.cpp"
-    try:
-        definition_count = _outline_per_layer_definitions(orchestration_path)
-        definition_record_replay = True
-    except RuntimeError:
-        source = orchestration_path.read_text(encoding="utf-8")
-        if "layer_idx" not in source or "< 40" not in source:
-            raise
-        definition_count = 0
-        definition_record_replay = False
-    if definition_record_replay:
-        _add_sample_dependency(orchestration_path)
+    definition_count = _outline_per_layer_definitions(orchestration_path)
+    definition_record_replay = True
+    _add_sample_dependency(orchestration_path)
     _normalize_tensor_type(orchestration_path)
     for kernel_path in sorted((child / "kernels").rglob("*.cpp")):
         _normalize_tensor_type(kernel_path)
@@ -640,9 +646,7 @@ def _adapt_child_callable(output_dir: Path, external_argument_count: int) -> dic
         "graph_definition_count": definition_count,
         "graph_definition_invocations_per_frame": 40,
         "graph_definition_boundary_scalars": 0,
-        "graph_definition_task_count_per_layer": (
-            _definition_task_count(orchestration_path.read_text(encoding="utf-8")) if definition_record_replay else 279
-        ),
+        "graph_definition_task_count_per_layer": _definition_task_count(orchestration_path.read_text(encoding="utf-8")),
         "adapter": f"qwen3-14b-{external_argument_count}-arg-per-layer-hbg-v1",
         "tensor_abi": "native HBG Tensor",
     }
@@ -684,9 +688,7 @@ def main(argv=None) -> int:
         raise RuntimeError(f"expected 39, 40, or 41 Qwen in-core binaries, got {len(source_bins)}")
     source_cpp_sha = _sha256(child_output_dir / "orchestration" / "decode_fwd.cpp")
     child_adapter = _adapt_child_callable(output_dir, len(param_names))
-    source_bin_bytes = {
-        name: (child_output_dir / "cache" / name).read_bytes() for name in source_bins
-    }
+    source_bin_bytes = {name: (child_output_dir / "cache" / name).read_bytes() for name in source_bins}
     from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
 
     compile_and_assemble(child_output_dir, args.platform)

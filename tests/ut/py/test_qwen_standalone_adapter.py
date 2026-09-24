@@ -1,7 +1,10 @@
-#!/usr/bin/env python3
 # Copyright (c) PyPTO Contributors.
-# This program is free software, you can redistribute it and/or modify it under the terms of
-# CANN Open Software License Agreement version 2.0 (the "License").
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -85,3 +88,12 @@ def test_submit_step_uses_worker_submit_and_worker_id():
     assert step.index == 0
     assert handle is not None
     assert events == [(("chip", "args", "cfg"), {"worker": 3})]
+
+
+@pytest.mark.parametrize("columns", [1, 8])
+def test_single_and_padded_sample_columns(columns):
+    state = adapter.StandaloneDecodeAdapter(Fixture())
+    step = state.next_step()
+    values = step.expected_output_token_ids[:, None].expand(-1, columns).clone()
+    state.complete_step(values)
+    assert state.completed_steps == 1

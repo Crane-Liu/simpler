@@ -1,8 +1,10 @@
-#!/usr/bin/env python3
 # Copyright (c) PyPTO Contributors.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
-# Please refer to the License for the full text of the License.
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """Stateful Qwen decode adapter for one fixture-backed Worker.submit stream.
 
@@ -130,9 +132,8 @@ class StandaloneDecodeAdapter:
         values = sampled_ids
         if values.dtype != torch.int32:
             values = values.to(torch.int32)
-        if values.ndim == 2:
-            if values.shape != (BATCH, 1) and values.shape[0] == BATCH and values.shape[1] >= 1:
-                values = values[:, 0]
+        if values.ndim == 2 and values.shape[0] == BATCH and values.shape[1] >= 1:
+            values = values[:, 0]
         if tuple(values.shape) != (BATCH,):
             raise ValueError(f"sampled_ids must have shape [16] or [16, N], got {tuple(values.shape)}")
         expected = self.golden["decode_output_token_ids"][self._step]

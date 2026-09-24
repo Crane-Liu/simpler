@@ -104,11 +104,13 @@ def _task_args(specs, signature, common, run_buffers):
 def _compare_run(base, buffers, golden) -> None:
     for name in ("out", "k_cache", "v_cache"):
         spec = next(item for item in base.param_specs(base.N_LAYERS) if item.name == name)
-        actual = _buffer_view(buffers[name], spec.shape, _DTYPE_BY_NAME[spec.dtype]).clone()
-        expected = getattr(golden, name)
-        if not torch.allclose(actual, expected, rtol=base.TestQwen314BDecode.RTOL, atol=base.TestQwen314BDecode.ATOL):
-            diff = (actual.float() - expected.float()).abs().max().item()
-            raise AssertionError(f"Qwen {name} mismatch: max_diff={diff}")
+        actual = _buffer_view(buffers[name], spec.shape, _DTYPE_BY_NAME[spec.dtype]).reshape(-1)
+        expected = getattr(golden, name).reshape(-1)
+        for start in range(0, actual.numel(), 1 << 20):
+            a, e = actual[start : start + (1 << 20)], expected[start : start + (1 << 20)]
+            if not torch.allclose(a, e, rtol=base.TestQwen314BDecode.RTOL, atol=base.TestQwen314BDecode.ATOL):
+                diff = (a.float() - e.float()).abs().max().item()
+                raise AssertionError(f"Qwen {name} mismatch at element {start}: chunk_max_diff={diff}")
 
 
 def run(device_ids, *, depth: int, seed: int, seq_len: int, skip_golden: bool, compile_only: bool = False) -> int:

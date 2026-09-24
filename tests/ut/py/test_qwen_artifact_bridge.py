@@ -26,6 +26,7 @@ CASE = Path(__file__).resolve().parents[3] / "examples/a2a3/host_build_graph/qwe
 def bridge(monkeypatch):
     monkeypatch.syspath_prepend(str(CASE))
     spec = importlib.util.spec_from_file_location("_qwen_artifact_bridge_tests", CASE / "callable_bridge.py")
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)

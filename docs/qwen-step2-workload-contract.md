@@ -1,54 +1,71 @@
 # Qwen step-two workload contract
 
-Status: model, tokenizer/prompt contract, generated decode artifact, and the standalone Worker.submit adapter are restored; the fixture is supplied as an external run input and its token-level hardware qualification remains a separate gate.
+The real Qwen3-14B workload is qualified through `Worker.submit` at launch depth one.
+The complete input and environment binding is recorded in
+[`qwen-step2-workload-manifest.json`](qwen-step2-workload-manifest.json).
+The qualification entry is
+`examples/a2a3/host_build_graph/qwen3_14b_serving_effective/reference_worker_submit.py`.
+It consumes an external, checksum-sealed `qwen-reference-logical-kv-v1` bundle.
 
-## Existing source of truth
+## Frozen workload
 
-The repository already contains a post-prefill Qwen3-14B HBG serving path under `examples/a2a3/host_build_graph/qwen3_14b_serving_effective/`. Its checked-in reference manifest records:
+- Model: Qwen3-14B, 40 layers, hidden size 5120, eight KV heads, head dimension 128.
+- Weights and initial KV: BF16; logits: FP32; greedy sampling.
+- Prompt: the exact 3338 token IDs in the reference metadata; compact token-ID SHA256
+  `8db4a9a6897a5ae237fd3806ce39b4d49a549f8faf2881d5ae5740d5e6be6bb9`.
+- Batch: 16 copies of that real prompt, each with independent physical pages.
+- Initial snapshot: prompt positions 0 through 3337. The first generated token,
+  32313, has been sampled but has not been appended to KV.
+- Generation: 127 decode dispatches after the prefill token, giving 128 generated
+  tokens. Qualification uses a fixed dispatch count and compares every frozen
+  token, including any EOS token; it does not stop early on EOS.
+- Logical KV: `[1, 8, 3338, 128]`, with keys after Q/K normalization and RoPE.
+- Physical KV: BSND `[448, 128, 8, 128]` per layer, 28 pages per request.
+  A 32-column block table describes each request. Both complete caches occupy
+  8.75 GiB of device storage. Decode step 118 crosses a page boundary.
 
-| Field | Value |
-| --- | --- |
-| Model | Qwen3-14B |
-| Dtype | BF16 |
-| Prompt tokens | 3338 |
-| Batch size | 16 |
-| Output tokens | 128 |
-| Decode dispatches | 127 consumed dispatches |
-| Steady skip | 5 dispatches |
-| Runtime slots | 0 and 1 |
-| KV backing pages | 691 |
-| Runtime | A3 `host_build_graph` |
-| Definition shape | One Definition invoked 40 times per frame |
-| ABI | 25 arguments, or 26 with `sampled_ids_host` |
+This fixture proves real model state and an independent-page batch conversion.
+It does not reproduce a vLLM scheduler's original batch allocation history.
+The distinct batch identity bundle contains 16 different token sequences. They
+share the verified prefix through position 3299 and carry independent real
+Qwen KV tails for positions 3300 through 3337. Its short three-step probe is
+for request identity and page ownership; the single-request bundle remains the
+full 127-step numerical qualification reference.
 
-This reference is a workload shape contract. It does not contain the external model checkpoint, prefill snapshot, generated decode artifact, tokenizer files, or their checksums.
+The original `serving-tmr-standalone-fixture-v1` schema remains separate;
+`reference_fixture.py` explicitly translates the logical reference into the
+standalone adapter contract.
 
-## Prefill snapshot contract
+## Input and artifact validation
 
-`fixture.py` defines the executable fixture schema as `serving-tmr-standalone-fixture-v1`. The fixture must prove all of the following before decode starts:
+The loader verifies the sealed bundle, the model checkpoint hashes, supported
+geometry, finite KV values and the reference restoration result. The appended-KV
+reference has its own checksum and identifies the same sealed initial bundle.
 
-- all chunked prefill work is complete;
-- the first token has been produced;
-- no decode dispatch has run before the snapshot;
-- prefill and sampling fences have retired;
-- prompt token IDs have shape `[16, 3338]` and dtype `int32`;
-- the first generated token, sequence lengths, block table, next slot mapping, and token counts are mutually consistent;
-- every KV shard and metadata file matches its SHA256 manifest.
+The qualified artifact has 25 tensor arguments and 39 in-core kernels. Its
+40 decoder layers invoke a bounded HBG Definition with 277 tasks per layer.
+The builder requires the recognized generated per-layer form and rejects a
+failed rewrite. It records source/binary hashes and counts emitted tasks.
+The bridge recompiles verified generated sources against the selected Simpler
+headers and tools; frozen historical binaries establish provenance rather than
+serving as the loaded current-runtime executable.
 
-The first decode input is the prefill fixture's `first_generated_token_ids`. The first decode position is named by `next_slot_mapping`; subsequent positions advance the page/block metadata in the golden contract. The fixture provides golden sampled-token rows for the remaining decode dispatches.
+The generic bridge also recognizes a 26-argument ABI with `sampled_ids_host`.
+That form is not covered by this reference consumer's hardware qualification.
 
-## Runtime and artifact contract
+## Acceptance
 
-The real serving driver validates a caller-provided Qwen checkpoint, fixture, and generated decode artifact. The artifact builder accepts only the 25-argument compatibility ABI or the 26-argument ABI that adds `sampled_ids_host`. The required semantic arguments include `out`, `embed_weight`, `sampled_ids_in`, `sampled_ids`, and `next_hidden`; the exact order comes from the artifact's `distributed_meta.json`.
+Every sampled token must match exactly. Every row of logits and appended KV must
+be finite, with relative L2 at most 0.05 and cosine similarity at least 0.999.
+These cross-implementation gates are fixed before the measured qualification.
+Original KV prefixes must remain bitwise unchanged and unused tail capacity must
+remain zero. Export/restoration equality within the reference implementation is
+a separate, bitwise comparison.
 
-The restored generated artifact has a 25-argument ABI, 40 in-core binaries, and a flat 40-layer orchestration. The HBG adapter rebuilds the orchestration shared library with the current runtime, restores the source in-core payload byte-for-byte, and records the seven assembly changes in its manifest. The flat source emits 279 tasks per frame; per-layer Definition artifacts remain supported when present. The verified HBG manifest and every copied metadata, source, shared-library, and in-core checksum are required before runtime use.
+The next input comes from the actual previous sampled output. Reference tokens
+are comparison data, not substituted future inputs. Each result records run IDs,
+positions, slots, artifact hashes, consumer source hashes and runtime binary hashes.
 
-## Fields that remain unfrozen
-
-The checkpoint and prompt contract are recorded in `docs/qwen-step2-real-input-evidence.md`. The following values must still be supplied and recorded before the real workload is declared frozen:
-
-- CANN, torch-npu, vLLM/vLLM-Ascend, PyPTO, PyPTO-lib, and PTOAS versions;
-- fixture manifest SHA256, metadata SHA256, KV shard checksums, and golden output-token SHA256; the current lcw external bundle is validated before use;
-- the device run evidence for the restored artifact and the selected 25-argument Worker adapter ABI.
-
-The `qwen3_14b_decode_worker_submit` manifest remains a bounded synthetic hidden-state probe. The real-fixture path is now represented by `standalone_adapter.py` and must be run with the external fixture/artifact bundle before step two closes.
+See [execution and lifetime map](qwen-step2-execution-map.md) for the serial host
+feedback boundary and [real-input evidence](qwen-step2-real-input-evidence.md) for
+hardware results and the remaining early-enqueue capability gap.

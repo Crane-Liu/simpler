@@ -31,8 +31,9 @@ Both runners verify the copied metadata, orchestration source/shared library,
 and in-core binary checksums before preparing the runtime.
 
 Each decode frame executes the generated 40-layer orchestration, then final
-RMSNorm, LM Head, and greedy sampling. For flat serving artifacts, the 279 emitted
-per-frame tasks remain in the orchestration and are validated before runtime use.
+RMSNorm, LM Head, and greedy sampling. The adapter requires the recognized
+per-layer generated form and counts the emitted Definition tasks. Unrecognized
+or incomplete generated orchestration is rejected.
 
 ## Run the benchmark
 
@@ -97,3 +98,35 @@ source rewriting without requiring model weights or an NPU.
 ## Worker.submit adapter
 
 `standalone_adapter.py` is the state boundary for a fixture-backed decode stream. It validates the sampled-token chain, advances `seq_lens`/`slot_mapping`/`block_table`, binds generated ABI buffers with explicit directions, and submits one `NEXT_LEVEL` callback per step. The caller waits for the returned `RunHandle`, reads the ABI-owned sampled output, and calls `complete_step` before requesting the next step. Synthetic hidden-state probes remain separate from this real-fixture adapter.
+
+## Qualify a sealed logical KV reference
+
+`reference_worker_submit.py` consumes a `qwen-reference-logical-kv-v1` bundle and
+an appended-KV reference identifying the same initial bundle. It verifies model
+hashes, materializes independent BSND pages for 16 requests and executes the real
+25-argument callable through `Worker.submit` at launch depth one.
+
+```bash
+python reference_worker_submit.py \
+  --fixture /path/to/reference-kv \
+  --kv-reference /path/to/reference-decode-kv \
+  --artifact /path/to/verified-hbg-artifact \
+  --model /path/to/Qwen3-14B \
+  --device DEVICE_ID --steps 127 --output /path/to/new-result-directory
+```
+
+On shared hardware, run this command through `task-submit` after the architecture
+precheck and explicit CANN environment setup. The result directory must be new.
+The consumer checks exact tokens and finite logits/KV with relative L2 at most
+0.05 and cosine similarity at least 0.999. Initial prefixes must remain bitwise
+unchanged; unused capacity must stay zero. The next input is the actual previous
+sampled output after completion and readback. The report identifies the tested
+sources and runtime binaries. A failed gate stops the chain.
+
+The original prefill bundle remains sealed. The appended-KV bundle contains
+`appended.safetensors` with `key_00`/`value_00` through `key_39`/`value_39`, each
+`[8, 127, 128]`, and a manifest recording `reference_sums_sha256`,
+`appended_sha256`, `steps`, `layers`, `layout`, and reference token/logit equality.
+
+The host feedback edge is serial. This qualification does not establish DEVICE
+early enqueue; see the [execution map](../../../../docs/qwen-step2-execution-map.md).

@@ -1,83 +1,72 @@
 # Qwen step-two execution and lifetime map
 
-Status: model/prompt and generated artifact restored; the prefill fixture is still required. This map describes the real serving path and the adapter boundary needed to move it to Simpler `Worker.submit`.
+The qualified path uses one real `Worker(level=3)` with A3 `host_build_graph`,
+one local chip child and launch depth one.
 
-## Existing real serving path
-
-```text
-prefill fixture
-  -> metadata + KV shard validation
-  -> model checkpoint and generated artifact validation
-  -> DistributedCompiledProgram.prepare
-  -> resident weights / RoPE / KV / output / sampled buffers
-  -> one decode submit per token step
-  -> handle.result
-  -> sampled token readback
-  -> next-step metadata update and decode submit
-```
-
-The single runner waits for every step before submitting the next step. The dual runner submits the first two steps before waiting, then keeps a two-slot pending queue. It alternates slots, reads sampled IDs before a slot is reused, and validates that device runner spans remain serialized.
-
-## Per-step argument map
-
-| Object | Producer | Consumer | Lifetime |
-| --- | --- | --- | --- |
-| Weights | checkpoint loader | every layer | all frames |
-| RoPE tables | checkpoint/fixture loader | every decode step | all frames |
-| KV cache | prefill fixture and decode kernels | attention in later steps | device resident; shared by ordered steps |
-| Block table | fixture metadata plus host slot update | attention/page lookup | until the submitted step consumes it |
-| Slot mapping | fixture metadata plus host slot update | attention KV write position | until the submitted step consumes it |
-| `sampled_ids_in` | initial fixture token or previous decode output | next decode step | device-only producer/consumer chain |
-| `sampled_ids` | decode sampler | next decode step and host validator | until the next consumer and host read finish |
-| `sampled_ids_host` | device copyback ABI, when present | host validator/request layer | until host read completes |
-| `next_hidden` | decoder | next decode step | per in-flight slot |
-| `out` | LM head | host validator/request layer | per in-flight slot until readback |
-
-## Dependency classification
-
-- Weights and RoPE are immutable and can be prepared early and shared.
-- KV cache is mutable device state. A later step may read and update it only after the device has completed the earlier producer in the same ordered execution domain.
-- `sampled_ids_in` can remain a device-only dependency when the next orchestration only passes its address and the device queue preserves the producer-before-consumer order. Host preparation must not read its contents.
-- `sampled_ids_host` is a host-visible result. A slot cannot be recycled until the host has consumed it and the corresponding run handle has completed.
-- Block table, slot mapping, and sequence lengths are host metadata. The checked-in fixture precomputes their per-step values. A real vLLM scheduler must produce the next values before the corresponding host prepare; the runtime must not infer them from a future device result.
-- `next_hidden` and `out` need independent storage for two in-flight slots. Sharing either buffer would overwrite the predecessor result.
-
-## Current Worker.submit adapter boundary
-
-The existing step-two probe demonstrates the outer path, and the restored artifact
-bridge now validates the generated 25-argument callable configuration:
+## Execution path
 
 ```text
-Worker(level=3)
-  -> register ChipCallable
-  -> init
-  -> Worker.submit(orch_fn)
-  -> orch.submit_next_level(chip_handle, HOST TaskArgs, config, worker=0)
-  -> RunHandle.wait/result
+sealed logical KV + checkpoint
+  -> validate hashes / geometry / reference qualification
+  -> register compiled chip callable; Worker.init
+  -> alloc_child_tensor; stream weights and BSND KV through host staging
+  -> StandaloneDecodeAdapter.next_step
+  -> upload actual previous token and immutable step metadata
+  -> Worker.submit -> submit_next_level(DEVICE TaskArgs)
+  -> RunHandle.result(timeout=120)
+  -> explicit sampled-token and logits D2H
+  -> validate; copy results into report-owned storage; complete_step
+  -> next decode step
 ```
 
-Its callable remains the checked-in synthetic 20-argument Qwen fixture for runtime smoke
-coverage. The restored serving artifact is an external generated `DistributedCompiledProgram`
-with a 25-argument ABI, a generated orchestration shared library, and 40 precompiled
-in-core binaries. `callable_bridge.py` validates that directory, preserves the child
-ABI and generated source paths, and records the runtime configuration for the Worker
-adapter. The bridge also accepts the 26-argument form with `sampled_ids_host`.
+The consumer retains device allocations through `Worker.close`. Temporary host
+upload buffers close after synchronous copy completion. The Worker owns child
+allocations; no foreign pointer ownership or process reset authority is acquired.
 
-The real fixture bridge still needs the authorized prefill snapshot, KV shards, and
-sampled-token golden rows. Those inputs are checked before a device run and retained
-with the artifact and model checksums.
+## Dependencies and reuse
 
-The reusable boundary is `examples/a2a3/host_build_graph/qwen3_14b_serving_effective/standalone_adapter.py`. `next_step()` validates and snapshots the next golden metadata row, `submit_step()` creates exactly one `Worker.submit` callback, and `complete_step()` consumes the sampled output only after the returned handle has completed. A second `next_step()` is rejected while a run is in flight, and a token mismatch leaves the stream in-flight so the caller cannot silently recycle its slot.
+- **Weights and RoPE:** read-only across the chain; upload before the first run.
+  Preparation may happen early once their identity and storage are fixed.
+- **KV:** shared mutable device storage. Every later read follows the prior run's
+  device completion on this driver. Original prompt pages and newly written slots
+  are verified separately. Any future early enqueue must preserve whole-op FIFO
+  and retain the allocation through its last device consumer.
+- **Sampled token:** the first value comes from prefill. Subsequent values are
+  read from the actual sampler output after the run fence and D2H. Host preparation
+  currently needs that value, so it must wait. `next_step()` rejects a second
+  reservation while the prior step is in flight.
+- **Sequence length, slot mapping and block table:** values are known from the
+  fixed workload. Their host snapshots can be prepared early, but reusing the
+  current device metadata allocation waits for the previous consumer.
+- **Logits, sampled output and hidden scratch:** resident allocations are reused
+  after completion and required readback. Report-owned copies preserve consumed
+  results; these allocations are not independent storage for concurrent runs.
+- **Run handles:** retained through the chain and read again after the last step.
+  Device completion, host visibility and release eligibility remain distinct
+  events; the driver waits and copies explicitly.
 
-## Current conclusions
+## Early-enqueue conclusion
 
-- `fixture.py` defines the token, KV, block-table, slot-mapping, and golden-output contract; the lcw workspace supplies an external bundle that passes structural validation, while real token/KV qualification remains hardware-gated.
-- The restored artifact bridge validates the 25-argument serving callable and preserves its in-core payload for the HBG adapter.
-- The remaining execution milestone is one real decode step through `Worker.submit`, followed by the full 127-dispatch golden run. Runtime admission and resource policy remain outside this phase.
+The selected runtime's `ChipRunLane::joinable_shape` rejects DEVICE-backed tensor
+arguments for joined native launch. The original bounded P4 capability covers
+HOST tensors. The separate DEVICE-chain PR #2446 was still open at the review
+checkpoint and is not part of this tested baseline.
 
+Even after integrating that capability, this driver needs an explicit device
+sampled-output-to-next-input edge, per-run metadata/output storage and a proven
+last-consumer lifetime before it can enqueue a real dependent successor early.
+A host-substituted reference token would not satisfy the autoregressive contract.
 
-## Worker address-space qualification
+The demonstrated execution mode is safe depth-one serialization. Real Qwen
+depth-two early enqueue remains a capability gap for the next integration stage.
+No change to runtime admission, implicit host synchronization, group/SUB,
+cross-endpoint ordering, A5/TMR or capture/replay is included.
 
-The real Worker(level=3) adapter binds the generated 25-argument HBG ABI to child-device allocations created with alloc_child_tensor. Host create_buffer objects carry the initial fixture and metadata values; the adapter transfers those values with H2D copies before the first dispatch and updates only the per-step metadata and sampled-token input between completed handles. The KV cache uses the full physical_layout.num_pages from the fixture manifest so block-table page IDs retain their physical address space.
+## Failure boundaries
 
-A one-step a3 hardware run reaches Worker.submit, completes the generated HBG callable, and returns sampled IDs without an AICPU/FFTSPLUS fault. The restored artifact and captured fixture still produce a token mismatch against the historical golden sequence, so the 127-step qualification remains blocked on artifact/KV provenance alignment. No depth-2 run is admitted until that token contract passes.
+A numerical mismatch fails the chain and records the observed values; no next
+step is submitted. A run error or timeout also stops submission, writes the
+failure report and enters Worker teardown. Existing runtime contract tests cover
+retryable wait timeouts, graph errors, subsequent-submit behavior and close
+admission/draining. Those CPU tests are distinct from the successful real-model
+hardware runs; hardware fault injection is not claimed.
