@@ -46,16 +46,6 @@
       "manifest_sha256": "6f13fb0b9d63b18b5a7a8dd14d8b8ec1f9d07b078027da79673353a5bde3bbf9",
       "sha256sums_sha256": "6659b433406cc99d9bd20df604e3faf10f07526e3d4b752af1bb4dc3035b73e3"
     },
-    "distinct_batch_identity_bundle": {
-      "root": "/data/sunkaixuan/lcw_subdir/qwen-serving-compatible/reference-distinct-batch-20260925-r7",
-      "manifest_sha256": "48f9c77f5a3a852f11699a5357c47c278d0c2f20de07bad1be21dc17f57a1550",
-      "sha256sums_sha256": "b71f371fb9d1c0b25588993d4dbddb3ee338be460b6b5280ba6b4714a68ebfc4",
-      "identity_decode_steps": 3,
-      "identity_validation_sha256": "4dd36003880fc604b1a2f5f9a2ed2c96ef69cd8e88e5a0ab36551d2ff70b31ad",
-      "distinct_prompt_marker_window": {"start": 3300, "length": 8},
-      "shared_prefix": "single_request_bundle positions 0..3299",
-      "per_request_tail": "positions 3300..3337"
-    },
     "hbg_artifact": {
       "root": "/data/sunkaixuan/lcw_subdir/qwen-serving-compatible/artifact-reference-rms-slice",
       "manifest_sha256": "4092e18662f53867b66553f38d526208e5037827c16212e405ddc5d124f92be3"
@@ -73,8 +63,8 @@
     "reproduction": "task-submit --device auto --device-num 1 --max-time 900 --run <configured wrapper>"
   },
   "scope": {
-    "qualified": ["real Worker.submit depth=1", "autoregressive sampled-token feedback", "single-request reference KV", "distinct batch prompt/KV identity bundle"],
-    "pending": ["depth=2 fallback probe", "device KV readback at cross_page_step", "distinct batch through HBG consumer"],
+    "qualified": ["real Worker.submit depth=1", "autoregressive sampled-token feedback", "single-request reference KV"],
+    "pending": ["depth=2 fallback probe", "device KV readback at cross_page_step"],
     "excluded": ["full vLLM eager", "dynamic admission", "A5/TMR", "capture/replay", "performance gate"]
   }
 }

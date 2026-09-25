@@ -55,15 +55,6 @@ selected runtime rejects that joined-launch shape, and the driver uses host toke
 feedback. The capability handoff is detailed in the
 [execution map](qwen-step2-execution-map.md).
 
-The distinct-request identity bundle is also generated and independently
-validated: 16 prompt-token rows differ, the shared prefix is checked bitwise,
-and each request owns a real KV tail. Its HBG consumer qualification is a
-follow-up boundary. The current HBG attention path reads the uploaded distinct
-KV bitwise correctly, but its first-step logits differ from the eager reference
-by about 0.42 relative L2; the same artifact remains within about 0.03 for the
-original single-request KV. This unresolved consumer issue is carried to the
-second Step 2 PR.
-
 These results do not establish native vLLM batching, dynamic request admission,
 A5/TMR coverage, capture/replay, or a performance improvement. The existing
 step-two PR #2447 and tracking issue #2429 should be updated only after review of

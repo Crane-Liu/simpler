@@ -26,11 +26,8 @@ It consumes an external, checksum-sealed `qwen-reference-logical-kv-v1` bundle.
 
 This fixture proves real model state and an independent-page batch conversion.
 It does not reproduce a vLLM scheduler's original batch allocation history.
-The distinct batch identity bundle contains 16 different token sequences. They
-share the verified prefix through position 3299 and carry independent real
-Qwen KV tails for positions 3300 through 3337. Its short three-step probe is
-for request identity and page ownership; the single-request bundle remains the
-full 127-step numerical qualification reference.
+The single-request bundle remains the full 127-step numerical qualification
+reference.
 
 The original `serving-tmr-standalone-fixture-v1` schema remains separate;
 `reference_fixture.py` explicitly translates the logical reference into the

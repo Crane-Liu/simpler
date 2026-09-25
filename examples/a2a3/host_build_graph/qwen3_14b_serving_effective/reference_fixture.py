@@ -21,9 +21,7 @@ class ReferenceFixture:
     def __init__(self, root, batch=16, page_size=128):
         self.root = Path(root)
         self.manifest = json.loads((self.root / "manifest.json").read_text())
-        self.distinct = self.manifest.get("schema") == "qwen-reference-distinct-batch-v1"
-        self.validation = (json.loads((self.root / "validation.json").read_text())
-                           if not self.distinct else json.loads((self.root / "identity_validation.json").read_text()))
+        self.validation = json.loads((self.root / "validation.json").read_text())
         required = {
             "schema": "qwen-reference-logical-kv-v1",
             "layers": 40,
@@ -32,11 +30,9 @@ class ReferenceFixture:
             "dtype": "bfloat16",
             "layout": "B,H,S,D",
         }
-        if not self.distinct and any(self.manifest.get(k) != v for k, v in required.items()):
+        if any(self.manifest.get(k) != v for k, v in required.items()):
             raise ValueError("Reference geometry does not match Qwen3-14B ABI")
-        if self.distinct and self.manifest.get("batch") != 16:
-            raise ValueError("Distinct reference must contain 16 requests")
-        if not self.distinct and not self.validation["reference_roundtrip_passed"]:
+        if not self.validation["reference_roundtrip_passed"]:
             raise ValueError("Reference KV has not passed restoration validation")
         if batch < 1 or page_size != 128:
             raise ValueError("Require positive batch and page_size=128")
@@ -51,9 +47,9 @@ class ReferenceFixture:
                     h.update(block)
             if h.hexdigest() != expected:
                 raise ValueError(f"Checksum mismatch: {name}")
-        self.batch, self.page_size = (16, 128) if self.distinct else (batch, page_size)
+        self.batch, self.page_size = batch, page_size
         self.length = int(self.manifest["prompt_tokens"])
-        self.steps = int(self.manifest["decode_steps"]) if self.distinct else int(self.validation["decode_steps"])
+        self.steps = int(self.validation["decode_steps"])
         if self.length < 1 or self.steps < 1 or self.length + self.steps > 4096:
             raise ValueError("Reference sequence exceeds decode ABI capacity")
         capacity_steps = int(self.manifest.get("capacity_decode_steps", self.steps))
@@ -63,12 +59,6 @@ class ReferenceFixture:
         self.block_table[:, : self.pages_per_request] = torch.arange(self.num_pages, dtype=torch.int32).view(batch, -1)
         self.metadata = load_file(str(self.root / "metadata.safetensors"))
         self.golden = load_file(str(self.root / "decode.safetensors"))
-        if self.distinct:
-            self._base_root = Path(self.manifest["shared_prefix_source"])
-            checkpoint = load_file(str(self.root / "decode_logits.safetensors"))
-            self.golden["logits"] = torch.stack([checkpoint[f"row_{row:02d}"] for row in range(self.batch)], dim=1)
-            self.golden["decode_input_token_ids"] = self.golden["decode_input_token_ids"].to(torch.int32)
-            self.golden["decode_output_token_ids"] = self.golden["decode_output_token_ids"].to(torch.int32)
 
     def adapter_fixture(self):
         """Translate logical reference metadata to the standalone decode contract."""
@@ -85,18 +75,14 @@ class ReferenceFixture:
                 "physical_layout": {"page_size": self.page_size, "num_pages": self.num_pages},
             },
             metadata={
-                "first_generated_token_ids": (
-                    self.metadata["first_token_ids"].to(torch.int32)
-                    if self.distinct
-                    else self.metadata["first_token_id"].repeat(self.batch).to(torch.int32)
-                ),
+                "first_generated_token_ids": self.metadata["first_token_id"].repeat(self.batch).to(torch.int32),
                 "block_table": self.block_table.clone(),
             },
             load_golden=lambda: golden,
         )
 
     def verify_model(self, model):
-        provenance = (self.manifest if self.distinct else json.loads((self.root / "provenance.json").read_text()))
+        provenance = json.loads((self.root / "provenance.json").read_text())
         for name, expected in provenance["checkpoint_sha256"].items():
             path = (Path(model) / name).resolve()
             if not path.is_relative_to(Path(model).resolve()):
@@ -117,16 +103,8 @@ class ReferenceFixture:
             "seq_lens": torch.full((self.batch,), position + 1, dtype=torch.int32),
             "slot_mapping": pages * self.page_size + position % self.page_size,
             "block_table": self.block_table.clone(),
-            "input_token_ids": (
-                self.golden["decode_input_token_ids"][index]
-                if self.distinct
-                else self.golden["decode_input_token_ids"][index].repeat(self.batch)
-            ),
-            "reference_output_token_ids": (
-                self.golden["decode_output_token_ids"][index]
-                if self.distinct
-                else self.golden["decode_output_token_ids"][index].repeat(self.batch)
-            ),
+            "input_token_ids": self.golden["decode_input_token_ids"][index].repeat(self.batch),
+            "reference_output_token_ids": self.golden["decode_output_token_ids"][index].repeat(self.batch),
         }
 
     def layer(self, layer):
@@ -137,23 +115,15 @@ class ReferenceFixture:
         """
         if not 0 <= layer < self.manifest["layers"]:
             raise ValueError("Layer index out of range")
-        if not self.distinct:
-            logical = load_file(str(self.root / f"layer_{layer:02d}.safetensors"))
-            for value in logical.values():
-                if (
-                    value.shape != (1, 8, self.length, 128)
-                    or value.dtype != torch.bfloat16
-                    or not torch.isfinite(value).all()
-                ):
-                    raise ValueError(f"Invalid KV tensor in layer {layer}")
-            rows = [(logical["key"][0], logical["value"][0])] * self.batch
-        else:
-            base = load_file(str(self._base_root / f"layer_{layer:02d}.safetensors"))
-            rows = []
-            for row in range(self.batch):
-                tail = load_file(str(self.root / f"request_{row:02d}_tail.safetensors"))
-                rows.append((torch.cat((base["key"][0, :, :3300], tail["key"][0]), dim=1),
-                             torch.cat((base["value"][0, :, :3300], tail["value"][0]), dim=1)))
+        logical = load_file(str(self.root / f"layer_{layer:02d}.safetensors"))
+        for value in logical.values():
+            if (
+                value.shape != (1, 8, self.length, 128)
+                or value.dtype != torch.bfloat16
+                or not torch.isfinite(value).all()
+            ):
+                raise ValueError(f"Invalid KV tensor in layer {layer}")
+        rows = [(logical["key"][0], logical["value"][0])] * self.batch
         for kind_index, kind in enumerate(("key", "value")):
             physical = torch.zeros((self.num_pages, self.page_size, 8, 128), dtype=torch.bfloat16)
             for row, tensors in enumerate(rows):
