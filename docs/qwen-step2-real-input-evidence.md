@@ -50,10 +50,13 @@ correctness qualification. The qualified reference bundle remains unchanged.
 ## Scope and handoff
 
 Real-data depth-one correctness and the host/device dependency classification are
-established for this workload. DEVICE early enqueue is not demonstrated: the
-selected runtime rejects that joined-launch shape, and the driver uses host token
-feedback. The capability handoff is detailed in the
-[execution map](qwen-step2-execution-map.md).
+established for this workload. The closeout probe
+`task_20260925_031151_256361614807` requested `launch_depth=2`, applied the
+explicit safe serial fallback required by host sampled-token feedback, and
+completed all 127 dispatches with KV readback at steps 0, 117, 118, and 126.
+DEVICE joined early enqueue is not demonstrated; the capability handoff is
+detailed in the [execution map](qwen-step2-execution-map.md) and the depth-2
+decision record.
 
 The distinct-request identity bundle is also generated and independently
 validated: 16 prompt-token rows differ, the shared prefix is checked bitwise,
@@ -61,10 +64,10 @@ and each request owns a real KV tail. Its HBG consumer qualification is a
 follow-up boundary. The current HBG attention path reads the uploaded distinct
 KV bitwise correctly, but its first-step logits differ from the eager reference
 by about 0.42 relative L2; the same artifact remains within about 0.03 for the
-original single-request KV. This unresolved consumer issue is carried to the
-second Step 2 PR.
+original single-request KV. This distinct-request HBG consumer issue is handled
+by a separate workstream and is outside the closeout PR described here.
 
 These results do not establish native vLLM batching, dynamic request admission,
 A5/TMR coverage, capture/replay, or a performance improvement. The existing
-step-two PR #2447 and tracking issue #2429 should be updated only after review of
-the prepared working changes and evidence.
+step-two PR #2447 and tracking issue #2429 should be updated with the closeout
+PR only after review of the prepared working changes and evidence.

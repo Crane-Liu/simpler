@@ -69,3 +69,13 @@ positions, slots, artifact hashes, consumer source hashes and runtime binary has
 See [execution and lifetime map](qwen-step2-execution-map.md) for the serial host
 feedback boundary and [real-input evidence](qwen-step2-real-input-evidence.md) for
 hardware results and the remaining early-enqueue capability gap.
+
+## Step-two closeout
+
+The closeout probe requested `launch_depth=2` with the same manifest and real KV
+bundle. Because the next host input depends on the previous sampled token and KV
+state, the driver applied an explicit serial fallback to effective depth one.
+`task_20260925_031151_256361614807` completed all 127 dispatches, including KV
+readback at steps 0, 117, 118, and 126. The result establishes a safe fallback
+and complete depth-one correctness; it does not claim joined native early
+enqueue support for this host-feedback path.

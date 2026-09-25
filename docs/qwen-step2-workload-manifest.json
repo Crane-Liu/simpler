@@ -1,6 +1,6 @@
 {
   "schema": "simpler-qwen-step2-workload-v2",
-  "status": "stage1-frozen",
+  "status": "step2-closed-bounded-depth2-fallback",
   "model": {
     "name": "Qwen3-14B",
     "root": "/data/models/Qwen3-14B",
@@ -74,7 +74,14 @@
   },
   "scope": {
     "qualified": ["real Worker.submit depth=1", "autoregressive sampled-token feedback", "single-request reference KV", "distinct batch prompt/KV identity bundle"],
-    "pending": ["depth=2 fallback probe", "device KV readback at cross_page_step", "distinct batch through HBG consumer"],
-    "excluded": ["full vLLM eager", "dynamic admission", "A5/TMR", "capture/replay", "performance gate"]
+    "pending": [],
+    "delegated": ["distinct batch through HBG consumer"],
+    "excluded": ["full vLLM eager", "dynamic admission", "A5/TMR", "capture/replay", "performance gate"],
+    "closeout": {
+      "depth2_task_id": "task_20260925_031151_256361614807",
+      "depth2_conclusion": "safe_serial_fallback_host_sampled_token_feedback",
+      "depth2_effective_launch_depth": 1,
+      "cross_page_kv_readback_steps": [0, 117, 118, 126]
+    }
   }
 }
