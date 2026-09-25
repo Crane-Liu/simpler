@@ -6,14 +6,14 @@
 
 ## depth=2 结果
 
-硬件任务：`task_20260925_031151_256361614807`
+硬件任务：`task_20260925_043921_34195018347`
 
 结果目录：`/data/sunkaixuan/lcw_subdir/qwen-serving-compatible/qualify-step2-depth2-fallback`
 
 - 请求的 `launch_depth=2`，driver 根据 host sampled-token feedback 合同安全回退到 effective depth=1。
 - 127 个 decode dispatch 全部完成，run ID `1..127` 连续。
 - 2032 个 sampled token 精确匹配。
-- 全部 logits 有限；最大 relative L2 `0.0306666`，最小 cosine `0.9996012`。
+- 全部 logits 有限；最大 relative L2 `0.0348324`，最小 cosine `0.9995546`。
 - step 0、117、118、126 均完成 40 层 K/V readback；每次 80 个 K/V 检查全部通过。
 - step 118 跨页写入检查通过；原始前缀保持逐位不变，未使用尾部保持为零。
 - 报告字段记录：`launch_depth_requested=2`、`launch_depth=1`、`depth2_conclusion=safe_serial_fallback_host_sampled_token_feedback`。

@@ -51,7 +51,7 @@ correctness qualification. The qualified reference bundle remains unchanged.
 
 Real-data depth-one correctness and the host/device dependency classification are
 established for this workload. The closeout probe
-`task_20260925_031151_256361614807` requested `launch_depth=2`, applied the
+`task_20260925_043921_34195018347` requested `launch_depth=2`, applied the
 explicit safe serial fallback required by host sampled-token feedback, and
 completed all 127 dispatches with KV readback at steps 0, 117, 118, and 126.
 DEVICE joined early enqueue is not demonstrated; the capability handoff is

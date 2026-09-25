@@ -158,17 +158,14 @@ def main():
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--kv-reference", type=Path)
-    parser.add_argument("--launch-depth", type=int, choices=(1, 2), default=1)
     parser.add_argument(
-        "--depth2-policy",
-        choices=("fallback", "attempt"),
-        default="fallback",
-        help="depth=2 is a capability probe; host sampled-token feedback falls back to serial depth=1 by default",
+        "--depth2-probe",
+        action="store_true",
+        help="record a requested depth=2 probe and run the safe serial depth=1 fallback",
     )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
-    depth2_fallback = args.launch_depth == 2 and args.depth2_policy == "fallback"
-    effective_launch_depth = 1 if depth2_fallback else args.launch_depth
+    depth2_fallback = args.depth2_probe
     torch.set_num_threads(8)
     fixture = ReferenceFixture(args.fixture)
     if not 1 <= args.steps <= fixture.steps:
@@ -187,13 +184,11 @@ def main():
     report = {
         "status": "running",
         "steps_requested": args.steps,
-        "launch_depth": effective_launch_depth,
-        "launch_depth_requested": args.launch_depth,
-        "depth2_policy": args.depth2_policy,
+        "launch_depth": 1,
+        "launch_depth_requested": 2 if args.depth2_probe else 1,
+        "depth2_policy": "safe_serial_fallback" if args.depth2_probe else "serial_default",
         "depth2_conclusion": (
-            "safe_serial_fallback_host_sampled_token_feedback"
-            if depth2_fallback
-            else ("serial_feedback_driver_probe" if args.launch_depth == 2 else "not_requested")
+            "safe_serial_fallback_host_sampled_token_feedback" if depth2_fallback else "not_requested"
         ),
         "eos_policy": "fixed dispatch count; compare all frozen tokens",
         "logit_gate": {"relative_l2_max": 0.05, "cosine_min": 0.999, "tokens": "exact"},
@@ -233,7 +228,7 @@ def main():
         runtime="host_build_graph",
         device_ids=[args.device],
         num_sub_workers=0,
-        launch_depth=effective_launch_depth,
+        launch_depth=1,
     )
     chip_handle = worker.register(chip)
     devices, hosts = {}, {}

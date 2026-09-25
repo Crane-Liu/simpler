@@ -6,7 +6,7 @@
 
 `--depth2-policy attempt` 只用于能力探针。它保留 Worker 的 `launch_depth=2` 配置，但 driver 仍在每个 step 读取 sampled output 后再准备下一步，因此该模式不能证明连续 early enqueue；只有具有真实前驱数据的独立 probe 记录了 joined native launch，才能把 bounded depth=2 标记为支持。
 
-本次真实闭环 probe：`task_20260925_031151_256361614807`。请求 depth=2，effective depth=1，127 个 dispatch 全部通过；step 0、117、118、126 的 40 层 K/V readback 全部通过。该任务给出步骤二需要的安全回退结论，不把当前 Qwen host feedback 路径标记为 joined depth=2 支持。
+本次真实闭环 probe：`task_20260925_043921_34195018347`。请求 depth=2，effective depth=1，127 个 dispatch 全部通过；step 0、117、118、126 的 40 层 K/V readback 全部通过。该任务给出步骤二需要的安全回退结论，不把当前 Qwen host feedback 路径标记为 joined depth=2 支持。
 
 验收必须绑定同一 workload manifest、模型、KV bundle、artifact、代码 head 和 runtime。报告至少包含：
 

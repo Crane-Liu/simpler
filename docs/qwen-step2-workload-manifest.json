@@ -78,7 +78,7 @@
     "delegated": ["distinct batch through HBG consumer"],
     "excluded": ["full vLLM eager", "dynamic admission", "A5/TMR", "capture/replay", "performance gate"],
     "closeout": {
-      "depth2_task_id": "task_20260925_031151_256361614807",
+      "depth2_task_id": "task_20260925_043921_34195018347",
       "depth2_conclusion": "safe_serial_fallback_host_sampled_token_feedback",
       "depth2_effective_launch_depth": 1,
       "cross_page_kv_readback_steps": [0, 117, 118, 126]
