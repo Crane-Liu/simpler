@@ -151,7 +151,7 @@ class ReferenceFixture:
             base = load_file(str(self._base_root / f"layer_{layer:02d}.safetensors"))
             rows = []
             for row in range(self.batch):
-                tail = load_file(str(self.root / "request_00_tail.safetensors"))
+                tail = load_file(str(self.root / f"request_{row:02d}_tail.safetensors"))
                 rows.append((torch.cat((base["key"][0, :, :3300], tail["key"][0]), dim=1),
                              torch.cat((base["value"][0, :, :3300], tail["value"][0]), dim=1)))
         for kind_index, kind in enumerate(("key", "value")):
