@@ -145,6 +145,24 @@ def test_source_change_after_inspection_rejected(bridge, artifact):
         inspected.compile()
 
 
+def test_runtime_does_not_execute_kernel_config(bridge, artifact):
+    (artifact / "next_levels/decode_fwd/kernel_config.py").write_text("raise RuntimeError('must not execute')\n")
+    assert bridge.inspect_artifact(artifact).parameter_names[-1] == "next_hidden"
+
+
+def test_absolute_callable_source_rejected(bridge, artifact):
+    path = artifact / "callable_spec.json"
+    spec = json.loads(path.read_text())
+    spec["orchestration"]["source"] = str((artifact / "next_levels/decode_fwd/orchestration/decode_fwd.cpp").resolve())
+    path.write_text(json.dumps(spec))
+    manifest_path = artifact / "hbg_artifact_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["callable_spec_sha256"] = _digest(path)
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="relative to the artifact"):
+        bridge.inspect_artifact(artifact)
+
+
 @pytest.mark.parametrize(
     ("extra", "message"),
     [
