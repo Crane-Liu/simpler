@@ -16,11 +16,11 @@ class to submit one immutable metadata snapshot per decode step.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import torch
+from hbg_common import update_slot
 
 BATCH = 16
 
@@ -57,6 +57,12 @@ class StandaloneDecodeAdapter:
         self._inflight = False
         self._last_output = self.metadata["first_generated_token_ids"].clone()
         self._block_table = self.metadata["block_table"].clone()
+        self._slot_state = {
+            "seq_lens": torch.empty(BATCH, dtype=torch.int32),
+            "slot_mapping": torch.empty(BATCH, dtype=torch.int32),
+            "block_table": self._block_table.reshape(-1),
+            "sampled_ids_host": torch.zeros((BATCH, 8), dtype=torch.int32),
+        }
         self._observed: list[torch.Tensor] = []
 
         self._validate_contract()
@@ -88,20 +94,23 @@ class StandaloneDecodeAdapter:
             raise ValueError("first_generated_token_ids must have shape [16]")
 
     def _install_step_metadata(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        seq_lens = self.golden["seq_lens"][index].clone()
-        slot_mapping = self.golden["slot_mapping"][index].clone()
-        positions = seq_lens - 1
-        if not torch.equal(slot_mapping.remainder(self.page_size), positions.remainder(self.page_size)):
-            raise ValueError(f"golden slot mapping offset mismatch at step {index}")
-        logical_blocks = positions.div(self.page_size, rounding_mode="floor")
+        seq_lens = self.golden["seq_lens"][index]
+        slot_mapping = self.golden["slot_mapping"][index]
         page_ids = slot_mapping.div(self.page_size, rounding_mode="floor")
-        if int(logical_blocks.min()) < 0 or int(logical_blocks.max()) >= self.blocks_per_row:
-            raise ValueError(f"golden logical block exceeds fixture table at step {index}")
         if int(page_ids.min()) < 0 or int(page_ids.max()) >= int(self.fixture.manifest["physical_layout"]["num_pages"]):
             raise ValueError(f"golden page id exceeds fixture storage at step {index}")
-        for row in range(BATCH):
-            self._block_table[row, int(logical_blocks[row])] = page_ids[row]
-        return seq_lens, slot_mapping, self._block_table.clone()
+        update_slot(
+            self._slot_state,
+            self.golden,
+            index,
+            page_size=self.page_size,
+            blocks_per_row=self.blocks_per_row,
+        )
+        return (
+            self._slot_state["seq_lens"].clone(),
+            self._slot_state["slot_mapping"].clone(),
+            self._slot_state["block_table"].reshape(BATCH, self.blocks_per_row).clone(),
+        )
 
     def next_step(self) -> DecodeStep:
         """Return the next immutable step and reserve the stream until completion."""
@@ -171,26 +180,3 @@ class StandaloneDecodeAdapter:
             self._inflight = False
             raise
         return step, handle
-
-
-def bind_task_args(
-    task_args: Any,
-    parameter_specs: Sequence[Any],
-    signature: Sequence[Any],
-    buffers: dict[str, Any],
-    *,
-    direction_to_tag: Callable[[Any], Any],
-    dtype_to_runtime: Callable[[str], Any],
-) -> Any:
-    """Bind generated host ABI buffers while preserving explicit directions."""
-    if len(parameter_specs) != len(signature):
-        raise ValueError("parameter specs and callable signature have different lengths")
-    for spec, direction in zip(parameter_specs, signature):
-        buffer = buffers.get(spec.name)
-        if buffer is None:
-            raise ValueError(f"missing ABI buffer: {spec.name}")
-        task_args.add_tensor(
-            buffer.tensor(tuple(spec.shape), dtype_to_runtime(spec.dtype)),
-            direction_to_tag(direction),
-        )
-    return task_args

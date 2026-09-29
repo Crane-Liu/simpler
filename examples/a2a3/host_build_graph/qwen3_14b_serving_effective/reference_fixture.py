@@ -32,6 +32,9 @@ class ReferenceFixture:
         }
         if any(self.manifest.get(k) != v for k, v in required.items()):
             raise ValueError("Reference geometry does not match Qwen3-14B ABI")
+        self.layers = int(self.manifest["layers"])
+        self.kv_heads = int(self.manifest["kv_heads"])
+        self.head_dim = int(self.manifest["head_dim"])
         if not self.validation["reference_roundtrip_passed"]:
             raise ValueError("Reference KV has not passed restoration validation")
         if batch < 1 or page_size != 128:
@@ -111,51 +114,30 @@ class ReferenceFixture:
         """Yield key/value physical pages [page, token, head, dim] for one layer.
 
         Each request has independent pages. Only unused tail capacity is zero.
-        Caller uploads layers at layer * num_pages * 8 * page_size * 128 elements.
+        Caller uploads layers at layer * num_pages * kv_heads * page_size * head_dim elements.
         """
-        if not 0 <= layer < self.manifest["layers"]:
+        if not 0 <= layer < self.layers:
             raise ValueError("Layer index out of range")
         logical = load_file(str(self.root / f"layer_{layer:02d}.safetensors"))
         for value in logical.values():
             if (
-                value.shape != (1, 8, self.length, 128)
+                value.shape != (1, self.kv_heads, self.length, self.head_dim)
                 or value.dtype != torch.bfloat16
                 or not torch.isfinite(value).all()
             ):
                 raise ValueError(f"Invalid KV tensor in layer {layer}")
         rows = [(logical["key"][0], logical["value"][0])] * self.batch
         for kind_index, kind in enumerate(("key", "value")):
-            physical = torch.zeros((self.num_pages, self.page_size, 8, 128), dtype=torch.bfloat16)
+            physical = torch.zeros(
+                (self.num_pages, self.page_size, self.kv_heads, self.head_dim), dtype=torch.bfloat16
+            )
             for row, tensors in enumerate(rows):
-                padded = torch.zeros((8, self.pages_per_request * self.page_size, 128), dtype=torch.bfloat16)
+                padded = torch.zeros(
+                    (self.kv_heads, self.pages_per_request * self.page_size, self.head_dim), dtype=torch.bfloat16
+                )
                 padded[:, : self.length] = tensors[kind_index]
-                pages = padded.reshape(8, self.pages_per_request, self.page_size, 128).permute(1, 2, 0, 3)
+                pages = padded.reshape(
+                    self.kv_heads, self.pages_per_request, self.page_size, self.head_dim
+                ).permute(1, 2, 0, 3)
                 physical[row * self.pages_per_request : (row + 1) * self.pages_per_request] = pages
             yield kind, physical
-
-    def validate_batch_layout(self):
-        for index in (0, 117, 118, 126):
-            step = self.step(index)
-            assert torch.unique(step["slot_mapping"]).numel() == self.batch
-            assert (step["slot_mapping"] >= 0).all()
-            assert (step["slot_mapping"] < self.num_pages * self.page_size).all()
-        for layer in range(self.manifest["layers"]):
-            logical = load_file(str(self.root / f"layer_{layer:02d}.safetensors"))
-            for kind, physical in self.layer(layer):
-                for row in range(self.batch):
-                    ids = self.block_table[row, : self.pages_per_request].long()
-                    back = physical[ids].permute(2, 0, 1, 3).reshape(1, 8, -1, 128)[:, :, : self.length]
-                    assert torch.equal(back, logical[kind]), (layer, kind, row)
-                # Verify an actual write to request zero cannot alter request one.
-                if self.batch > 1:
-                    sibling_page = int(self.block_table[1, 0])
-                    sibling = physical[sibling_page].clone()
-                    physical[int(self.block_table[0, 0])].fill_(123)
-                    assert torch.equal(physical[sibling_page], sibling)
-        return {
-            "batch": self.batch,
-            "num_pages": self.num_pages,
-            "pages_per_request": self.pages_per_request,
-            "all_40_layers_16_rows_bitwise_roundtrip": True,
-            "request_storage_independent": True,
-        }

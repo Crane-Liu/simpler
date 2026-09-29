@@ -40,6 +40,9 @@ from weights import iter_kernel_weights, rope_tables
 
 from simpler_setup.torch_interop import torch_dtype_to_datatype
 
+LOGIT_RELATIVE_L2_MAX = 0.05
+COSINE_MIN = 0.999
+
 _LAST_OUTPUT: dict[str, Path] = {}
 
 
@@ -80,7 +83,12 @@ def validate_kv(worker, devices, fixture, expected, steps):
                         "rows": checks,
                         "passed": prefix_equal
                         and tail_zero
-                        and all(m["finite"] and m["relative_l2"] <= 0.05 and m["cosine"] >= 0.999 for m in checks),
+                        and all(
+                            m["finite"]
+                            and m["relative_l2"] <= LOGIT_RELATIVE_L2_MAX
+                            and m["cosine"] >= COSINE_MIN
+                            for m in checks
+                        ),
                     }
                 )
                 del physical, logical, added
@@ -184,7 +192,11 @@ def main():
         "steps_requested": args.steps,
         "launch_depth": 1,
         "eos_policy": "fixed dispatch count; compare all frozen tokens",
-        "logit_gate": {"relative_l2_max": 0.05, "cosine_min": 0.999, "tokens": "exact"},
+        "logit_gate": {
+            "relative_l2_max": LOGIT_RELATIVE_L2_MAX,
+            "cosine_min": COSINE_MIN,
+            "tokens": "exact",
+        },
         "reference_sums_sha256": hashlib.sha256((args.fixture / "SHA256SUMS").read_bytes()).hexdigest(),
         "code_head": subprocess.check_output(["git", "-C", str(repo_root), "rev-parse", "HEAD"], text=True).strip(),
         "source_hashes": artifact.source_hashes,
@@ -202,8 +214,8 @@ def main():
         raise FileNotFoundError("no host_build_graph runtime binaries found")
     report["torch_version"] = torch.__version__
     report["kv_numerical_gate"] = {
-        "relative_l2_max": 0.05,
-        "cosine_min": 0.999,
+        "relative_l2_max": LOGIT_RELATIVE_L2_MAX,
+        "cosine_min": COSINE_MIN,
         "prefix": "bitwise unchanged",
         "unused_tail": "zero",
     }
@@ -233,7 +245,6 @@ def main():
         config = CallConfig()
         config.enable_dep_gen = False
         config.enable_chip_swimlane = 0
-        handles = []
         for index in range(args.steps):
             step = adapter.next_step()
             values = {
@@ -255,7 +266,6 @@ def main():
             handle = worker.submit(submit_next_level, args=None, config=config)
             run_id = handle._run_id
             handle.result(timeout=120)
-            handles.append(handle)
             for name in ("sampled_ids", "out"):
                 worker.copy_from(hosts[name], devices[name])
             sampled = _view(hosts["sampled_ids"], (BATCH, 8), torch.int32).clone()
@@ -281,7 +291,10 @@ def main():
             }
             report["steps"].append(entry)
             print(json.dumps(entry), flush=True)
-            passed = all(m["finite"] and m["relative_l2"] <= 0.05 and m["cosine"] >= 0.999 for m in row_metrics)
+            passed = all(
+                m["finite"] and m["relative_l2"] <= LOGIT_RELATIVE_L2_MAX and m["cosine"] >= COSINE_MIN
+                for m in row_metrics
+            )
             if index == 0 or not passed or not torch.equal(sampled[:, 0], step.expected_output_token_ids):
                 save_file({"logits": logits, "sampled": sampled}, str(args.output / f"step-{index:03d}.safetensors"))
             if kv_reference is not None and (index in (0, 117, 118, args.steps - 1) or not passed):
@@ -291,8 +304,6 @@ def main():
             adapter.complete_step(sampled)
             if not passed:
                 raise AssertionError(f"Numerical gate failed at step {index}")
-        for handle in handles:
-            handle.result()
         report["status"] = "passed"
         report["completed_steps"] = adapter.completed_steps
     except BaseException as error:

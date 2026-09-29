@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -43,7 +44,7 @@ def _load(path: Path, name: str):
 def _view(buffer, shape, dtype):
     if buffer.shm is None:
         raise RuntimeError("host buffer has no shared backing")
-    return torch.frombuffer(buffer.shm.buf, dtype=dtype, count=int(torch.tensor(shape).prod())).reshape(shape)
+    return torch.frombuffer(buffer.shm.buf, dtype=dtype, count=math.prod(shape)).reshape(shape)
 
 
 def _host_buffer(worker, tensor: torch.Tensor):
