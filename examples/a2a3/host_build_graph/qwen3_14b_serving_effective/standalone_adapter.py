@@ -94,7 +94,6 @@ class StandaloneDecodeAdapter:
             raise ValueError("first_generated_token_ids must have shape [16]")
 
     def _install_step_metadata(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        seq_lens = self.golden["seq_lens"][index]
         slot_mapping = self.golden["slot_mapping"][index]
         page_ids = slot_mapping.div(self.page_size, rounding_mode="floor")
         if int(page_ids.min()) < 0 or int(page_ids.max()) >= int(self.fixture.manifest["physical_layout"]["num_pages"]):
