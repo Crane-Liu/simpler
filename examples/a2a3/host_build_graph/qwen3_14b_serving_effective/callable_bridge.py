@@ -14,7 +14,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from build_hbg_artifact import _validate_param_names, verify_hbg_artifact
 
@@ -44,7 +44,7 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _decode_callable_value(value):
+def _decode_callable_value(value: Any) -> Any:
     if isinstance(value, dict) and value.get("__type__") == "ArgDirection":
         from simpler.task_interface import ArgDirection  # noqa: PLC0415
 
@@ -101,7 +101,7 @@ def inspect_artifact(root: Path) -> DecodeArtifact:
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     if spec.get("schema") != "simpler-qwen-callable-spec-v1":
         raise ValueError("unsupported Qwen callable spec")
-    config = _decode_callable_value(spec)
+    config = cast(dict[str, Any], _decode_callable_value(spec))
     if config.get("runtime_config", {}).get("runtime") != "host_build_graph":
         raise ValueError("chip runtime must be host_build_graph")
     orchestration = config["orchestration"]
