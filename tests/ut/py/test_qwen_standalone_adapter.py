@@ -17,6 +17,7 @@ import pytest
 import torch
 
 CASE = Path(__file__).resolve().parents[3] / "examples/a2a3/host_build_graph/qwen3_14b_serving_effective"
+sys.path.insert(0, str(CASE))
 spec = importlib.util.spec_from_file_location("qwen_standalone_adapter", CASE / "standalone_adapter.py")
 assert spec is not None and spec.loader is not None
 adapter = importlib.util.module_from_spec(spec)
