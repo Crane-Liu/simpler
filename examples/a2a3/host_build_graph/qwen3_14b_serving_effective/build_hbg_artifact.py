@@ -17,7 +17,9 @@ import argparse
 import hashlib
 import json
 import re
+import runpy
 import shutil
+from enum import Enum
 from pathlib import Path
 
 
@@ -42,6 +44,38 @@ def _bin_manifest(cache: Path) -> dict[str, str]:
     return {path.name: _sha256(path) for path in sorted(cache.glob("incore_*.bin"))}
 
 
+def _serialize_callable_value(value, root: Path):
+    if isinstance(value, Enum):
+        if type(value).__name__ != "ArgDirection":
+            raise ValueError(f"unsupported callable enum: {type(value).__name__}")
+        return {"__type__": "ArgDirection", "name": value.name}
+    if isinstance(value, Path):
+        resolved = value.resolve(strict=True)
+        if not resolved.is_relative_to(root):
+            raise ValueError(f"callable source escapes artifact root: {resolved}")
+        return str(resolved.relative_to(root)).replace("\\", "/")
+    if isinstance(value, dict):
+        return {str(key): _serialize_callable_value(item, root) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_serialize_callable_value(item, root) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    raise ValueError(f"unsupported callable config value: {type(value).__name__}")
+
+
+def _write_callable_spec(config_path: Path, root: Path) -> str:
+    config = runpy.run_path(str(config_path))
+    spec = {
+        "schema": "simpler-qwen-callable-spec-v1",
+        "orchestration": _serialize_callable_value(config["ORCHESTRATION"], root),
+        "incores": _serialize_callable_value(config["KERNELS"], root),
+        "runtime_config": _serialize_callable_value(config["RUNTIME_CONFIG"], root),
+    }
+    target = root / "callable_spec.json"
+    target.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return _sha256(target)
+
+
 def verify_hbg_artifact(root: Path) -> dict:
     manifest = json.loads((root / "hbg_artifact_manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schema") != "simpler-hbg-pure-artifact-v1" or manifest.get("runtime") != "host_build_graph":
@@ -51,6 +85,7 @@ def verify_hbg_artifact(root: Path) -> dict:
     child = root / "next_levels" / "decode_fwd"
     paths = {
         "distributed_meta_sha256": root / "distributed_meta.json",
+        "callable_spec_sha256": root / "callable_spec.json",
         "orchestration_cpp_sha256": child / "orchestration" / "decode_fwd.cpp",
         "orchestration_so_sha256": child / "orchestration" / "decode_fwd.so",
     }
@@ -688,6 +723,7 @@ def main(argv=None) -> int:
         raise RuntimeError(f"expected 39, 40, or 41 Qwen in-core binaries, got {len(source_bins)}")
     source_cpp_sha = _sha256(child_output_dir / "orchestration" / "decode_fwd.cpp")
     child_adapter = _adapt_child_callable(output_dir, len(param_names))
+    callable_spec_sha = _write_callable_spec(child_output_dir / "kernel_config.py", output_dir)
     source_bin_bytes = {name: (child_output_dir / "cache" / name).read_bytes() for name in source_bins}
     from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
 
@@ -731,6 +767,7 @@ def main(argv=None) -> int:
         "orchestration_cpp_sha256": _sha256(child_output_dir / "orchestration" / "decode_fwd.cpp"),
         "orchestration_so_sha256": _sha256(child_output_dir / "orchestration" / "decode_fwd.so"),
         "distributed_meta_sha256": _sha256(metadata_path),
+        "callable_spec_sha256": callable_spec_sha,
         "output_dir": ".",
         **child_adapter,
     }

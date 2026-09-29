@@ -66,6 +66,34 @@ def artifact(tmp_path):
         '"source": str(R / "kernels/vector.cpp"), "core_type": "aiv", '
         '"signature": [D.IN, D.OUT]} for i in range(39)]\n'
     )
+    callable_spec = {
+        "schema": "simpler-qwen-callable-spec-v1",
+        "orchestration": {
+            "source": "next_levels/decode_fwd/orchestration/decode_fwd.cpp",
+            "function_name": "entry",
+            "signature": [
+                {"__type__": "ArgDirection", "name": "IN"},
+                {"__type__": "ArgDirection", "name": "INOUT"},
+                {"__type__": "ArgDirection", "name": "OUT"},
+            ],
+        },
+        "incores": [
+            {
+                "func_id": i,
+                "name": f"kernel_{i}",
+                "source": "next_levels/decode_fwd/kernels/vector.cpp",
+                "core_type": "aiv",
+                "signature": [
+                    {"__type__": "ArgDirection", "name": "IN"},
+                    {"__type__": "ArgDirection", "name": "OUT"},
+                ],
+            }
+            for i in range(39)
+        ],
+        "runtime_config": {"runtime": "host_build_graph"},
+    }
+    callable_spec_path = tmp_path / "callable_spec.json"
+    callable_spec_path.write_text(json.dumps(callable_spec))
     manifest = {
         "schema": "simpler-hbg-pure-artifact-v1",
         "runtime": "host_build_graph",
@@ -73,6 +101,7 @@ def artifact(tmp_path):
         "external_argument_count": 25,
         "graph_definition_task_count_per_layer": 277,
         "distributed_meta_sha256": _digest(tmp_path / "distributed_meta.json"),
+        "callable_spec_sha256": _digest(callable_spec_path),
         "orchestration_cpp_sha256": _digest(child / "orchestration/decode_fwd.cpp"),
         "orchestration_so_sha256": _digest(child / "orchestration/decode_fwd.so"),
         "source_incore_bins": {f"incore_{i}.bin": _digest(child / f"cache/incore_{i}.bin") for i in range(39)},
@@ -119,15 +148,23 @@ def test_source_change_after_inspection_rejected(bridge, artifact):
 @pytest.mark.parametrize(
     ("extra", "message"),
     [
-        ('KERNELS[1]["func_id"] = 0', "unique"),
-        ('KERNELS[1]["func_id"] = 100', "no verified"),
-        ('ORCHESTRATION["signature"] = []', "explicit tensor directions"),
-        ('RUNTIME_CONFIG["runtime"] = "tensormap_and_ringbuffer"', "chip runtime"),
+        (("incores", 1, "func_id", 0), "unique"),
+        (("incores", 1, "func_id", 100), "no verified"),
+        (("orchestration", None, "signature", []), "explicit tensor directions"),
+        (("runtime_config", None, "runtime", "tensormap_and_ringbuffer"), "chip runtime"),
     ],
 )
 def test_invalid_generated_config_is_rejected(bridge, artifact, extra, message):
-    path = artifact / "next_levels/decode_fwd/kernel_config.py"
-    path.write_text(path.read_text() + extra + "\n")
+    path = artifact / "callable_spec.json"
+    spec = json.loads(path.read_text())
+    section, index, key, value = extra
+    target = spec[section] if index is None else spec[section][index]
+    target[key] = value
+    path.write_text(json.dumps(spec))
+    manifest_path = artifact / "hbg_artifact_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["callable_spec_sha256"] = _digest(path)
+    manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match=message):
         bridge.inspect_artifact(artifact)
 
@@ -145,12 +182,24 @@ def test_host_output_abi_is_preserved(bridge, artifact):
 
 
 def test_explicit_empty_kernel_signature_is_preserved(bridge, artifact):
-    path = artifact / "next_levels/decode_fwd/kernel_config.py"
-    path.write_text(path.read_text() + 'KERNELS[0]["signature"] = []\n')
+    path = artifact / "callable_spec.json"
+    spec = json.loads(path.read_text())
+    spec["incores"][0]["signature"] = []
+    path.write_text(json.dumps(spec))
+    manifest_path = artifact / "hbg_artifact_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["callable_spec_sha256"] = _digest(path)
+    manifest_path.write_text(json.dumps(manifest))
     assert bridge.inspect_artifact(artifact).callable_spec["incores"][0]["signature"] == []
 
 
 def test_runtime_configuration_survives_bridge(bridge, artifact):
-    path = artifact / "next_levels/decode_fwd/kernel_config.py"
-    path.write_text(path.read_text() + 'RUNTIME_CONFIG["aicpu_thread_num"] = 6\n')
+    path = artifact / "callable_spec.json"
+    spec = json.loads(path.read_text())
+    spec["runtime_config"]["aicpu_thread_num"] = 6
+    path.write_text(json.dumps(spec))
+    manifest_path = artifact / "hbg_artifact_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["callable_spec_sha256"] = _digest(path)
+    manifest_path.write_text(json.dumps(manifest))
     assert bridge.inspect_artifact(artifact).runtime_config == {"runtime": "host_build_graph", "aicpu_thread_num": 6}

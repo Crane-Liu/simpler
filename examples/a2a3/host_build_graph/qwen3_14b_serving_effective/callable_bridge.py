@@ -6,19 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Compile a verified generated Qwen HBG child with the selected Simpler tree.
-
-The generated kernel_config.py is trusted executable Python. Distributed host
-parameters and chip parameters are distinct ABIs; callers retain the generated
-host wrapper when binding a request to the returned child callable.
-"""
+"""Compile a verified declarative Qwen HBG callable with the selected runtime."""
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
-import runpy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,12 +44,31 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _source_path(value: str, child: Path) -> Path:
+def _decode_callable_value(value):
+    if isinstance(value, dict) and value.get("__type__") == "ArgDirection":
+        from simpler.task_interface import ArgDirection  # noqa: PLC0415
+
+        try:
+            return ArgDirection[value["name"]]
+        except (KeyError, TypeError) as error:
+            raise ValueError("invalid callable tensor direction") from error
+    if isinstance(value, dict):
+        return {key: _decode_callable_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_callable_value(item) for item in value]
+    return value
+
+
+def _source_path(value: str, root: Path) -> Path:
     path = Path(value)
-    path = path if path.is_absolute() else child / path
+    if path.is_absolute():
+        raise ValueError("callable source paths must be relative to the artifact")
+    path = root / path
     path = path.resolve(strict=True)
+    if not path.is_relative_to(root):
+        raise ValueError("callable source escapes artifact root")
     if not path.is_file():
-        raise ValueError(f"expected source file: {path}")
+        raise ValueError(f"expected callable source file: {path.name}")
     return path
 
 
@@ -85,27 +97,27 @@ def inspect_artifact(root: Path) -> DecodeArtifact:
         raise ValueError("manifest and distributed argument count differ")
 
     child = root / "next_levels" / "decode_fwd"
-    config_path = child / "kernel_config.py"
-    config_hash = _sha256(config_path)
-    config = runpy.run_path(str(config_path))
-    if _sha256(config_path) != config_hash:
-        raise ValueError("kernel configuration changed during inspection")
-    if config.get("RUNTIME_CONFIG", {}).get("runtime") != "host_build_graph":
+    spec_path = root / "callable_spec.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    if spec.get("schema") != "simpler-qwen-callable-spec-v1":
+        raise ValueError("unsupported Qwen callable spec")
+    config = _decode_callable_value(spec)
+    if config.get("runtime_config", {}).get("runtime") != "host_build_graph":
         raise ValueError("chip runtime must be host_build_graph")
-    orchestration = copy.deepcopy(config["ORCHESTRATION"])
-    orchestration_source = _source_path(orchestration["source"], child)
+    orchestration = config["orchestration"]
+    orchestration_source = _source_path(orchestration["source"], root)
     if orchestration_source != (child / "orchestration" / "decode_fwd.cpp").resolve():
         raise ValueError("chip orchestration differs from the verified source")
     if not orchestration.get("function_name"):
         raise ValueError("missing orchestration entry symbol")
     orchestration["source"] = str(orchestration_source)
-    kernels = copy.deepcopy(config["KERNELS"])
+    kernels = config["incores"]
     if len(kernels) != len(manifest["source_incore_bins"]):
         raise ValueError("kernel configuration and verified binary counts differ")
     paths = {
         "hbg_artifact_manifest.json": root / "hbg_artifact_manifest.json",
         "distributed_meta.json": metadata_path,
-        "next_levels/decode_fwd/kernel_config.py": config_path,
+        "callable_spec.json": spec_path,
         "next_levels/decode_fwd/orchestration/decode_fwd.cpp": orchestration_source,
     }
     hashes = {name: _sha256(path) for name, path in paths.items()}
@@ -122,7 +134,7 @@ def inspect_artifact(root: Path) -> DecodeArtifact:
             raise ValueError("kernel function ID has no verified in-core binary")
         if kernel.get("core_type") not in ("aic", "aiv"):
             raise ValueError("unsupported kernel core type")
-        source = _source_path(kernel["source"], child)
+        source = _source_path(kernel["source"], root)
         kernel["source"] = str(source)
         name = str(source.relative_to(root)).replace("\\", "/")
         paths[name] = source
@@ -135,7 +147,7 @@ def inspect_artifact(root: Path) -> DecodeArtifact:
         {"name": "decode_fwd", "orchestration": orchestration, "incores": kernels},
         hashes,
         paths,
-        copy.deepcopy(config["RUNTIME_CONFIG"]),
+        config["runtime_config"],
     )
 
 

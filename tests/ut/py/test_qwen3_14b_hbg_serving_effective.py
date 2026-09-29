@@ -235,11 +235,14 @@ def test_artifact_preflight_checks_frozen_files(tmp_path: Path, tamper: str | No
         path.write_text("frozen", encoding="utf-8")
     for index in range(1, 39):
         (child / "cache" / f"incore_{index}.bin").write_text("kernel", encoding="utf-8")
+    callable_spec = tmp_path / "callable_spec.json"
+    callable_spec.write_text("{}", encoding="utf-8")
     manifest = {
         "schema": "simpler-hbg-pure-artifact-v1",
         "runtime": "host_build_graph",
         "graph_definition_task_count_per_layer": 277,
         "distributed_meta_sha256": artifact_builder._sha256(paths["metadata"]),
+        "callable_spec_sha256": artifact_builder._sha256(callable_spec),
         "orchestration_cpp_sha256": artifact_builder._sha256(paths["cpp"]),
         "orchestration_so_sha256": artifact_builder._sha256(paths["so"]),
         "source_incore_bins": artifact_builder._bin_manifest(child / "cache"),
