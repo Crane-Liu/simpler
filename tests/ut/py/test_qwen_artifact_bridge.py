@@ -98,6 +98,8 @@ def test_compile_preserves_child_abi_separately_from_host_params(bridge, artifac
     assert spec["orchestration"]["function_name"] == "entry"
     assert [kernel["func_id"] for kernel in spec["incores"]] == list(range(39))
     assert (platform, runtime) == ("a2a3", "host_build_graph")
+    assert all(not Path(name).is_absolute() for name in inspected.source_hashes)
+    assert set(inspected.source_hashes) == set(inspected.source_paths)
 
 
 @pytest.mark.parametrize("relative", ["distributed_meta.json", "next_levels/decode_fwd/cache/incore_0.bin"])

@@ -23,9 +23,10 @@ not establish model correctness.
 
 ## Consumer evidence
 
-The tested tree is based on the depth-one PR head `7a28eaf7`.
-The full-run report records exact consumer-source and loaded-runtime artifact
-hashes for the qualified artifact and runtime.
+The qualification reports record exact consumer-source and loaded-runtime
+artifact hashes. The source and artifact locations are invocation inputs; the
+repository records their logical identities and checksums rather than machine
+specific paths.
 
 - Baseline task `task_20260924_084843_18736539585`: all 16 first-step tokens
   matched, but logits relative L2 was about 0.9983, so numerical acceptance failed.

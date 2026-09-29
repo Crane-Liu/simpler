@@ -194,7 +194,7 @@ def main():
         path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(Path(__file__).parent.glob("*.py"))
     }
     report["runtime_binaries_sha256"] = {
-        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        str(path.relative_to(repo_root)).replace("\\", "/"): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted((repo_root / "build/lib/a2a3/onboard/host_build_graph").glob("*"))
         if path.is_file()
     }

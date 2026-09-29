@@ -3,14 +3,14 @@
   "status": "stage1-frozen",
   "model": {
     "name": "Qwen3-14B",
-    "root": "/data/models/Qwen3-14B",
+    "root": "external://qwen3-14b/model",
     "config_sha256": "e73c3664ca09b10a673fef0c22e8a6b456201d49bd4713c9691f775720e8857a",
     "index_sha256": "62d7ad35757bae5e7baa452cb1483178b7daa50e869e923226b8da10871f7ebc",
     "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
     "generation_config_sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
   },
   "runtime": {
-    "simpler_repo": "/data/sunkaixuan/lcw_subdir/vllm-step2-qwen",
+    "simpler_repo": "repository://simpler",
     "tested_base_head": "badb5e4c7e2b23e12c5674ee0a1308a4ac2654d5",
     "platform": "a2a3",
     "runtime": "host_build_graph",
@@ -19,10 +19,10 @@
     "torch_npu": "2.6.0",
     "transformers": "5.16.1",
     "attention": "eager",
-    "ptoas": "/usr/local/ptoas/0.57"
+    "ptoas": "toolchain://ptoas/0.57"
   },
   "workload": {
-    "prompt_source": "/data/sunkaixuan/lcw_subdir/qwen-serving-compatible/prompt.txt",
+    "prompt_source": "external://qwen3-14b/reference-prompt-v1",
     "prompt_source_sha256": "6b3e99d56ed58d58d98f149be7a68d2e454df2447414ac51f3f46da92adb9dfd",
     "prompt_tokens": 3338,
     "batch": 16,
@@ -42,12 +42,12 @@
   },
   "references": {
     "single_request_bundle": {
-      "root": "/data/sunkaixuan/lcw_subdir/qwen-serving-compatible/reference-kv-20260924",
+      "root": "external://qwen3-14b/reference-kv-20260924",
       "manifest_sha256": "6f13fb0b9d63b18b5a7a8dd14d8b8ec1f9d07b078027da79673353a5bde3bbf9",
       "sha256sums_sha256": "6659b433406cc99d9bd20df604e3faf10f07526e3d4b752af1bb4dc3035b73e3"
     },
     "hbg_artifact": {
-      "root": "/data/sunkaixuan/lcw_subdir/qwen-serving-compatible/artifact-reference-rms-slice",
+      "root": "external://qwen3-14b/artifact-reference-rms-slice",
       "manifest_sha256": "4092e18662f53867b66553f38d526208e5037827c16212e405ddc5d124f92be3"
     }
   },

@@ -720,7 +720,7 @@ def main(argv=None) -> int:
         "sampled_ids_pad": 8,
         "external_argument_count": len(param_names),
         "incore_bin_count": len(source_bins),
-        "source_artifact": str(source_decode),
+        "source_artifact": "external-input",
         "source_artifact_manifest_sha256": _sha256(source_manifest_path) if source_manifest is not None else None,
         "source_distributed_meta_sha256": _sha256(source_decode / "distributed_meta.json"),
         "source_orchestration_cpp_sha256": source_cpp_sha,
@@ -731,7 +731,7 @@ def main(argv=None) -> int:
         "orchestration_cpp_sha256": _sha256(child_output_dir / "orchestration" / "decode_fwd.cpp"),
         "orchestration_so_sha256": _sha256(child_output_dir / "orchestration" / "decode_fwd.so"),
         "distributed_meta_sha256": _sha256(metadata_path),
-        "output_dir": str(output_dir),
+        "output_dir": ".",
         **child_adapter,
     }
     (output_dir / "hbg_artifact_manifest.json").write_text(

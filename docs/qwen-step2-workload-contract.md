@@ -6,6 +6,9 @@ The complete input and environment binding is recorded in
 The qualification entry is
 `examples/a2a3/host_build_graph/qwen3_14b_serving_effective/reference_worker_submit.py`.
 It consumes an external, checksum-sealed `qwen-reference-logical-kv-v1` bundle.
+The manifest uses logical external identifiers; local model, fixture, artifact,
+and toolchain paths are supplied by the invocation environment and are never
+part of the repository contract.
 
 ## Frozen workload
 

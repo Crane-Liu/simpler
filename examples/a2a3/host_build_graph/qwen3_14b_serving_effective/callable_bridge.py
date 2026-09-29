@@ -32,6 +32,7 @@ class DecodeArtifact:
     parameter_names: tuple[str, ...]
     callable_spec: dict[str, Any]
     source_hashes: dict[str, str]
+    source_paths: dict[str, Path]
     runtime_config: dict[str, Any]
 
     def compile(self):
@@ -39,7 +40,7 @@ class DecodeArtifact:
         from simpler_setup.scene_test import compile_chip_callable_spec, l3_compile_cache_key  # noqa: PLC0415
 
         for filename, digest in self.source_hashes.items():
-            if _sha256(Path(filename)) != digest:
+            if _sha256(self.source_paths[filename]) != digest:
                 raise ValueError(f"artifact source changed after inspection: {filename}")
         identity = hashlib.sha256(json.dumps(self.source_hashes, sort_keys=True).encode()).hexdigest()
         key = l3_compile_cache_key("qwen_hbg_artifact", identity, "decode_fwd", "a2a3", "host_build_graph")
@@ -101,12 +102,13 @@ def inspect_artifact(root: Path) -> DecodeArtifact:
     kernels = copy.deepcopy(config["KERNELS"])
     if len(kernels) != len(manifest["source_incore_bins"]):
         raise ValueError("kernel configuration and verified binary counts differ")
-    hashes = {
-        str(root / "hbg_artifact_manifest.json"): _sha256(root / "hbg_artifact_manifest.json"),
-        str(metadata_path): _sha256(metadata_path),
-        str(config_path): config_hash,
-        str(orchestration_source): _sha256(orchestration_source),
+    paths = {
+        "hbg_artifact_manifest.json": root / "hbg_artifact_manifest.json",
+        "distributed_meta.json": metadata_path,
+        "next_levels/decode_fwd/kernel_config.py": config_path,
+        "next_levels/decode_fwd/orchestration/decode_fwd.cpp": orchestration_source,
     }
+    hashes = {name: _sha256(path) for name, path in paths.items()}
     identifiers = set()
     for kernel in kernels:
         identifier = kernel["func_id"]
@@ -122,7 +124,9 @@ def inspect_artifact(root: Path) -> DecodeArtifact:
             raise ValueError("unsupported kernel core type")
         source = _source_path(kernel["source"], child)
         kernel["source"] = str(source)
-        hashes[str(source)] = _sha256(source)
+        name = str(source.relative_to(root)).replace("\\", "/")
+        paths[name] = source
+        hashes[name] = _sha256(source)
     _validate_signatures(orchestration, kernels)
 
     return DecodeArtifact(
@@ -130,6 +134,7 @@ def inspect_artifact(root: Path) -> DecodeArtifact:
         tuple(names),
         {"name": "decode_fwd", "orchestration": orchestration, "incores": kernels},
         hashes,
+        paths,
         copy.deepcopy(config["RUNTIME_CONFIG"]),
     )
 
