@@ -84,9 +84,7 @@ def validate_kv(worker, devices, fixture, expected, steps):
                         "passed": prefix_equal
                         and tail_zero
                         and all(
-                            m["finite"]
-                            and m["relative_l2"] <= LOGIT_RELATIVE_L2_MAX
-                            and m["cosine"] >= COSINE_MIN
+                            m["finite"] and m["relative_l2"] <= LOGIT_RELATIVE_L2_MAX and m["cosine"] >= COSINE_MIN
                             for m in checks
                         ),
                     }

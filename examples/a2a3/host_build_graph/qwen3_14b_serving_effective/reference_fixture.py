@@ -128,16 +128,14 @@ class ReferenceFixture:
                 raise ValueError(f"Invalid KV tensor in layer {layer}")
         rows = [(logical["key"][0], logical["value"][0])] * self.batch
         for kind_index, kind in enumerate(("key", "value")):
-            physical = torch.zeros(
-                (self.num_pages, self.page_size, self.kv_heads, self.head_dim), dtype=torch.bfloat16
-            )
+            physical = torch.zeros((self.num_pages, self.page_size, self.kv_heads, self.head_dim), dtype=torch.bfloat16)
             for row, tensors in enumerate(rows):
                 padded = torch.zeros(
                     (self.kv_heads, self.pages_per_request * self.page_size, self.head_dim), dtype=torch.bfloat16
                 )
                 padded[:, : self.length] = tensors[kind_index]
-                pages = padded.reshape(
-                    self.kv_heads, self.pages_per_request, self.page_size, self.head_dim
-                ).permute(1, 2, 0, 3)
+                pages = padded.reshape(self.kv_heads, self.pages_per_request, self.page_size, self.head_dim).permute(
+                    1, 2, 0, 3
+                )
                 physical[row * self.pages_per_request : (row + 1) * self.pages_per_request] = pages
             yield kind, physical
