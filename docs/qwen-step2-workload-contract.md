@@ -1,14 +1,16 @@
 # Qwen step-two workload contract
 
 The real Qwen3-14B workload is qualified through `Worker.submit` at launch depth one.
-The complete input and environment binding is recorded in
-[`qwen-step2-workload-manifest.json`](qwen-step2-workload-manifest.json).
 The qualification entry is
 `examples/a2a3/host_build_graph/qwen3_14b_serving_effective/reference_worker_submit.py`.
 It consumes an external, checksum-sealed `qwen-reference-logical-kv-v1` bundle.
-The manifest uses logical external identifiers; local model, fixture, artifact,
-and toolchain paths are supplied by the invocation environment and are never
-part of the repository contract.
+
+The digests that pin the external model and prompt are held as constants in
+`examples/a2a3/host_build_graph/qwen3_14b_serving_effective/validate_real_inputs.py`,
+which is the only reader that compares them. This page describes the contract;
+that module enforces it. Local model, fixture, artifact and toolchain paths are
+supplied by the invocation environment and are never part of the repository
+contract.
 
 ## Frozen workload
 

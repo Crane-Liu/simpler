@@ -121,7 +121,6 @@ nav:
       - Qwen workload contract: qwen-step2-workload-contract.md
       - Qwen execution map: qwen-step2-execution-map.md
       - Qwen input evidence: qwen-step2-real-input-evidence.md
-      - Qwen workload manifest: qwen-step2-workload-manifest.json
       - Hardware:
           - Overview: hardware/README.md
           - Chip architecture: hardware/chip-architecture.md

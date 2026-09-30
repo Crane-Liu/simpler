@@ -7,7 +7,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Validate the external model, prompt, fixture, and generated Qwen artifact inputs."""
+"""Validate the external model, prompt, fixture, and generated Qwen artifact inputs.
+
+The model and prompt this qualification is frozen against live outside the
+repository, so their content is the only thing that can be pinned here. The
+digests below are those pins, and this module is their only reader: it compares
+them before any device work, so a checkpoint or prompt that is not the frozen
+one fails here rather than producing numbers against the wrong inputs.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +25,23 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+
+# The frozen prompt, in the form `prompt_contract` returns so the two compare whole.
+EXPECTED_PROMPT: dict[str, Any] = {
+    "prompt_sha256": "6b3e99d56ed58d58d98f149be7a68d2e454df2447414ac51f3f46da92adb9dfd",
+    "prompt_token_count": 3338,
+    "prompt_token_ids_sha256": "8db4a9a6897a5ae237fd3806ce39b4d49a549f8faf2881d5ae5740d5e6be6bb9",
+    "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+}
+
+# Every checkpoint file this qualification reads, and the digest it must have.
+# A required file with no digest here is a failure rather than an unchecked pass.
+EXPECTED_MODEL_FILES: dict[str, str] = {
+    "config.json": "e73c3664ca09b10a673fef0c22e8a6b456201d49bd4713c9691f775720e8857a",
+    "model.safetensors.index.json": "62d7ad35757bae5e7baa452cb1483178b7daa50e869e923226b8da10871f7ebc",
+    "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    "generation_config.json": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -42,16 +66,14 @@ def prompt_contract(prompt: Path, tokenizer: Path) -> dict[str, Any]:
     }
 
 
-def validate_model(model_dir: Path, expected: dict[str, str]) -> dict[str, str]:
-    required = ("config.json", "model.safetensors.index.json", "tokenizer.json", "generation_config.json")
+def validate_model(model_dir: Path) -> dict[str, str]:
     observed = {}
-    for name in required:
+    for name, expected_hash in EXPECTED_MODEL_FILES.items():
         path = model_dir / name
         if not path.is_file():
             raise FileNotFoundError(path)
         observed[name] = sha256_file(path)
-        expected_hash = expected.get(f"model_{name.replace('.', '_')}_sha256")
-        if expected_hash is not None and observed[name] != expected_hash:
+        if observed[name] != expected_hash:
             raise ValueError(f"model checksum mismatch: {name}")
     config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     if int(config.get("num_hidden_layers", 0)) != 40 or int(config.get("hidden_size", 0)) != 5120:
@@ -69,13 +91,11 @@ def _load_module(name: str, path: Path):
     return module
 
 
-def validate_inputs(manifest_path: Path, *, model_dir: Path, prompt: Path, fixture: Path | None, artifact: Path | None):
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    expected_prompt = manifest["prompt"]
+def validate_inputs(*, model_dir: Path, prompt: Path, fixture: Path | None, artifact: Path | None):
     observed_prompt = prompt_contract(prompt, model_dir / "tokenizer.json")
-    if observed_prompt != expected_prompt:
+    if observed_prompt != EXPECTED_PROMPT:
         raise ValueError(f"prompt/tokenizer contract mismatch: {observed_prompt}")
-    model_hashes = validate_model(model_dir, manifest.get("model_checksums", {}))
+    model_hashes = validate_model(model_dir)
     report = {"prompt": observed_prompt, "model_checksums": model_hashes}
     if fixture is not None:
         fixture_module = _load_module("_qwen_fixture_validator", Path(__file__).with_name("fixture.py"))
@@ -98,14 +118,12 @@ def validate_inputs(manifest_path: Path, *, model_dir: Path, prompt: Path, fixtu
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--prompt", type=Path, required=True)
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--artifact", type=Path)
     args = parser.parse_args(argv)
     report = validate_inputs(
-        args.manifest,
         model_dir=args.model_dir,
         prompt=args.prompt,
         fixture=args.fixture,

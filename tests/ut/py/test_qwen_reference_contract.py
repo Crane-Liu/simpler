@@ -90,3 +90,81 @@ def test_reference_rejects_changed_payload(tmp_path):
         stream.write(b"changed")
     with pytest.raises(ValueError, match="Checksum mismatch"):
         fixture_type(tmp_path)
+
+
+def _validator():
+    validator_spec = importlib.util.spec_from_file_location("qwen_input_validator", CASE / "validate_real_inputs.py")
+    assert validator_spec is not None and validator_spec.loader is not None
+    module = importlib.util.module_from_spec(validator_spec)
+    validator_spec.loader.exec_module(module)
+    return module
+
+
+def _model_dir(tmp_path):
+    """A checkpoint whose four required files exist and carry the geometry the validator demands."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({"num_hidden_layers": 40, "hidden_size": 5120}))
+    (model_dir / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}))
+    (model_dir / "tokenizer.json").write_text("{}")
+    (model_dir / "generation_config.json").write_text(json.dumps({"do_sample": False}))
+    return model_dir
+
+
+def test_the_tokenizer_is_pinned_to_one_digest():
+    """The prompt contract and the checkpoint file list name the same tokenizer.json.
+
+    Two pins on one file: a re-pin that updates one and not the other leaves the
+    validator accepting a checkpoint whose tokenizer the prompt pin rejects.
+    """
+    validator = _validator()
+    assert validator.EXPECTED_PROMPT["tokenizer_sha256"] == validator.EXPECTED_MODEL_FILES["tokenizer.json"]
+
+
+def test_every_pinned_checkpoint_file_is_compared(tmp_path, monkeypatch):
+    """A mismatch in any one required file fails, and a missing file fails.
+
+    Every entry in the pin set is compared, so no required file can pass unchecked —
+    which is what a lookup keyed on anything other than the file's own name allows
+    when the key it derives is absent.
+    """
+    validator = _validator()
+    model_dir = _model_dir(tmp_path)
+    pinned = {
+        name: hashlib.sha256((model_dir / name).read_bytes()).hexdigest() for name in validator.EXPECTED_MODEL_FILES
+    }
+    monkeypatch.setattr(validator, "EXPECTED_MODEL_FILES", pinned)
+    assert validator.validate_model(model_dir) == pinned
+
+    for name in pinned:
+        with (model_dir / name).open("ab") as stream:
+            stream.write(b" ")
+        with pytest.raises(ValueError, match=f"model checksum mismatch: {name}"):
+            validator.validate_model(model_dir)
+        (model_dir / name).write_bytes((model_dir / name).read_bytes()[:-1])
+
+    (model_dir / "generation_config.json").unlink()
+    with pytest.raises(FileNotFoundError):
+        validator.validate_model(model_dir)
+
+
+def test_a_prompt_that_is_not_the_pinned_one_is_refused(tmp_path, monkeypatch):
+    """The frozen prompt is enforced against the contract computed from the file."""
+    validator = _validator()
+    model_dir = _model_dir(tmp_path)
+    monkeypatch.setattr(
+        validator,
+        "EXPECTED_MODEL_FILES",
+        {name: hashlib.sha256((model_dir / name).read_bytes()).hexdigest() for name in validator.EXPECTED_MODEL_FILES},
+    )
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("not the frozen prompt")
+
+    monkeypatch.setattr(validator, "prompt_contract", lambda *_: dict(validator.EXPECTED_PROMPT, prompt_token_count=7))
+    with pytest.raises(ValueError, match="prompt/tokenizer contract mismatch"):
+        validator.validate_inputs(model_dir=model_dir, prompt=prompt, fixture=None, artifact=None)
+
+    monkeypatch.setattr(validator, "prompt_contract", lambda *_: dict(validator.EXPECTED_PROMPT))
+    report = validator.validate_inputs(model_dir=model_dir, prompt=prompt, fixture=None, artifact=None)
+    assert report["prompt"] == validator.EXPECTED_PROMPT
+    assert set(report["model_checksums"]) == set(validator.EXPECTED_MODEL_FILES)

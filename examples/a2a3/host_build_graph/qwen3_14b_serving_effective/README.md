@@ -101,6 +101,23 @@ source rewriting without requiring model weights or an NPU.
 
 ## Qualify a sealed logical KV reference
 
+`validate_real_inputs.py` checks the external inputs before any device work. It
+compares the checkpoint files and the prompt/tokenizer contract against the
+digests pinned in that module, and reports the fixture schema and artifact ABI
+it was given:
+
+```bash
+python validate_real_inputs.py \
+  --model-dir /path/to/Qwen3-14B \
+  --prompt /path/to/prompt.txt \
+  --fixture /path/to/reference-kv \
+  --artifact /path/to/verified-hbg-artifact
+```
+
+A digest mismatch fails here rather than producing numbers against the wrong
+inputs. Re-pinning a different prompt or checkpoint means editing
+`EXPECTED_PROMPT` / `EXPECTED_MODEL_FILES` in that module.
+
 `reference_worker_submit.py` consumes a `qwen-reference-logical-kv-v1` bundle and
 an appended-KV reference identifying the same initial bundle. It verifies model
 hashes, materializes independent BSND pages for 16 requests and executes the real
