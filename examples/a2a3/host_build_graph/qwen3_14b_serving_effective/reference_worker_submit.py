@@ -126,23 +126,6 @@ def allocate_resident(worker, devices, hosts, fixture, model):
             finally:
                 staging.close()
     print("uploaded all 40 KV layers", flush=True)
-    if fixture.distinct:
-        shape = (fixture.num_pages, PAGE, HEADS, HEAD_DIM)
-        nbytes = math.prod(shape) * 2
-        expected = dict(fixture.layer(0))
-        staging = worker.create_buffer(nbytes)
-        try:
-            for name in ("k_cache", "v_cache"):
-                worker.copy_from(staging, devices[name], src_offset=0)
-                actual = _view(staging, shape, torch.bfloat16).clone()
-                delta = actual - expected["key" if name == "k_cache" else "value"]
-                print(
-                    f"input_kv_check {name} max_abs={float(delta.float().abs().max())} "
-                    f"nonzero={int(delta.ne(0).sum())}",
-                    flush=True,
-                )
-        finally:
-            staging.close()
     for name, shape, dtype in (
         ("seq_lens", (BATCH,), torch.int32),
         ("slot_mapping", (BATCH,), torch.int32),
@@ -157,7 +140,7 @@ def allocate_resident(worker, devices, hosts, fixture, model):
         worker.copy_to(devices[name], hosts[name])
 
 
-def main():
+def main():  # noqa: PLR0912, PLR0915 -- execution and finalization share one report
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--artifact", type=Path, required=True)
@@ -166,10 +149,16 @@ def main():
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--kv-reference", type=Path)
+    parser.add_argument(
+        "--depth2-probe",
+        action="store_true",
+        help="record a requested depth=2 probe and run the safe serial depth=1 fallback",
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     _LAST_OUTPUT["path"] = args.output
     repo_root = Path(__file__).resolve().parents[4]
+    depth2_fallback = args.depth2_probe
     torch.set_num_threads(8)
     fixture = ReferenceFixture(args.fixture)
     if not 1 <= args.steps <= fixture.steps:
@@ -189,6 +178,11 @@ def main():
         "status": "running",
         "steps_requested": args.steps,
         "launch_depth": 1,
+        "launch_depth_requested": 2 if args.depth2_probe else 1,
+        "depth2_policy": "safe_serial_fallback" if args.depth2_probe else "serial_default",
+        "depth2_conclusion": (
+            "safe_serial_fallback_host_sampled_token_feedback" if depth2_fallback else "not_requested"
+        ),
         "eos_policy": "fixed dispatch count; compare all frozen tokens",
         "logit_gate": {
             "relative_l2_max": LOGIT_RELATIVE_L2_MAX,
@@ -235,10 +229,11 @@ def main():
         num_sub_workers=0,
         launch_depth=1,
     )
-    chip_handle = worker.register(chip)
     devices, hosts = {}, {}
-    worker.init()
+    failure = None
     try:
+        chip_handle = worker.register(chip)
+        worker.init()
         allocate_resident(worker, devices, hosts, fixture, args.model)
         config = CallConfig()
         config.enable_dep_gen = False
@@ -305,24 +300,53 @@ def main():
         report["status"] = "passed"
         report["completed_steps"] = adapter.completed_steps
     except BaseException as error:
+        failure = error
         report["status"] = "failed"
         report["error"] = f"{type(error).__name__}: {error}"
-        raise
     finally:
-        (args.output / "result.json").write_text(json.dumps(report, indent=2))
-        worker.close()
+        try:
+            worker.close()
+        except BaseException as error:
+            report["cleanup_error"] = f"{type(error).__name__}: {error}"
+            if failure is None:
+                failure = error
+                report["status"] = "failed"
+                report["error"] = report["cleanup_error"]
+            else:
+                error.__context__ = failure.__context__
+                failure.__context__ = error
+        try:
+            (args.output / "result.json").write_text(json.dumps(report, indent=2))
+        except BaseException as error:
+            if failure is None:
+                failure = error
+            else:
+                error.__context__ = failure.__context__
+                failure.__context__ = error
+    if failure is not None:
+        raise failure
     return 0
 
 
-if __name__ == "__main__":
+def cli():
     try:
-        raise SystemExit(main())
+        return main()
     except BaseException as error:
+        if isinstance(error, SystemExit) and error.code in (None, 0):
+            raise
         output_path = _LAST_OUTPUT.get("path")
         if output_path is not None:
             result_path = output_path / "result.json"
-            if not result_path.exists():
-                result_path.write_text(
-                    json.dumps({"status": "failed", "error": f"{type(error).__name__}: {error}"}, indent=2)
-                )
+            try:
+                if not result_path.exists():
+                    result_path.write_text(
+                        json.dumps({"status": "failed", "error": f"{type(error).__name__}: {error}"}, indent=2)
+                    )
+            except BaseException as report_error:
+                report_error.__context__ = error.__context__
+                error.__context__ = report_error
         raise
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

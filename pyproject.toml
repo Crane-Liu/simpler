@@ -36,9 +36,9 @@ test = [
     "pytest-timeout>=2.3",
     "pytest-xdist>=3.0",
     "PyYAML>=6.0",
-    "numpy>=1.24",
-    "safetensors>=0.4",
     "torch>=2.3",
+    "safetensors>=0.4",
+    "numpy>=1.24",
 ]
 
 [tool.ruff]

@@ -9,10 +9,9 @@ dispatches. Single- and dual-slot execution use separate Python entry points.
 
 The input is a generated Qwen decode artifact containing the distributed host
 wrapper and one chip callable. The adapter preserves the source in-core programs
-and converts the generated child runtime to `host_build_graph`. Generated artifacts
-may use either a per-layer Definition or the flat 40-layer orchestration emitted by
-the serving compiler; the latter is recorded with `graph_definition_count: 0` and
-its emitted task count:
+and converts the generated child runtime to `host_build_graph`. The adapter accepts
+the recognized per-layer Definition form and rejects incomplete or unrecognized
+orchestration:
 
 ```bash
 PYTHONPATH=/path/to/pypto/python:/path/to/simpler/python \
@@ -101,23 +100,6 @@ source rewriting without requiring model weights or an NPU.
 
 ## Qualify a sealed logical KV reference
 
-`validate_real_inputs.py` checks the external inputs before any device work. It
-compares the checkpoint files and the prompt/tokenizer contract against the
-digests pinned in that module, and reports the fixture schema and artifact ABI
-it was given:
-
-```bash
-python validate_real_inputs.py \
-  --model-dir /path/to/Qwen3-14B \
-  --prompt /path/to/prompt.txt \
-  --fixture /path/to/reference-kv \
-  --artifact /path/to/verified-hbg-artifact
-```
-
-A digest mismatch fails here rather than producing numbers against the wrong
-inputs. Re-pinning a different prompt or checkpoint means editing
-`EXPECTED_PROMPT` / `EXPECTED_MODEL_FILES` in that module.
-
 `reference_worker_submit.py` consumes a `qwen-reference-logical-kv-v1` bundle and
 an appended-KV reference identifying the same initial bundle. It verifies model
 hashes, materializes independent BSND pages for 16 requests and executes the real
@@ -145,5 +127,71 @@ The original prefill bundle remains sealed. The appended-KV bundle contains
 `[8, 127, 128]`, and a manifest recording `reference_sums_sha256`,
 `appended_sha256`, `steps`, `layers`, `layout`, and reference token/logit equality.
 
-The host feedback edge is serial. This qualification does not establish DEVICE
-early enqueue; see the [execution map](../../../../docs/qwen-step2-execution-map.md).
+### Reference workload and validation
+
+The reference workload uses Qwen3-14B's 40 layers, hidden size 5120, eight KV
+heads and head dimension 128. Weights and KV use BF16; logits use FP32 and
+sampling uses greedy argmax. The fixture contains one real 3338-token prompt,
+replicated across 16 requests with independent physical pages. It does not
+reproduce a vLLM scheduler's batch allocation history or qualify distinct prompts.
+
+The initial KV snapshot covers prompt positions 0 through 3337. The first
+generated token has been sampled but is not cached. The 127 decode dispatches
+therefore produce 128 generated tokens including that prefill token. Every
+frozen token is compared, including EOS; EOS does not stop qualification early.
+
+Logical initial KV has shape `[1, 8, 3338, 128]`, with keys after Q/K normalization
+and RoPE. Each physical layer cache uses BSND shape `[448, 128, 8, 128]`, with
+28 pages per request and a 32-column block table. Both complete caches occupy
+8.75 GiB of device storage. Decode step 118 crosses a page boundary.
+
+The loader checks bundle checksums, model checkpoint hashes, supported geometry,
+finite KV values and reference restoration. `reference_fixture.py` translates
+the logical bundle into the standalone adapter contract; the
+`serving-tmr-standalone-fixture-v1` schema remains separate. The qualified
+25-argument artifact has 39 in-core kernels and 277 tasks per layer. The bridge
+recompiles verified sources against the selected Simpler headers and tools;
+historical binaries provide provenance. The bridge's 26-argument ABI with
+`sampled_ids_host` is outside this reference consumer's hardware qualification.
+
+The result records run IDs, positions, slots, artifact and consumer-source hashes,
+and loaded-runtime binary hashes. Hardware measurements are recorded in
+[PR #2447](https://github.com/hw-native-sys/simpler/pull/2447) and
+[PR #2456](https://github.com/hw-native-sys/simpler/pull/2456).
+
+### Execution dependencies and lifetime
+
+The reference consumer uses `Worker(level=3)` with A3 `host_build_graph` and one
+local chip child. Each step uploads the actual previous sampled token and step
+metadata, calls `Worker.submit`, waits for `RunHandle.result(timeout=120)`,
+explicitly copies sampled output and logits to the host, validates them, and
+calls `complete_step`. Reference tokens are comparison data, never substituted
+future inputs. `next_step()` rejects a second reservation while a step is in flight.
+
+- Weights and RoPE are read-only and uploaded before the first run.
+- KV is shared mutable device storage; the next step waits for the prior run's
+  completion. Metadata values may be prepared early, but their device buffers
+  cannot be reused before the previous consumer completes.
+- Logits, sampled output and scratch storage are reused only after completion
+  and required readback. Report-owned copies preserve consumed results.
+- Worker-owned device allocations remain resident through `Worker.close`.
+  Temporary host upload buffers close after synchronous copies complete. Run
+  handles remain available through the chain. Device completion, host visibility
+  and eligibility for release are separate events.
+
+The host feedback edge is serial. Passing `--depth2-probe` records
+`launch_depth_requested=2`, but keeps effective `launch_depth=1` and reports
+`depth2_conclusion=safe_serial_fallback_host_sampled_token_feedback`. It does not
+enable early enqueue. A dependent successor would require a device sampled-output
+to next-input dependency, per-run metadata/output storage, last-consumer lifetime
+guarantees, and runtime support for joined DEVICE-backed launches.
+
+A numerical mismatch, run error or timeout stops further submission. Registration
+and initialization failures also trigger Worker cleanup. The consumer closes the
+Worker before writing the final report, and cleanup failure marks the report
+failed. An execution error remains primary if cleanup or report writing also
+fails; secondary errors remain in its exception context.
+
+This reference qualification covers serial correctness on A3 HBG. It does not
+establish full vLLM serving, dynamic request admission, A5/TMR coverage,
+capture/replay, implicit host/device synchronization or a performance improvement.

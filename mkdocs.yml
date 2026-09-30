@@ -118,9 +118,6 @@ nav:
       - A5 AICPU core selection: design/a5-fg-pg-core-selection.en.md
       - Run completion fences: design/run-completion-fence.md
       - Worker Manager: worker-manager.md
-      - Qwen workload contract: qwen-step2-workload-contract.md
-      - Qwen execution map: qwen-step2-execution-map.md
-      - Qwen input evidence: qwen-step2-real-input-evidence.md
       - Hardware:
           - Overview: hardware/README.md
           - Chip architecture: hardware/chip-architecture.md
