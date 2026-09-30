@@ -786,6 +786,7 @@ class _EarlyEnqueueBase(SceneTestCase):
         """
         buffers = []
         tensors = []
+        # Distinct output sentinels keep result attribution observable for both runs.
         for value in (2.0, 3.0, 0.0, 5.0, 7.0, 0.0):
             buffer, tensor = self._tensor_from_host_buffer(worker, value)
             buffers.append(buffer)

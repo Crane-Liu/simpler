@@ -96,6 +96,8 @@ struct EarlyLaunchHarness {
     /** That run's dispatch reaching an endpoint outcome. */
     void accept(const Run &run) { orch.mark_task_accepted(run.task.task_slot); }
 
+    const TaskSlotState &state(const Run &run) { return *allocator.slot_state(run.task.task_slot); }
+
     /** Drive a run's only task to completion so the run retires. */
     void complete(const Run &run) {
         allocator.slot_state(run.task.task_slot)->state.store(TaskState::COMPLETED, std::memory_order_release);
@@ -112,6 +114,33 @@ TEST(EarlyLaunchAdmission, DepthOneAuthorizesNothingHoweverReadyThePairIs) {
     ASSERT_EQ(h.orch.active_run_id(), first.id);
     ASSERT_EQ(h.orch.preparable_run_id(), second.id);
     EXPECT_EQ(h.orch.early_launch_run_id(), INVALID_RUN_ID);
+}
+
+TEST(EarlyLaunchAdmission, DistinctSubmissionsOwnIdentityAndLease) {
+    EarlyLaunchHarness h(/*depth=*/2, /*launch_depth=*/2);
+    const auto first = h.build_closed_run(0xA001);
+    const auto second = h.build_closed_run(0xA002);
+
+    const Tensor &first_tensor = h.state(first).task_args.tensor(0);
+    const Tensor &second_tensor = h.state(second).task_args.tensor(0);
+    EXPECT_NE(first_tensor.buffer.identity.buffer_id, second_tensor.buffer.identity.buffer_id);
+
+    EXPECT_NE(first.id, second.id);
+    EXPECT_NE(first.task.task_slot, second.task.task_slot);
+    const PipelineSlotLease first_lease = h.state(first).pipeline_lease;
+    const PipelineSlotLease second_lease = h.state(second).pipeline_lease;
+    ASSERT_NE(first_lease.generation, 0u);
+    ASSERT_NE(second_lease.generation, 0u);
+    EXPECT_NE(first_lease.slot_id, second_lease.slot_id);
+
+    h.accept(first);
+    EXPECT_EQ(h.orch.early_launch_run_id(), second.id);
+    h.accept(second);
+
+    h.complete(first);
+    h.complete(second);
+    h.orch.release_run(first.id);
+    h.orch.release_run(second.id);
 }
 
 TEST(EarlyLaunchAdmission, ClosedSubmissionAloneIsNotTheBoundary) {
