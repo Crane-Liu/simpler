@@ -127,13 +127,13 @@ def test_sampled_ids_are_reset_before_each_device_submission():
 
 def test_native_join_requires_attributed_ordered_device_boundaries():
     spans = [
-        SimpleNamespace(pid=7, inv=10, name="chip.run", attrs="run_id=1 dispatch_id=20 slot_id=0"),
-        SimpleNamespace(pid=7, inv=11, name="chip.run", attrs="run_id=2 dispatch_id=21 slot_id=1"),
+        SimpleNamespace(pid=7, inv=10, name="chip.run", attrs="run_id=1 dispatch_id=20 slot_id=0 run_epoch=1"),
+        SimpleNamespace(pid=7, inv=11, name="chip.run", attrs="run_id=2 dispatch_id=21 slot_id=1 run_epoch=2"),
         SimpleNamespace(
             pid=7,
             inv=11,
             name="chip.run.joined_launch",
-            attrs="p_disp=20 p_slot=0 s_disp=21 s_slot=1 observed=1 unfired=1 rc=0",
+            attrs="p_disp=20 p_slot=0 p_epoch=1 s_disp=21 s_slot=1 s_epoch=2 observed=1 unfired=1 rc=0",
         ),
         SimpleNamespace(
             pid=7,

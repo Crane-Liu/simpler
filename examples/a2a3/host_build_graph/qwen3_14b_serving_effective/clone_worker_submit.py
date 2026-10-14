@@ -136,25 +136,53 @@ def _attributes(span):
     return dict(part.split("=", 1) for part in span.attrs.split() if "=" in part)
 
 
-def _first_join_evidence(spans, run_ids):
+def _ordered_device_ticks(predecessor, successor):
+    if predecessor.get("wo_rc") != "0" or successor.get("aic_rc") != "0":
+        raise AssertionError("device boundary timestamps are unavailable")
+    if predecessor.get("dev_id") != successor.get("dev_id") or predecessor.get("ts_hz") != successor.get("ts_hz"):
+        raise AssertionError("request device clocks are not comparable")
+    end, start = int(predecessor["wo_end"]), int(successor["aic_start"])
+    if end <= 0 or start <= 0 or int(predecessor["ts_hz"]) <= 0:
+        raise AssertionError("device boundary timestamps are invalid")
+    if start < end:
+        raise AssertionError("successor operator overlapped its predecessor")
+    return start - end
+
+
+def _first_join_evidence(spans, run_ids, *, allow_serial=False):
     runs = {}
     boundaries = {}
     joins = []
+    launches = set()
     for span in spans:
-        if span.name not in {"chip.run", "chip.run.runner_run.device_boundaries", "chip.run.joined_launch"}:
+        if span.name not in {
+            "chip.run",
+            "chip.run.runner_run.device_boundaries",
+            "chip.run.joined_launch",
+            "chip.run.runner_run.aicpu_launch",
+        }:
             continue
         fields = _attributes(span)
         if span.name == "chip.run" and int(fields.get("run_id", -1)) in run_ids:
-            runs[int(fields["run_id"])] = (span.pid, span.inv, int(fields["dispatch_id"]), int(fields["slot_id"]))
+            runs[int(fields["run_id"])] = (
+                span.pid,
+                span.inv,
+                int(fields["dispatch_id"]),
+                int(fields["slot_id"]),
+                int(fields["run_epoch"]),
+            )
         elif span.name == "chip.run.runner_run.device_boundaries":
             boundaries[span.pid, span.inv] = fields
         elif span.name == "chip.run.joined_launch":
             joins.append((span.pid, fields))
+        elif span.name == "chip.run.runner_run.aicpu_launch":
+            launches.add((span.pid, span.inv))
     if len(runs) != 2:
         return None
     first, second = (runs[run_id] for run_id in run_ids)
     if first[0] != second[0]:
         raise AssertionError("requests ran on different chip children")
+    joined = False
     for pid, fields in joins:
         if (
             pid == first[0]
@@ -162,64 +190,77 @@ def _first_join_evidence(spans, run_ids):
             and int(fields.get("p_slot", -1)) == first[3]
             and int(fields.get("s_disp", -1)) == second[2]
             and int(fields.get("s_slot", -1)) == second[3]
-            and fields.get("observed") == "1"
-            and fields.get("unfired") == "1"
-            and fields.get("rc") == "0"
         ):
-            predecessor = boundaries.get(first[:2])
-            successor = boundaries.get(second[:2])
-            if predecessor is None or successor is None:
+            if int(fields.get("p_epoch", -1)) != first[4] or int(fields.get("s_epoch", -1)) != second[4]:
                 return None
-            if predecessor.get("wo_rc") != "0" or successor.get("aic_rc") != "0":
-                raise AssertionError("device boundary timestamps are unavailable")
-            if predecessor.get("dev_id") != successor.get("dev_id") or predecessor.get("ts_hz") != successor.get(
-                "ts_hz"
-            ):
-                raise AssertionError("request device clocks are not comparable")
-            end, start = int(predecessor["wo_end"]), int(successor["aic_start"])
-            if start < end:
-                raise AssertionError("successor operator overlapped its predecessor")
-            return {
-                "predecessor_dispatch": first[2],
-                "successor_dispatch": second[2],
-                "serial_device_ticks": start - end,
-            }
-    return None
+            if fields.get("observed") != "1" or fields.get("unfired") != "1" or fields.get("rc") != "0":
+                return None
+            joined = True
+            break
+    if not joined and not (allow_serial and second[:2] in launches):
+        return None
+    predecessor = boundaries.get(first[:2])
+    successor = boundaries.get(second[:2])
+    if predecessor is None or successor is None:
+        return None
+    result = {
+        "predecessor_dispatch": first[2],
+        "successor_dispatch": second[2],
+        "serial_device_ticks": _ordered_device_ticks(predecessor, successor),
+    }
+    if allow_serial:
+        result["kind"] = "joined" if joined else "serial_launch"
+    return result
 
 
-def _await_joined_evidence(log_directory, child_pids, run_pairs, timeout=10.0):
+class JoinedEvidenceError(AssertionError):
+    def __init__(self, missing_pairs, joined_count):
+        super().__init__(f"joined native launch evidence missing for {len(missing_pairs)} request pairs")
+        self.missing_pairs = tuple(missing_pairs)
+        self.joined_count = joined_count
+
+
+def _await_joined_evidence(log_directory, child_pids, run_pairs, timeout=10.0, *, allow_serial=False):
     deadline = time.monotonic() + timeout
     offsets = {pid: 0 for pid in child_pids}
     spans = []
     pending = list(run_pairs)
     evidence = {}
     while True:
+        updated = False
         for pid in child_pids:
             path = log_directory / f"host.{pid}.log"
             try:
-                blob = path.read_bytes()
+                with path.open("rb") as stream:
+                    stream.seek(offsets[pid])
+                    window = stream.read()
             except OSError:
                 continue
-            window = blob[offsets[pid] :]
             consumed = window.rfind(b"\n") + 1
             if consumed > 0:
                 offsets[pid] += consumed
                 spans.extend(parse_spans(window[:consumed].decode("utf-8", errors="replace").splitlines()))
-        for run_ids in tuple(pending):
-            pair_evidence = _first_join_evidence(spans, run_ids)
-            if pair_evidence is not None:
-                evidence[run_ids] = pair_evidence
-                pending.remove(run_ids)
+                updated = True
+        if updated:
+            for run_ids in tuple(pending):
+                pair_evidence = _first_join_evidence(spans, run_ids, allow_serial=allow_serial)
+                if pair_evidence is not None:
+                    evidence[run_ids] = pair_evidence
+                    pending.remove(run_ids)
         if not pending:
             ticks = [item["serial_device_ticks"] for item in evidence.values()]
-            return {
+            result = {
                 "pair_count": len(evidence),
                 "first": evidence[run_pairs[0]],
                 "serial_device_ticks_min": min(ticks),
                 "serial_device_ticks_max": max(ticks),
             }
+            if allow_serial:
+                serial_pairs = tuple(pair for pair, item in evidence.items() if item["kind"] == "serial_launch")
+                result.update(pair_count=len(evidence) - len(serial_pairs), serial_pairs=serial_pairs)
+            return result
         if time.monotonic() >= deadline:
-            raise AssertionError(f"joined native launch evidence missing for {len(pending)} request pairs")
+            raise JoinedEvidenceError(pending, len(evidence))
         time.sleep(0.05)
 
 

@@ -221,3 +221,41 @@ requires exact sampled tokens, logits/KV numerical gates, request-private
 storage isolation, and an attributable joined-launch trace for every decode pair
 showing the second enqueue before the first operator ends while device execution
 remains serial.
+
+## DEVICE feedback chain
+
+`device_feedback_worker_submit.py` qualifies continuous autoregressive feedback
+on one A3 HBG chip child with at most two pending runs. After completing the
+oldest handle, it refills the queue before waiting for its successor. Two frames
+hold metadata, hidden scratch and HOST logits. The bridge seeds the HOST logits
+as INOUT so HBG uploads a NaN sentinel and publishes the run's logits at its own
+completion. Each frame is read and validated before reuse.
+
+Sampled tokens use DEVICE buffers, initialized to a sentinel before submission.
+Each successor binds the actual preceding DEVICE output. The fixed-count audit
+retains these small token buffers until all consumers complete and host late
+readback validates every token. Device output capacity is checked before
+allocation; weights and KV remain resident. The submission loop performs no
+direct-control device copies.
+
+```bash
+python device_feedback_worker_submit.py \
+  --fixture /path/to/reference-kv \
+  --kv-reference /path/to/reference-decode-kv \
+  --artifact /path/to/verified-hbg-artifact \
+  --model /path/to/Qwen3-14B \
+  --device DEVICE_ID --steps 127 --output /path/to/new-result-directory
+```
+
+Native traces must identify every launch, match joined epochs and prove serial
+device boundaries for every adjacent pair. Qualification requires real joined
+launches, including a refill beyond the initial two submissions. Observed serial
+launches remain in `fallback_edges`; missing evidence and an all-fallback chain
+fail. Tokens, logits and appended KV must pass their gates.
+
+The report separates accepted submissions, prepare-only staged dispatches,
+native enqueues and successful handle completions. Retirement is recorded only
+after successful Worker close, with that basis stated explicitly. Failed reports
+retain accepted run IDs and distinguish incomplete trace observations from zero
+enqueues. Failed close leaves host buffers retained. The qualified scope is
+fixed-count A3 HBG decode with known layouts, one endpoint and diagnostics off.

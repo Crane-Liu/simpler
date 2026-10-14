@@ -28,7 +28,7 @@ class DecodeArtifact:
     source_paths: dict[str, Path]
     runtime_config: dict[str, Any]
 
-    def compile(self):
+    def compile(self, *, seed_outputs=()):
         """Recompile generated sources using current runtime headers and tools."""
         from simpler_setup.scene_test import compile_chip_callable_spec, l3_compile_cache_key  # noqa: PLC0415
 
@@ -36,8 +36,22 @@ class DecodeArtifact:
             if _sha256(self.source_paths[filename]) != digest:
                 raise ValueError(f"artifact source changed after inspection: {filename}")
         identity = hashlib.sha256(json.dumps(self.source_hashes, sort_keys=True).encode()).hexdigest()
+        spec = self.callable_spec
+        if seed_outputs:
+            from simpler.task_interface import ArgDirection  # noqa: PLC0415
+
+            signature = list(spec["orchestration"]["signature"])
+            if len(signature) != len(self.parameter_names):
+                raise ValueError("seeded outputs require matching host and child tensor counts")
+            for name in seed_outputs:
+                index = self.parameter_names.index(name)
+                if index >= len(signature) or signature[index] != ArgDirection.OUT:
+                    raise ValueError(f"seeded output {name} must have an OUT declaration")
+                signature[index] = ArgDirection.INOUT
+            spec = {**spec, "orchestration": {**spec["orchestration"], "signature": signature}}
+            identity = hashlib.sha256(json.dumps([identity, list(seed_outputs)]).encode()).hexdigest()
         key = l3_compile_cache_key("qwen_hbg_artifact", identity, "decode_fwd", "a2a3", "host_build_graph")
-        return compile_chip_callable_spec(self.callable_spec, "a2a3", "host_build_graph", key)
+        return compile_chip_callable_spec(spec, "a2a3", "host_build_graph", key)
 
 
 def _sha256(path: Path) -> str:

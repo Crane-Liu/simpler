@@ -131,6 +131,27 @@ def test_compile_preserves_child_abi_separately_from_host_params(bridge, artifac
     assert set(inspected.source_hashes) == set(inspected.source_paths)
 
 
+def test_seeded_host_output_has_distinct_signature_and_cache_identity(bridge, artifact, monkeypatch):
+    inspected = bridge.inspect_artifact(artifact)
+    with pytest.raises(ValueError, match="matching host and child tensor counts"):
+        inspected.compile(seed_outputs=("out",))
+    inspected.parameter_names = ("input", "state", "out")
+    calls = []
+    monkeypatch.setattr(
+        importlib.import_module("simpler_setup.scene_test"),
+        "compile_chip_callable_spec",
+        lambda *args: calls.append(args),
+    )
+    inspected.compile()
+    inspected.compile(seed_outputs=("out",))
+    assert calls[0][0]["orchestration"]["signature"][-1] == ArgDirection.OUT
+    assert calls[1][0]["orchestration"]["signature"][-1] == ArgDirection.INOUT
+    assert calls[0][-1] != calls[1][-1]
+    assert inspected.callable_spec["orchestration"]["signature"][-1] == ArgDirection.OUT
+    with pytest.raises(ValueError, match="OUT declaration"):
+        inspected.compile(seed_outputs=("input",))
+
+
 @pytest.mark.parametrize("relative", ["distributed_meta.json", "next_levels/decode_fwd/cache/incore_0.bin"])
 def test_tampered_artifact_rejected_before_compilation(bridge, artifact, relative):
     (artifact / relative).write_text("tampered")
