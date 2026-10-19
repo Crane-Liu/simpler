@@ -198,7 +198,9 @@ class TorchDecode:
         if self.cohort is None:
             if current != (3338,) * BATCH:
                 raise ValueError("decode must follow the supported 3338-token prefill")
-        elif identity != self.cohort or current != tuple(value + 1 for value in self.positions):
+        elif (
+            self.positions is None or identity != self.cohort or current != tuple(value + 1 for value in self.positions)
+        ):
             raise ValueError("request replacement or nonconsecutive decode requires a drained cohort boundary")
         if max(current) >= 3338 + 127:
             raise ValueError("fixed decode exceeds the qualified generation range")
@@ -234,6 +236,7 @@ class TorchDecode:
         try:
             if self.worker is None:
                 self._initialize()
+            assert self.worker is not None
             self.run = self.worker.submit(self.callable, self.args, self.config, caller_stream=stream.npu_stream)
             self.run.wait()
         except BaseException:

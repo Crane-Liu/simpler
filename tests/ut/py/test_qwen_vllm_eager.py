@@ -47,6 +47,7 @@ def adapter(monkeypatch):
         module.__dict__.update(values)
         monkeypatch.setitem(sys.modules, name, module)
     spec = importlib.util.spec_from_file_location("qwen_vllm_eager_test", CASE / "vllm_eager.py")
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)

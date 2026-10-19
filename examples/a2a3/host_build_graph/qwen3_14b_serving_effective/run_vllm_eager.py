@@ -72,7 +72,10 @@ def main():
         expected_steps = 0
         for _ in range(args.rounds):
             start = time.perf_counter()
-            result = llm.generate([{"prompt_token_ids": ids} for _ in range(16)], sampling, use_tqdm=False)
+            llm.sleep(level=0, mode="keep")
+            llm.enqueue([{"prompt_token_ids": ids} for _ in range(16)], sampling, use_tqdm=False)
+            llm.wake_up(tags=["scheduling"])
+            result = llm.wait_for_completion(use_tqdm=False)
             elapsed = time.perf_counter() - start
             tokens = [list(request.outputs[0].token_ids) for request in result]
             if len(tokens) != 16 or not all(tokens):

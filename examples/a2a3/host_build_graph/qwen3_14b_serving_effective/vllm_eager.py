@@ -119,11 +119,15 @@ class SimplerModelRunner(NPUModelRunner):
         self.model.initialize_packed_weights(self.device)
 
     def _allocate_kv_cache_tensors(self, kv_cache_config):
+        def layer_index(name):
+            match = re.search(r"\.layers\.(\d+)\.", name)
+            if match is None:
+                raise ValueError("KV layer name does not identify a Qwen layer")
+            return int(match.group(1))
+
         specs = self._get_layer_kv_cache_specs(kv_cache_config)
-        names = sorted(specs, key=lambda name: int(re.search(r"\.layers\.(\d+)\.", name).group(1)))
-        if len(names) != 40 or [int(re.search(r"\.layers\.(\d+)\.", name).group(1)) for name in names] != list(
-            range(40)
-        ):
+        names = sorted(specs, key=layer_index)
+        if [layer_index(name) for name in names] != list(range(40)):
             raise ValueError("fixed eager requires exactly one attention cache per Qwen layer")
         for spec in specs.values():
             if (spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype) != (128, 8, 128, torch.bfloat16):

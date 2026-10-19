@@ -22,6 +22,7 @@ CASE = Path(__file__).resolve().parents[3] / "examples/a2a3/host_build_graph/qwe
 def adapter(monkeypatch):
     monkeypatch.syspath_prepend(str(CASE))
     spec = importlib.util.spec_from_file_location("qwen_torch_decode_test", CASE / "torch_decode.py")
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
@@ -78,7 +79,7 @@ def test_pack_model_weights_reuses_loaded_projection_storage(adapter, monkeypatc
             pass
 
         def load(self, name):
-            width = 2 if name.endswith(('.q_norm.weight', '.k_norm.weight')) else 3
+            width = 2 if name.endswith((".q_norm.weight", ".k_norm.weight")) else 3
             return torch.ones(width)
 
     model = SimpleNamespace(
