@@ -58,8 +58,8 @@ def validate_config(config):
 
 
 class SimplerQwen3ForCausalLM(Qwen3ForCausalLM):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, *, vllm_config, prefix=""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.simpler = None
         self.simpler_caches = None
         self.simpler_request_ids = ()

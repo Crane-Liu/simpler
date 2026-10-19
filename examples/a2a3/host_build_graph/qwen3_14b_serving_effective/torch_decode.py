@@ -44,6 +44,7 @@ class PackedLinear(torch.nn.Module):
         return (parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)), None
 
 
+@torch.no_grad()
 def pack_model_weights(model):
     layers = model.model.layers
     packed = {}
@@ -58,14 +59,12 @@ def pack_model_weights(model):
     for parent_name, projection_name, names, sizes in groups:
         for part, name in enumerate(names):
             start, count = sum(sizes[:part]), sizes[part]
-            packed[name] = torch.cat(
-                [
-                    getattr(getattr(layer, parent_name), projection_name).weight[start : start + count]
-                    .T.contiguous()
-                    for layer in layers
-                ],
-                dim=0,
-            )
+            weight = getattr(getattr(layers[0], parent_name), projection_name).weight
+            packed[name] = weight.new_empty((LAYERS * weight.shape[1], count))
+            for index, layer in enumerate(layers):
+                weight = getattr(getattr(layer, parent_name), projection_name).weight
+                packed[name].view(LAYERS, -1, count)[index].copy_(weight[start : start + count].T)
+            del weight
         for index, layer in enumerate(layers):
             views = [packed[name].view(LAYERS, -1, count)[index] for name, count in zip(names, sizes, strict=True)]
             setattr(getattr(layer, parent_name), projection_name, PackedLinear(*views))

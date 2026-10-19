@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import importlib.util
+import inspect
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -23,6 +24,10 @@ def adapter(monkeypatch):
     monkeypatch.syspath_prepend(str(CASE))
 
     class Qwen(torch.nn.Module):
+        def __init__(self, *, vllm_config, prefix=""):
+            super().__init__()
+            self.vllm_config = vllm_config
+
         def forward(self, *args):
             return "native-prefill"
 
@@ -76,6 +81,8 @@ def config():
 def test_fixed_contract_accepted(adapter, config):
     module, _ = adapter
     module.validate_config(config)
+    parameters = inspect.signature(module.SimplerQwen3ForCausalLM.__init__).parameters
+    assert {"vllm_config", "prefix"} <= parameters.keys()
 
 
 @pytest.mark.parametrize(
@@ -100,7 +107,7 @@ def test_unsupported_config_refused(adapter, config, section, name, value):
 
 def test_framework_logits_and_native_prefill_routes(adapter):
     module, context = adapter
-    model = module.SimplerQwen3ForCausalLM()
+    model = module.SimplerQwen3ForCausalLM(vllm_config=SimpleNamespace(), prefix="")
     model.config = SimpleNamespace(vocab_size=3)
     logits = torch.arange(10).reshape(2, 5)
     model.simpler_logits = True

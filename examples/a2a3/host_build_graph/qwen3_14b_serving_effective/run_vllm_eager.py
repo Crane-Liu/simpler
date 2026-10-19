@@ -62,6 +62,7 @@ def main():
         enable_prefix_caching=False,
         enable_chunked_prefill=False,
         async_scheduling=False,
+        block_size=128,
         num_gpu_blocks_override=449,
         **options,
     )

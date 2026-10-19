@@ -103,6 +103,7 @@ def test_pack_model_weights_reuses_loaded_projection_storage(adapter, monkeypatc
     assert packed["wq"].shape == (40 * 3, 4)
     assert packed["w_down"].shape == (40 * 5, 3)
     assert packed["embed_weight"].shape == (7, 3)
+    assert all(not value.requires_grad for value in packed.values())
     assert all(isinstance(layer.self_attn.qkv_proj, adapter.PackedLinear) for layer in model.model.layers)
     torch.testing.assert_close(model.model.layers[7].self_attn.qkv_proj.weight_0, packed["wq"].view(40, 3, 4)[7])
 
