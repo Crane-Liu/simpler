@@ -333,6 +333,9 @@ admission. An unproven completion prevents source release and successful close.
 Diagnostics are disabled; supported execution is eager with synchronous scheduling,
 private local KV pages and complete prefill cohorts.
 
+Use the A3 vLLM-Ascend build with CANN/NNAL 9.0.0 and torch/torch-npu 2.10.0.
+Initialize both the CANN and NNAL/ATB environments before starting either process.
+
 Run the native reference and the Simpler worker in separate processes under the
 same environment, using a JSON array containing the frozen prompt token IDs:
 
